@@ -1,14 +1,15 @@
 {
-    debug
-    experimental_http3
-    cache {
-        olric_config fixtures/olricd.yaml
-    }
+	debug
+	cache {
+		path /tmp/caddy-cache-tests
+		# The suite expects a cache that obeys the requests' directives.
+		mode strict
+	}
 }
 
 localhost
 
 route * {
-    cache
-    reverse_proxy 127.0.0.1:8000
+	cache
+	reverse_proxy 127.0.0.1:8000
 }

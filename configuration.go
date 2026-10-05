@@ -1,795 +1,451 @@
 package httpcache
 
 import (
+	"fmt"
+	"net/http"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
-	"github.com/darkweak/souin/configurationtypes"
-	"github.com/darkweak/storages/core"
 )
 
-// DefaultCache the struct
-type DefaultCache struct {
-	// Allowed HTTP verbs to be cached by the system.
-	AllowedHTTPVerbs []string `json:"allowed_http_verbs"`
-	// Allowed additional status code to be cached by the system.
-	AllowedAdditionalStatusCodes []int `json:"allowed_additional_status_codes"`
-	// Badger provider configuration.
-	Badger configurationtypes.CacheProvider `json:"badger"`
-	// The cache name to use in the Cache-Status response header.
-	CacheName string                 `json:"cache_name"`
-	CDN       configurationtypes.CDN `json:"cdn"`
-	// The default Cache-Control header value if none set by the upstream server.
-	DefaultCacheControl string `json:"default_cache_control"`
-	// The maximum body size (in bytes) to be stored into cache.
-	MaxBodyBytes uint64 `json:"max_cacheable_body_bytes"`
-	// Redis provider configuration.
-	Distributed bool `json:"distributed"`
-	// Headers to add to the cache key if they are present.
-	Headers []string `json:"headers"`
-	// Configure the global key generation.
-	Key configurationtypes.Key `json:"key"`
-	// Mode defines if strict or bypass.
-	Mode string `json:"mode"`
-	// Olric provider configuration.
-	Olric configurationtypes.CacheProvider `json:"olric"`
-	// Redis provider configuration.
-	Redis configurationtypes.CacheProvider `json:"redis"`
-	// Etcd provider configuration.
-	Etcd configurationtypes.CacheProvider `json:"etcd"`
-	// Nats provider configuration.
-	Nats configurationtypes.CacheProvider `json:"nats"`
-	// NutsDB provider configuration.
-	Nuts configurationtypes.CacheProvider `json:"nuts"`
-	// Otter provider configuration.
-	Otter configurationtypes.CacheProvider `json:"otter"`
-	// Regex to exclude cache.
-	Regex configurationtypes.Regex `json:"regex"`
-	// Storage providers chaining and order.
-	Storers []string `json:"storers"`
-	// Time before cache or backend access timeout.
-	Timeout configurationtypes.Timeout `json:"timeout"`
-	// Time to live.
-	TTL configurationtypes.Duration `json:"ttl"`
-	// SimpleFS provider configuration.
-	SimpleFS configurationtypes.CacheProvider `json:"simplefs"`
-	// Stale time to live.
-	Stale configurationtypes.Duration `json:"stale"`
-	// Disable the coalescing system.
-	DisableCoalescing bool `json:"disable_coalescing"`
-	// MappingEvictionInterval interval between eviction
-	MappingEvictionInterval configurationtypes.Duration `json:"mapping_eviction_interval"`
+const (
+	defaultTTL         = 120 * time.Second
+	defaultLockTimeout = 5 * time.Second
+	defaultMaxSize     = 10 << 30
+	defaultMaxMemory   = 256 << 20
+	defaultCacheName   = "Caddy"
+
+	// minMaxMemory is the smallest memory budget accepted: below it the
+	// index could not even describe a useful number of files.
+	minMaxMemory = 1 << 20
+)
+
+// KeyOptions tunes how the cache key of a request is built. By default the
+// key is METHOD-SCHEME-HOST-PATH?QUERY.
+type KeyOptions struct {
+	// Leave the host out of the key.
+	DisableHost bool `json:"disable_host,omitempty"`
+	// Leave the method out of the key.
+	DisableMethod bool `json:"disable_method,omitempty"`
+	// Leave the query string out of the key.
+	DisableQuery bool `json:"disable_query,omitempty"`
+	// Leave the scheme out of the key.
+	DisableScheme bool `json:"disable_scheme,omitempty"`
+	// Ignore the Vary header of the responses.
+	DisableVary bool `json:"disable_vary,omitempty"`
+	// Sort the query parameters so their order does not matter.
+	SortQuery bool `json:"sort_query,omitempty"`
+	// Do not reveal the key in the Cache-Status header.
+	Hide bool `json:"hide,omitempty"`
+	// Request headers whose value is added to the key.
+	Headers []string `json:"headers,omitempty"`
+	// Replaces the default key. Caddy placeholders are supported.
+	Template string `json:"template,omitempty"`
 }
 
-// GetAllowedHTTPVerbs returns the allowed verbs to cache
-func (d *DefaultCache) GetAllowedHTTPVerbs() []string {
-	return d.AllowedHTTPVerbs
+// RegexOptions excludes requests from the cache.
+type RegexOptions struct {
+	// Requests whose URI matches are not cached.
+	Exclude string `json:"exclude,omitempty"`
 }
 
-// GetAllowedAdditionalStatusCodes returns the allowed verbs to cache
-func (d *DefaultCache) GetAllowedAdditionalStatusCodes() []int {
-	return d.AllowedAdditionalStatusCodes
+// Options are the settings shared by the global cache option and the cache
+// handler. A handler inherits from the global option whatever it leaves
+// unset.
+type Options struct {
+	// Directory the responses are stored in. Handlers using the same
+	// directory share one cache and its limits.
+	// Default: the "cache" directory of Caddy's data directory.
+	Path string `json:"path,omitempty"`
+	// Disk space the cache may take. Default: 10GiB.
+	MaxSize Size `json:"max_size,omitempty"`
+	// RAM the cache may take, for its index and for the most requested
+	// responses, which are served from memory. "off" keeps the responses on
+	// disk only. Default: 256MiB.
+	MaxMemory Size `json:"max_memory,omitempty"`
+	// Remove the responses that were not requested for that long.
+	// Default: keep them until the space is needed.
+	Inactive caddy.Duration `json:"inactive,omitempty"`
+	// How long a response is fresh when the upstream does not say.
+	// Default: 120s.
+	TTL caddy.Duration `json:"ttl,omitempty"`
+	// How long past its freshness a response may still be served while it is
+	// being updated or when the upstream fails. Default: 0.
+	Stale caddy.Duration `json:"stale,omitempty"`
+	// How long a request waits for another one that is already fetching the
+	// same response before going to the upstream itself. Default: 5s.
+	LockTimeout caddy.Duration `json:"lock_timeout,omitempty"`
+	// Which Cache-Control directives are honoured: by default those of the
+	// responses only, with "strict" also those of the requests, with
+	// "bypass_response" or "bypass" none of the responses.
+	Mode string `json:"mode,omitempty"`
+	// Name of the cache in the Cache-Status header. Default: Caddy.
+	CacheName string `json:"cache_name,omitempty"`
+	// Cache-Control given to the responses that have none.
+	DefaultCacheControl string `json:"default_cache_control,omitempty"`
+	// Responses with a larger body are not stored. Default: half of max_size.
+	MaxBodyBytes Size `json:"max_cacheable_body_bytes,omitempty"`
+	// Status codes to cache with the default TTL besides the standard ones.
+	AllowedAdditionalStatusCodes []int `json:"allowed_additional_status_codes,omitempty"`
+	// Cache key tuning.
+	Key *KeyOptions `json:"key,omitempty"`
+	// Requests to keep out of the cache.
+	Regex *RegexOptions `json:"regex,omitempty"`
 }
 
-// GetBadger returns the Badger configuration
-func (d *DefaultCache) GetBadger() configurationtypes.CacheProvider {
-	return d.Badger
+// inherit fills the unset options of o with those of parent.
+func (o Options) inherit(parent Options) Options {
+	if o.Path == "" {
+		o.Path = parent.Path
+	}
+	if o.MaxSize == 0 {
+		o.MaxSize = parent.MaxSize
+	}
+	if o.MaxMemory == 0 {
+		o.MaxMemory = parent.MaxMemory
+	}
+	if o.Inactive == 0 {
+		o.Inactive = parent.Inactive
+	}
+	if o.TTL == 0 {
+		o.TTL = parent.TTL
+	}
+	if o.Stale == 0 {
+		o.Stale = parent.Stale
+	}
+	if o.LockTimeout == 0 {
+		o.LockTimeout = parent.LockTimeout
+	}
+	if o.Mode == "" {
+		o.Mode = parent.Mode
+	}
+	if o.CacheName == "" {
+		o.CacheName = parent.CacheName
+	}
+	if o.DefaultCacheControl == "" {
+		o.DefaultCacheControl = parent.DefaultCacheControl
+	}
+	if o.MaxBodyBytes == 0 {
+		o.MaxBodyBytes = parent.MaxBodyBytes
+	}
+	if o.Key == nil {
+		o.Key = parent.Key
+	}
+	if o.Regex == nil {
+		o.Regex = parent.Regex
+	}
+	o.AllowedAdditionalStatusCodes = append(append([]int{}, parent.AllowedAdditionalStatusCodes...), o.AllowedAdditionalStatusCodes...)
+
+	return o
 }
 
-// GetCacheName returns the cache name to use in the Cache-Status response header
-func (d *DefaultCache) GetCacheName() string {
-	return d.CacheName
+// config is what a handler works with once its options are resolved.
+type config struct {
+	path   string
+	limits Limits
+
+	name           string
+	ttl            time.Duration
+	stale          time.Duration
+	lockTimeout    time.Duration
+	strict         bool
+	ignoreResponse bool
+	defaultCC      string
+	maxBody        int64
+	extraStatus    map[int]bool
+	key            KeyOptions
+	keyHeaders     []string
+	exclude        *regexp.Regexp
 }
 
-// GetCDN returns the CDN configuration
-func (d *DefaultCache) GetCDN() configurationtypes.CDN {
-	return d.CDN
-}
+// resolve validates the options and applies the defaults.
+func (o Options) resolve() (*config, error) {
+	c := &config{
+		path:        o.Path,
+		name:        o.CacheName,
+		ttl:         time.Duration(o.TTL),
+		stale:       time.Duration(o.Stale),
+		lockTimeout: time.Duration(o.LockTimeout),
+		defaultCC:   o.DefaultCacheControl,
+		maxBody:     int64(o.MaxBodyBytes),
+		extraStatus: make(map[int]bool),
+		limits: Limits{
+			MaxSize:   int64(o.MaxSize),
+			MaxMemory: int64(o.MaxMemory),
+			Inactive:  time.Duration(o.Inactive),
+		},
+	}
 
-// GetDistributed returns if it uses Olric or not as provider
-func (d *DefaultCache) GetDistributed() bool {
-	return d.Distributed
-}
+	if c.path == "" {
+		c.path = filepath.Join(caddy.AppDataDir(), "cache")
+	}
+	path, err := filepath.Abs(c.path)
+	if err != nil {
+		return nil, fmt.Errorf("cache path: %w", err)
+	}
+	c.path = path
 
-// GetHeaders returns the default headers that should be cached
-func (d *DefaultCache) GetHeaders() []string {
-	return d.Headers
-}
+	switch {
+	case c.limits.MaxSize == 0:
+		c.limits.MaxSize = defaultMaxSize
+	case c.limits.MaxSize < 0:
+		return nil, fmt.Errorf("max_size must be positive")
+	}
+	switch {
+	case c.limits.MaxMemory == 0:
+		c.limits.MaxMemory = defaultMaxMemory
+	case c.limits.MaxMemory < 0:
+		c.limits.MaxMemory = 0
+	case c.limits.MaxMemory < minMaxMemory:
+		return nil, fmt.Errorf("max_memory must be at least %s, or off", Size(minMaxMemory))
+	}
 
-// GetKey returns the default Key generation strategy
-func (d *DefaultCache) GetKey() configurationtypes.Key {
-	return d.Key
-}
+	if c.ttl < 0 || c.stale < 0 || c.lockTimeout < 0 || c.limits.Inactive < 0 || c.maxBody < 0 {
+		return nil, fmt.Errorf("cache durations and sizes cannot be negative")
+	}
+	if c.ttl == 0 {
+		c.ttl = defaultTTL
+	}
+	if c.lockTimeout == 0 {
+		c.lockTimeout = defaultLockTimeout
+	}
+	if c.name == "" {
+		c.name = defaultCacheName
+	}
 
-// GetEtcd returns etcd configuration
-func (d *DefaultCache) GetEtcd() configurationtypes.CacheProvider {
-	return d.Etcd
-}
+	switch o.Mode {
+	case "", "bypass_request":
+	case "strict":
+		c.strict = true
+	case "bypass", "bypass_response":
+		c.ignoreResponse = true
+	default:
+		return nil, fmt.Errorf("unknown cache mode %q: expected strict, bypass, bypass_request or bypass_response", o.Mode)
+	}
 
-// GetMappingEvictionInterval returns the interval between eviction
-func (d *DefaultCache) GetMappingEvictionInterval() time.Duration {
-	return d.MappingEvictionInterval.Duration
-}
-
-// GetMode returns mdoe configuration
-func (d *DefaultCache) GetMode() string {
-	return d.Mode
-}
-
-// GetNats returns nats configuration
-func (d *DefaultCache) GetNats() configurationtypes.CacheProvider {
-	return d.Nats
-}
-
-// GetNuts returns nuts configuration
-func (d *DefaultCache) GetNuts() configurationtypes.CacheProvider {
-	return d.Nuts
-}
-
-// GetOtter returns otter configuration
-func (d *DefaultCache) GetOtter() configurationtypes.CacheProvider {
-	return d.Otter
-}
-
-// GetOlric returns olric configuration
-func (d *DefaultCache) GetOlric() configurationtypes.CacheProvider {
-	return d.Olric
-}
-
-// GetRedis returns redis configuration
-func (d *DefaultCache) GetRedis() configurationtypes.CacheProvider {
-	return d.Redis
-}
-
-// GetRegex returns the regex that shouldn't be cached
-func (d *DefaultCache) GetRegex() configurationtypes.Regex {
-	return d.Regex
-}
-
-// GetSimpleFS returns simplefs configuration
-func (d *DefaultCache) GetSimpleFS() configurationtypes.CacheProvider {
-	return d.SimpleFS
-}
-
-// GetStorers returns the chianed storers
-func (d *DefaultCache) GetStorers() []string {
-	return d.Storers
-}
-
-// GetTimeout returns the backend and cache timeouts
-func (d *DefaultCache) GetTimeout() configurationtypes.Timeout {
-	return d.Timeout
-}
-
-// GetTTL returns the default TTL
-func (d *DefaultCache) GetTTL() time.Duration {
-	return d.TTL.Duration
-}
-
-// GetStale returns the stale duration
-func (d *DefaultCache) GetStale() time.Duration {
-	return d.Stale.Duration
-}
-
-// GetDefaultCacheControl returns the configured default cache control value
-func (d *DefaultCache) GetDefaultCacheControl() string {
-	return d.DefaultCacheControl
-}
-
-// GetMaxBodyBytes returns the maximum body size (in bytes) to be cached
-func (d *DefaultCache) GetMaxBodyBytes() uint64 {
-	return d.MaxBodyBytes
-}
-
-// IsCoalescingDisable returns if the coalescing is disabled
-func (d *DefaultCache) IsCoalescingDisable() bool {
-	return d.DisableCoalescing
-}
-
-// Configuration holder
-type Configuration struct {
-	// Default cache to fallback on when none are redefined.
-	DefaultCache DefaultCache
-	// API endpoints enablers.
-	API configurationtypes.API
-	// Cache keys configuration.
-	CacheKeys configurationtypes.CacheKeys `json:"cache_keys"`
-	// Override the ttl depending the cases.
-	URLs map[string]configurationtypes.URL
-	// Logger level, fallback on caddy's one when not redefined.
-	LogLevel string
-	// SurrogateKeys contains the surrogate keys to use with a predefined mapping
-	SurrogateKeys map[string]configurationtypes.SurrogateKeys
-	// SurrogateKeyDisabled disables the surrogate keys system
-	SurrogateKeyDisabled bool
-	logger               core.Logger
-}
-
-// GetUrls get the urls list in the configuration
-func (c *Configuration) GetUrls() map[string]configurationtypes.URL {
-	return c.URLs
-}
-
-// GetPluginName get the plugin name
-func (c *Configuration) GetPluginName() string {
-	return "caddy"
-}
-
-// GetDefaultCache get the default cache
-func (c *Configuration) GetDefaultCache() configurationtypes.DefaultCacheInterface {
-	return &c.DefaultCache
-}
-
-// GetAPI get the default cache
-func (c *Configuration) GetAPI() configurationtypes.API {
-	return c.API
-}
-
-// GetLogLevel get the log level
-func (c *Configuration) GetLogLevel() string {
-	return c.LogLevel
-}
-
-// GetLogger get the logger
-func (c *Configuration) GetLogger() core.Logger {
-	return c.logger
-}
-
-// SetLogger set the logger
-func (c *Configuration) SetLogger(l core.Logger) {
-	c.logger = l
-}
-
-// GetYkeys get the ykeys list
-func (c *Configuration) GetYkeys() map[string]configurationtypes.SurrogateKeys {
-	return nil
-}
-
-// GetSurrogateKeys get the surrogate keys list
-func (c *Configuration) GetSurrogateKeys() map[string]configurationtypes.SurrogateKeys {
-	return nil
-}
-
-// IsSurrogateDisabled disables the surrogate storage
-func (c *Configuration) IsSurrogateDisabled() bool {
-	return c.SurrogateKeyDisabled
-}
-
-// GetCacheKeys get the cache keys rules to override
-func (c *Configuration) GetCacheKeys() configurationtypes.CacheKeys {
-	return c.CacheKeys
-}
-
-var _ configurationtypes.AbstractConfigurationInterface = (*Configuration)(nil)
-
-func parseCaddyfileRecursively(h *caddyfile.Dispenser) interface{} {
-	input := make(map[string]interface{})
-	for nesting := h.Nesting(); h.NextBlock(nesting); {
-		val := h.Val()
-		if val == "}" || val == "{" {
-			continue
+	for _, code := range o.AllowedAdditionalStatusCodes {
+		if code < 200 || code > 599 || code == http.StatusPartialContent || code == http.StatusNotModified {
+			return nil, fmt.Errorf("status code %d cannot be cached", code)
 		}
-		args := h.RemainingArgs()
-		if len(args) == 1 {
-			input[val] = args[0]
-		} else if len(args) > 1 {
-			input[val] = args
-		} else {
-			input[val] = parseCaddyfileRecursively(h)
+		c.extraStatus[code] = true
+	}
+
+	if o.Key != nil {
+		c.key = *o.Key
+		for _, name := range o.Key.Headers {
+			c.keyHeaders = append(c.keyHeaders, http.CanonicalHeaderKey(name))
+		}
+	}
+	if o.Regex != nil && o.Regex.Exclude != "" {
+		if c.exclude, err = regexp.Compile(o.Regex.Exclude); err != nil {
+			return nil, fmt.Errorf("regex exclude: %w", err)
 		}
 	}
 
-	return input
+	return c, nil
 }
 
-func parseBadgerConfiguration(c map[string]interface{}) map[string]interface{} {
-	for k, v := range c {
-		switch k {
-		case "Dir", "ValueDir":
-			c[k] = v
-		case "SyncWrites", "ReadOnly", "InMemory", "MetricsEnabled", "CompactL0OnClose", "LmaxCompaction", "VerifyValueChecksum", "BypassLockGuard", "DetectConflicts":
-			c[k] = true
-			if v != nil {
-				val, ok := v.(string)
-				if ok {
-					c[k], _ = strconv.ParseBool(val)
-				}
-			}
-		case "NumVersionsToKeep", "NumGoroutines", "MemTableSize", "BaseTableSize", "BaseLevelSize", "LevelSizeMultiplier", "TableSizeMultiplier", "MaxLevels", "ValueThreshold", "NumMemtables", "BlockSize", "BlockCacheSize", "IndexCacheSize", "NumLevelZeroTables", "NumLevelZeroTablesStall", "ValueLogFileSize", "NumCompactors", "ZSTDCompressionLevel", "ChecksumVerificationMode", "NamespaceOffset":
-			c[k], _ = strconv.Atoi(v.(string))
-		case "Compression", "ValueLogMaxEntries":
-			c[k], _ = strconv.ParseUint(v.(string), 10, 32)
-		case "VLogPercentile", "BloomFalsePositive":
-			c[k], _ = strconv.ParseFloat(v.(string), 64)
-		case "EncryptionKey":
-			c[k] = []byte(v.(string))
-		case "EncryptionKeyRotationDuration":
-			c[k], _ = time.ParseDuration(v.(string))
+const storageRemoved = "storage backends were removed, the cache now stores on disk and in memory by itself: use path, max_size and max_memory"
+
+// removedOptions are the options of the Souin based versions of this module
+// that no longer exist, with what to do instead.
+var removedOptions = map[string]string{
+	"badger":                    storageRemoved,
+	"etcd":                      storageRemoved,
+	"nats":                      storageRemoved,
+	"nuts":                      storageRemoved,
+	"olric":                     storageRemoved,
+	"otter":                     storageRemoved,
+	"redis":                     storageRemoved,
+	"simplefs":                  storageRemoved,
+	"storers":                   storageRemoved,
+	"api":                       "the cache API is always served by the admin endpoint, under /cache/",
+	"cdn":                       "CDN purge propagation is not supported",
+	"cache_keys":                "use one cache directive per matcher instead",
+	"headers":                   "use key { headers ... } instead",
+	"timeout":                   "set the timeouts on reverse_proxy instead",
+	"allowed_http_verbs":        "only GET and HEAD requests are cached",
+	"log_level":                 "the cache logs through Caddy's logger",
+	"disable_coalescing":        "use lock_timeout to bound how long requests wait for each other",
+	"disable_surrogate_key":     "surrogate keys are not supported",
+	"mapping_eviction_interval": "it is no longer needed",
+}
+
+// parseOptions reads the block of the global option or of the directive,
+// which share their syntax.
+func parseOptions(d *caddyfile.Dispenser, o *Options) error {
+	for d.Next() {
+		if d.NextArg() {
+			return d.ArgErr()
 		}
-	}
 
-	return c
-}
+		for nesting := d.Nesting(); d.NextBlock(nesting); {
+			option := d.Val()
 
-func parseRedisConfiguration(c map[string]interface{}) map[string]interface{} {
-	for k, v := range c {
-		switch k {
-		case "Addrs", "InitAddress":
-			if s, ok := v.(string); ok {
-				c[k] = []string{s}
-			} else {
-				c[k] = v
-			}
-		case "Username", "Password", "ClientName", "ClientSetInfo", "ClientTrackingOptions", "SentinelUsername", "SentinelPassword", "MasterName", "IdentitySuffix":
-			c[k] = v
-		case "SendToReplicas", "ShuffleInit", "ClientNoTouch", "DisableRetry", "DisableCache", "AlwaysPipelining", "AlwaysRESP2", "ForceSingleClient", "ReplicaOnly", "ClientNoEvict", "ContextTimeoutEnabled", "PoolFIFO", "ReadOnly", "RouteByLatency", "RouteRandomly", "DisableIndentity":
-			c[k] = true
-		case "SelectDB", "CacheSizeEachConn", "RingScaleEachConn", "ReadBufferEachConn", "WriteBufferEachConn", "BlockingPoolSize", "PipelineMultiplex", "DB", "Protocol", "MaxRetries", "PoolSize", "MinIdleConns", "MaxIdleConns", "MaxActiveConns", "MaxRedirects":
-			switch v {
-			case false:
-				c[k] = 0
-			case true:
-				c[k] = 1
-			default:
-				c[k], _ = strconv.Atoi(v.(string))
-			}
-		case "ConnWriteTimeout", "MaxFlushDelay", "MinRetryBackoff", "MaxRetryBackoff", "DialTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout", "ConnMaxIdleTime", "ConnMaxLifetime":
-			c[k], _ = time.ParseDuration(v.(string))
-		case "MaxVersion", "MinVersion":
-			strV, _ := v.(string)
-			if strings.HasPrefix(strV, "TLS") {
-				strV = strings.Trim(strings.TrimPrefix(strV, "TLS"), " ")
+			if hint, removed := removedOptions[option]; removed {
+				return d.Errf("the %s option is not supported anymore: %s", option, hint)
 			}
 
-			switch strV {
-			case "0x0300", "SSLv3":
-				c[k] = 0x0300
-			case "0x0301", "1.0":
-				c[k] = 0x0301
-			case "0x0302", "1.1":
-				c[k] = 0x0302
-			case "0x0303", "1.2":
-				c[k] = 0x0303
-			case "0x0304", "1.3":
-				c[k] = 0x0304
-			}
-		case "TLSConfig":
-			c[k] = parseRedisConfiguration(v.(map[string]interface{}))
-		}
-	}
-
-	return c
-}
-
-func parseSimpleFSConfiguration(c map[string]interface{}) map[string]interface{} {
-	for k, v := range c {
-		switch k {
-		case "path":
-			c[k] = v
-		case "size":
-			switch v {
-			case false:
-				c[k] = 0
-			case true:
-				c[k] = 1
-			default:
-				c[k], _ = strconv.Atoi(v.(string))
-			}
-		case "directory_size":
-			switch v {
-			case false:
-				c[k] = 0
-			case true:
-				c[k] = 1
-			default:
-				c[k], _ = strconv.Atoi(v.(string))
-			}
-		}
-	}
-
-	return c
-}
-
-func parseConfiguration(cfg *Configuration, h *caddyfile.Dispenser, isGlobal bool) error {
-	for h.Next() {
-		for nesting := h.Nesting(); h.NextBlock(nesting); {
-			rootOption := h.Val()
-			switch rootOption {
-			case "allowed_http_verbs":
-				allowed := cfg.DefaultCache.AllowedHTTPVerbs
-				allowed = append(allowed, h.RemainingArgs()...)
-				cfg.DefaultCache.AllowedHTTPVerbs = allowed
-			case "allowed_additional_status_codes":
-				allowed := cfg.DefaultCache.AllowedAdditionalStatusCodes
-				additional := h.RemainingArgs()
-				codes := make([]int, 0)
-				for _, code := range additional {
-					if c, err := strconv.Atoi(code); err == nil {
-						codes = append(codes, c)
-					}
+			switch option {
+			case "path":
+				if !d.AllArgs(&o.Path) {
+					return d.ArgErr()
 				}
-				allowed = append(allowed, codes...)
-				cfg.DefaultCache.AllowedAdditionalStatusCodes = allowed
-			case "api":
-				if !isGlobal {
-					return h.Err("'api' block must be global")
+			case "max_size":
+				if err := parseSizeArg(d, &o.MaxSize); err != nil {
+					return err
 				}
-				apiConfiguration := configurationtypes.API{}
-				for nesting := h.Nesting(); h.NextBlock(nesting); {
-					directive := h.Val()
-					switch directive {
-					case "basepath":
-						apiConfiguration.BasePath = h.RemainingArgs()[0]
-					case "debug":
-						apiConfiguration.Debug = configurationtypes.APIEndpoint{}
-						apiConfiguration.Debug.Enable = true
-						for nesting := h.Nesting(); h.NextBlock(nesting); {
-							directive := h.Val()
-							switch directive {
-							case "basepath":
-								apiConfiguration.Debug.BasePath = h.RemainingArgs()[0]
-							default:
-								return h.Errf("unsupported debug directive: %s", directive)
-							}
-						}
-					case "prometheus":
-						apiConfiguration.Prometheus = configurationtypes.APIEndpoint{}
-						apiConfiguration.Prometheus.Enable = true
-						for nesting := h.Nesting(); h.NextBlock(nesting); {
-							directive := h.Val()
-							switch directive {
-							case "basepath":
-								apiConfiguration.Prometheus.BasePath = h.RemainingArgs()[0]
-							default:
-								return h.Errf("unsupported prometheus directive: %s", directive)
-							}
-						}
-					case "souin":
-						apiConfiguration.Souin = configurationtypes.APIEndpoint{}
-						apiConfiguration.Souin.Enable = true
-						for nesting := h.Nesting(); h.NextBlock(nesting); {
-							directive := h.Val()
-							switch directive {
-							case "basepath":
-								apiConfiguration.Souin.BasePath = h.RemainingArgs()[0]
-							default:
-								return h.Errf("unsupported souin directive: %s", directive)
-							}
-						}
-					default:
-						return h.Errf("unsupported api directive: %s", directive)
-					}
+				if o.MaxSize <= 0 {
+					return d.Err("max_size must be positive")
 				}
-				cfg.API = apiConfiguration
-			case "badger":
-				provider := configurationtypes.CacheProvider{Found: true}
-				for nesting := h.Nesting(); h.NextBlock(nesting); {
-					directive := h.Val()
-					switch directive {
-					case "path":
-						urlArgs := h.RemainingArgs()
-						provider.Path = urlArgs[0]
-					case "configuration":
-						provider.Configuration = parseCaddyfileRecursively(h)
-						provider.Configuration = parseBadgerConfiguration(provider.Configuration.(map[string]interface{}))
-					default:
-						return h.Errf("unsupported badger directive: %s", directive)
-					}
+			case "max_memory":
+				if err := parseSizeArg(d, &o.MaxMemory); err != nil {
+					return err
 				}
-				cfg.DefaultCache.Badger = provider
-			case "cache_keys":
-				CacheKeys := cfg.CacheKeys
-				if CacheKeys == nil {
-					CacheKeys = make(configurationtypes.CacheKeys, 0)
+				// An unset size is zero, so zero is spelled off.
+				if o.MaxMemory == 0 {
+					o.MaxMemory = SizeOff
 				}
-				for nesting := h.Nesting(); h.NextBlock(nesting); {
-					rg := h.Val()
-					ck := configurationtypes.Key{}
-
-					for nesting := h.Nesting(); h.NextBlock(nesting); {
-						directive := h.Val()
-						switch directive {
-						case "disable_body":
-							ck.DisableBody = true
-						case "disable_host":
-							ck.DisableHost = true
-						case "disable_method":
-							ck.DisableMethod = true
-						case "disable_query":
-							ck.DisableQuery = true
-						case "sort_query":
-							ck.SortQuery = true
-						case "disable_scheme":
-							ck.DisableScheme = true
-						case "disable_vary":
-							ck.DisableVary = true
-						case "template":
-							ck.Template = h.RemainingArgs()[0]
-						case "hash":
-							ck.Hash = true
-						case "hide":
-							ck.Hide = true
-						case "headers":
-							ck.Headers = h.RemainingArgs()
-						default:
-							return h.Errf("unsupported cache_keys (%s) directive: %s", rg, directive)
-						}
-					}
-
-					CacheKeys = append(CacheKeys, configurationtypes.CacheKey{configurationtypes.RegValue{Regexp: regexp.MustCompile(rg)}: ck})
-				}
-				cfg.CacheKeys = CacheKeys
-			case "cache_name":
-				args := h.RemainingArgs()
-				cfg.DefaultCache.CacheName = args[0]
-			case "cdn":
-				cdn := configurationtypes.CDN{
-					Dynamic: true,
-				}
-				for nesting := h.Nesting(); h.NextBlock(nesting); {
-					directive := h.Val()
-					switch directive {
-					case "api_key":
-						cdn.APIKey = h.RemainingArgs()[0]
-					case "dynamic":
-						cdn.Dynamic = true
-						args := h.RemainingArgs()
-						if len(args) > 0 {
-							cdn.Dynamic, _ = strconv.ParseBool(args[0])
-						}
-					case "email":
-						cdn.Email = h.RemainingArgs()[0]
-					case "hostname":
-						cdn.Hostname = h.RemainingArgs()[0]
-					case "network":
-						cdn.Network = h.RemainingArgs()[0]
-					case "provider":
-						cdn.Provider = h.RemainingArgs()[0]
-					case "service_id":
-						cdn.ServiceID = h.RemainingArgs()[0]
-					case "strategy":
-						cdn.Strategy = h.RemainingArgs()[0]
-					case "zone_id":
-						cdn.ZoneID = h.RemainingArgs()[0]
-					default:
-						return h.Errf("unsupported cdn directive: %s", directive)
-					}
-				}
-				cfg.DefaultCache.CDN = cdn
-			case "default_cache_control":
-				args := h.RemainingArgs()
-				cfg.DefaultCache.DefaultCacheControl = strings.Join(args, " ")
 			case "max_cacheable_body_bytes":
-				args := h.RemainingArgs()
-				maxBodyBytes, err := strconv.ParseUint(args[0], 10, 64)
-				if err != nil {
-					return h.Errf("unsupported max_cacheable_body_bytes: %s", args)
-				} else {
-					cfg.DefaultCache.MaxBodyBytes = maxBodyBytes
+				if err := parseSizeArg(d, &o.MaxBodyBytes); err != nil {
+					return err
 				}
-			case "etcd":
-				cfg.DefaultCache.Distributed = true
-				provider := configurationtypes.CacheProvider{Found: true}
-				for nesting := h.Nesting(); h.NextBlock(nesting); {
-					directive := h.Val()
-					switch directive {
-					case "configuration":
-						provider.Configuration = parseCaddyfileRecursively(h)
-					default:
-						return h.Errf("unsupported etcd directive: %s", directive)
-					}
+				if o.MaxBodyBytes < 0 {
+					return d.Err("max_cacheable_body_bytes must be positive")
 				}
-				cfg.DefaultCache.Etcd = provider
-			case "headers":
-				cfg.DefaultCache.Headers = append(cfg.DefaultCache.Headers, h.RemainingArgs()...)
-			case "key":
-				config_key := configurationtypes.Key{}
-				for nesting := h.Nesting(); h.NextBlock(nesting); {
-					directive := h.Val()
-					switch directive {
-					case "disable_body":
-						config_key.DisableBody = true
-					case "disable_host":
-						config_key.DisableHost = true
-					case "disable_method":
-						config_key.DisableMethod = true
-					case "disable_query":
-						config_key.DisableQuery = true
-					case "sort_query":
-						config_key.SortQuery = true
-					case "disable_scheme":
-						config_key.DisableScheme = true
-					case "disable_vary":
-						config_key.DisableVary = true
-					case "template":
-						config_key.Template = h.RemainingArgs()[0]
-					case "hash":
-						config_key.Hash = true
-					case "hide":
-						config_key.Hide = true
-					case "headers":
-						config_key.Headers = h.RemainingArgs()
-					default:
-						return h.Errf("unsupported key directive: %s", directive)
-					}
+			case "inactive":
+				if err := parseDurationArg(d, &o.Inactive); err != nil {
+					return err
 				}
-				cfg.DefaultCache.Key = config_key
-			case "log_level":
-				args := h.RemainingArgs()
-				cfg.LogLevel = args[0]
-			case "mode":
-				args := h.RemainingArgs()
-				if len(args) > 1 {
-					return h.Errf("mode must contains only one arg: %s given", args)
-				}
-				cfg.DefaultCache.Mode = args[0]
-			case "nats":
-				provider := configurationtypes.CacheProvider{Found: true}
-				for nesting := h.Nesting(); h.NextBlock(nesting); {
-					directive := h.Val()
-					switch directive {
-					case "url":
-						urlArgs := h.RemainingArgs()
-						provider.URL = urlArgs[0]
-					case "configuration":
-						provider.Configuration = parseCaddyfileRecursively(h)
-					default:
-						return h.Errf("unsupported nats directive: %s", directive)
-					}
-				}
-				cfg.DefaultCache.Nats = provider
-			case "nuts":
-				provider := configurationtypes.CacheProvider{Found: true}
-				for nesting := h.Nesting(); h.NextBlock(nesting); {
-					directive := h.Val()
-					switch directive {
-					case "url":
-						urlArgs := h.RemainingArgs()
-						provider.URL = urlArgs[0]
-					case "path":
-						urlArgs := h.RemainingArgs()
-						provider.Path = urlArgs[0]
-					case "configuration":
-						provider.Configuration = parseCaddyfileRecursively(h)
-					default:
-						return h.Errf("unsupported nuts directive: %s", directive)
-					}
-				}
-				cfg.DefaultCache.Nuts = provider
-			case "otter":
-				provider := configurationtypes.CacheProvider{Found: true}
-				for nesting := h.Nesting(); h.NextBlock(nesting); {
-					directive := h.Val()
-					switch directive {
-					case "configuration":
-						provider.Configuration = parseCaddyfileRecursively(h)
-					default:
-						return h.Errf("unsupported otter directive: %s", directive)
-					}
-				}
-				cfg.DefaultCache.Otter = provider
-			case "olric":
-				cfg.DefaultCache.Distributed = true
-				provider := configurationtypes.CacheProvider{Found: true}
-				for nesting := h.Nesting(); h.NextBlock(nesting); {
-					directive := h.Val()
-					switch directive {
-					case "url":
-						urlArgs := h.RemainingArgs()
-						provider.URL = urlArgs[0]
-					case "path":
-						urlArgs := h.RemainingArgs()
-						provider.Path = urlArgs[0]
-					case "configuration":
-						provider.Configuration = parseCaddyfileRecursively(h)
-					default:
-						return h.Errf("unsupported olric directive: %s", directive)
-					}
-				}
-				cfg.DefaultCache.Olric = provider
-			case "redis":
-				cfg.DefaultCache.Distributed = true
-				provider := configurationtypes.CacheProvider{Found: true}
-				for nesting := h.Nesting(); h.NextBlock(nesting); {
-					directive := h.Val()
-					switch directive {
-					case "url":
-						urlArgs := h.RemainingArgs()
-						provider.URL = urlArgs[0]
-					case "path":
-						urlArgs := h.RemainingArgs()
-						provider.Path = urlArgs[0]
-					case "configuration":
-						provider.Configuration = parseCaddyfileRecursively(h)
-						provider.Configuration = parseRedisConfiguration(provider.Configuration.(map[string]interface{}))
-					default:
-						return h.Errf("unsupported redis directive: %s", directive)
-					}
-				}
-				cfg.DefaultCache.Redis = provider
-			case "regex":
-				for nesting := h.Nesting(); h.NextBlock(nesting); {
-					directive := h.Val()
-					switch directive {
-					case "exclude":
-						cfg.DefaultCache.Regex.Exclude = h.RemainingArgs()[0]
-					default:
-						return h.Errf("unsupported regex directive: %s", directive)
-					}
-				}
-			case "simplefs":
-				provider := configurationtypes.CacheProvider{Found: true}
-				for nesting := h.Nesting(); h.NextBlock(nesting); {
-					directive := h.Val()
-					switch directive {
-					case "path":
-						urlArgs := h.RemainingArgs()
-						provider.Path = urlArgs[0]
-					case "configuration":
-						provider.Configuration = parseCaddyfileRecursively(h)
-						provider.Configuration = parseSimpleFSConfiguration(provider.Configuration.(map[string]interface{}))
-					default:
-						return h.Errf("unsupported simplefs directive: %s", directive)
-					}
-				}
-				cfg.DefaultCache.SimpleFS = provider
-			case "stale":
-				args := h.RemainingArgs()
-				stale, err := time.ParseDuration(args[0])
-				if err == nil {
-					cfg.DefaultCache.Stale.Duration = stale
-				}
-			case "storers":
-				args := h.RemainingArgs()
-				cfg.DefaultCache.Storers = args
-			case "timeout":
-				timeout := configurationtypes.Timeout{}
-				for nesting := h.Nesting(); h.NextBlock(nesting); {
-					directive := h.Val()
-					switch directive {
-					case "backend":
-						d := configurationtypes.Duration{}
-						ttl, err := time.ParseDuration(h.RemainingArgs()[0])
-						if err == nil {
-							d.Duration = ttl
-						}
-						timeout.Backend = d
-					case "cache":
-						d := configurationtypes.Duration{}
-						ttl, err := time.ParseDuration(h.RemainingArgs()[0])
-						if err == nil {
-							d.Duration = ttl
-						}
-						timeout.Cache = d
-					default:
-						return h.Errf("unsupported timeout directive: %s", directive)
-					}
-				}
-				cfg.DefaultCache.Timeout = timeout
 			case "ttl":
-				args := h.RemainingArgs()
-				ttl, err := time.ParseDuration(args[0])
-				if err == nil {
-					cfg.DefaultCache.TTL.Duration = ttl
+				if err := parseDurationArg(d, &o.TTL); err != nil {
+					return err
 				}
-			case "disable_coalescing":
-				cfg.DefaultCache.DisableCoalescing = true
-			case "mapping_eviction_interval":
-				args := h.RemainingArgs()
-				interval, err := time.ParseDuration(args[0])
-				if err == nil {
-					cfg.DefaultCache.MappingEvictionInterval.Duration = interval
+			case "stale":
+				if err := parseDurationArg(d, &o.Stale); err != nil {
+					return err
 				}
-			case "disable_surrogate_key":
-				cfg.SurrogateKeyDisabled = true
+			case "lock_timeout":
+				if err := parseDurationArg(d, &o.LockTimeout); err != nil {
+					return err
+				}
+			case "mode":
+				if !d.AllArgs(&o.Mode) {
+					return d.ArgErr()
+				}
+			case "cache_name":
+				if !d.AllArgs(&o.CacheName) {
+					return d.ArgErr()
+				}
+			case "default_cache_control":
+				args := d.RemainingArgs()
+				if len(args) == 0 {
+					return d.ArgErr()
+				}
+				o.DefaultCacheControl = strings.Join(args, " ")
+			case "allowed_additional_status_codes":
+				args := d.RemainingArgs()
+				if len(args) == 0 {
+					return d.ArgErr()
+				}
+				for _, arg := range args {
+					code, err := strconv.Atoi(arg)
+					if err != nil {
+						return d.Errf("invalid status code %q", arg)
+					}
+					o.AllowedAdditionalStatusCodes = append(o.AllowedAdditionalStatusCodes, code)
+				}
+			case "key":
+				key := new(KeyOptions)
+				for nesting := d.Nesting(); d.NextBlock(nesting); {
+					switch d.Val() {
+					case "disable_host":
+						key.DisableHost = true
+					case "disable_method":
+						key.DisableMethod = true
+					case "disable_query":
+						key.DisableQuery = true
+					case "disable_scheme":
+						key.DisableScheme = true
+					case "disable_vary":
+						key.DisableVary = true
+					case "sort_query":
+						key.SortQuery = true
+					case "hide":
+						key.Hide = true
+					case "headers":
+						key.Headers = d.RemainingArgs()
+						if len(key.Headers) == 0 {
+							return d.ArgErr()
+						}
+					case "template":
+						if !d.AllArgs(&key.Template) {
+							return d.ArgErr()
+						}
+					default:
+						return d.Errf("unsupported key option: %s", d.Val())
+					}
+				}
+				o.Key = key
+			case "regex":
+				regex := new(RegexOptions)
+				for nesting := d.Nesting(); d.NextBlock(nesting); {
+					switch d.Val() {
+					case "exclude":
+						if !d.AllArgs(&regex.Exclude) {
+							return d.ArgErr()
+						}
+					default:
+						return d.Errf("unsupported regex option: %s", d.Val())
+					}
+				}
+				o.Regex = regex
 			default:
-				return h.Errf("unsupported root directive: %s", rootOption)
+				return d.Errf("unsupported cache option: %s", option)
 			}
 		}
 	}
+
+	// Report mistakes where they are written rather than when the
+	// configuration is loaded.
+	if _, err := o.resolve(); err != nil {
+		return d.Err(err.Error())
+	}
+
+	return nil
+}
+
+func parseSizeArg(d *caddyfile.Dispenser, size *Size) error {
+	var arg string
+	if !d.AllArgs(&arg) {
+		return d.ArgErr()
+	}
+
+	v, err := ParseSize(arg)
+	if err != nil {
+		return d.Err(err.Error())
+	}
+	*size = v
+
+	return nil
+}
+
+func parseDurationArg(d *caddyfile.Dispenser, duration *caddy.Duration) error {
+	var arg string
+	if !d.AllArgs(&arg) {
+		return d.ArgErr()
+	}
+
+	v, err := caddy.ParseDuration(arg)
+	if err != nil {
+		return d.Errf("invalid duration %q: %v", arg, err)
+	}
+	*duration = caddy.Duration(v)
 
 	return nil
 }

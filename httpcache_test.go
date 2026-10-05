@@ -1,1673 +1,1563 @@
 package httpcache
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
-	"mime"
-	"mime/multipart"
 	"net/http"
-	"reflect"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/caddyserver/caddy/v2/caddytest"
 )
 
-func compareHit(t *testing.T, headers http.Header, key, details string, ttl int, suffixes ...string) {
+const (
+	testURL  = "http://localhost:9080"
+	adminURL = "http://localhost:2999"
+)
+
+// startCaddy loads a configuration made of a global cache block with the
+// given options, stored in dir, and of a site with the given directives.
+func startCaddy(t *testing.T, dir, cacheOptions, site string) *caddytest.Tester {
 	t.Helper()
 
-	suffix := strings.Join(suffixes, "; ")
-	tpl := "Souin; hit; ttl=%d; key=%s; detail=%s%s"
+	tester := caddytest.NewTester(t)
+	tester.InitServer(fmt.Sprintf(`
+	{
+		admin localhost:2999
+		http_port 9080
+		https_port 9443
+		cache {
+			path %s
+			%s
+		}
+	}
+	localhost:9080 {
+		%s
+	}`, dir, cacheOptions, site), "caddyfile")
 
-	if headers.Get("Cache-Status") != fmt.Sprintf(tpl, ttl, key, details, suffix) &&
-		headers.Get("Cache-Status") != fmt.Sprintf(tpl, ttl-1, key, details, suffix) {
-		t.Errorf("unexpected Cache-Status header %v", headers.Get("Cache-Status"))
+	return tester
+}
+
+// upstream is an origin server that counts the requests it gets.
+type upstream struct {
+	*httptest.Server
+	hits atomic.Int64
+}
+
+func newUpstream(t *testing.T, handler http.HandlerFunc) *upstream {
+	t.Helper()
+
+	u := new(upstream)
+	u.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u.hits.Add(1)
+		handler(w, r)
+	}))
+	t.Cleanup(u.Close)
+
+	return u
+}
+
+func (u *upstream) addr() string {
+	return strings.TrimPrefix(u.URL, "http://")
+}
+
+// fetch performs a request, given as a path and "Name: value" headers.
+func fetch(t *testing.T, tester *caddytest.Tester, method, path string, headers ...string) (*http.Response, string) {
+	t.Helper()
+
+	req, err := http.NewRequest(method, testURL+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range headers {
+		name, value, _ := strings.Cut(h, ": ")
+		req.Header.Set(name, value)
+	}
+
+	resp, err := tester.Client.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("%s %s: reading the body: %v", method, path, err)
+	}
+
+	return resp, string(body)
+}
+
+func get(t *testing.T, tester *caddytest.Tester, path string, headers ...string) (*http.Response, string) {
+	t.Helper()
+
+	return fetch(t, tester, http.MethodGet, path, headers...)
+}
+
+func expectStatus(t *testing.T, resp *http.Response, want string) {
+	t.Helper()
+
+	if got := resp.Header.Get("Cache-Status"); got != want {
+		t.Errorf("Cache-Status: %s\n         want: %s", got, want)
 	}
 }
 
-func TestMinimal(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port     9080
-		https_port    9443
-		cache
+var hitPattern = regexp.MustCompile(`^Caddy; hit; ttl=(\d+); detail=(DISK|MEMORY); key=(.+)$`)
+
+// expectHit checks that the response is a fresh one from the cache and
+// returns the tier it came from.
+func expectHit(t *testing.T, resp *http.Response, key string, ttl int) string {
+	t.Helper()
+
+	m := hitPattern.FindStringSubmatch(resp.Header.Get("Cache-Status"))
+	if m == nil || m[3] != key || (m[1] != fmt.Sprint(ttl) && m[1] != fmt.Sprint(ttl-1)) {
+		t.Errorf("Cache-Status: %s\n         want: a hit for %s with ttl=%d", resp.Header.Get("Cache-Status"), key, ttl)
+		return ""
 	}
-	localhost:9080 {
-		route /cache-default {
+	if resp.Header.Get("Age") == "" {
+		t.Error("a response served from the cache has no Age")
+	}
+
+	return m[2]
+}
+
+func expectBody(t *testing.T, got, want string) {
+	t.Helper()
+
+	if got != want {
+		t.Errorf("body: %q, want %q", abbreviate(got), abbreviate(want))
+	}
+}
+
+func abbreviate(s string) string {
+	if len(s) > 80 {
+		return fmt.Sprintf("%s… (%d bytes)", s[:80], len(s))
+	}
+
+	return s
+}
+
+func cacheStats(t *testing.T) StoreStats {
+	t.Helper()
+
+	resp, err := http.Get(adminURL + "/cache/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var stats struct {
+		Caches []StoreStats `json:"caches"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil || len(stats.Caches) != 1 {
+		t.Fatalf("reading the stats: %v, %d caches", err, len(stats.Caches))
+	}
+
+	return stats.Caches[0]
+}
+
+func purge(t *testing.T, query string) int {
+	t.Helper()
+
+	resp, err := http.Post(adminURL+"/cache/purge?"+query, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var result struct {
+		Purged int `json:"purged"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("purging %s: status %d, %v", query, resp.StatusCode, err)
+	}
+
+	return result.Purged
+}
+
+func TestMissThenHit(t *testing.T) {
+	tester := startCaddy(t, t.TempDir(), "", `
+		route /hello {
 			cache
-			respond "Hello, default!"
-		}
-	}`, "caddyfile")
+			respond "Hello, cache!"
+		}`)
+	const key = "GET-http-localhost:9080-/hello"
 
-	resp1, _ := tester.AssertGetResponse(`http://localhost:9080/cache-default`, 200, "Hello, default!")
-	if resp1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/cache-default" {
-		t.Errorf("unexpected Cache-Status header %v", resp1.Header)
+	resp, body := get(t, tester, "/hello")
+	expectStatus(t, resp, "Caddy; fwd=uri-miss; stored; key="+key)
+	expectBody(t, body, "Hello, cache!")
+	if resp.Header.Get("Age") != "" {
+		t.Error("a response from the upstream has an Age")
 	}
 
-	resp2, _ := tester.AssertGetResponse(`http://localhost:9080/cache-default`, 200, "Hello, default!")
-	compareHit(t, resp2.Header, "GET-http-localhost:9080-/cache-default", "DEFAULT", 119)
+	resp, body = get(t, tester, "/hello")
+	if tier := expectHit(t, resp, key, 120); tier != "DISK" {
+		t.Errorf("first hit served from %s, want DISK", tier)
+	}
+	expectBody(t, body, "Hello, cache!")
+	if resp.Header.Get("Content-Length") != "13" {
+		t.Errorf("Content-Length: %q", resp.Header.Get("Content-Length"))
+	}
+
+	// A response that keeps being requested is served from memory.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		resp, body = get(t, tester, "/hello")
+		expectBody(t, body, "Hello, cache!")
+		if expectHit(t, resp, key, 120) == "MEMORY" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the response never moved to memory")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	time.Sleep(2 * time.Second)
-	resp3, _ := tester.AssertGetResponse(`http://localhost:9080/cache-default`, 200, "Hello, default!")
-	compareHit(t, resp3.Header, "GET-http-localhost:9080-/cache-default", "DEFAULT", 117)
+	resp, _ = get(t, tester, "/hello")
+	expectHit(t, resp, key, 118)
+	if age := resp.Header.Get("Age"); age != "2" && age != "3" {
+		t.Errorf("Age: %s, want 2", age)
+	}
+}
+
+func TestProxiedResponseIsFetchedOnce(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("X-Upstream", "yes")
+		_, _ = io.WriteString(w, "from upstream "+r.URL.Path)
+	})
+	tester := startCaddy(t, t.TempDir(), "ttl 1h", `
+		cache
+		reverse_proxy `+up.addr())
+
+	var first http.Header
+	for i := range 5 {
+		resp, body := get(t, tester, "/a")
+		expectBody(t, body, "from upstream /a")
+		if resp.Header.Get("X-Upstream") != "yes" || resp.Header.Get("Content-Type") != "text/plain" {
+			t.Errorf("request %d: upstream headers lost: %v", i, resp.Header)
+		}
+
+		// A hit must look like the response it was stored from.
+		comparable := resp.Header.Clone()
+		for _, name := range []string{"Cache-Status", "Age"} {
+			comparable.Del(name)
+		}
+		if i == 0 {
+			first = comparable
+		} else if fmt.Sprint(comparable) != fmt.Sprint(first) {
+			t.Errorf("request %d: headers %v differ from the first response %v", i, comparable, first)
+		}
+	}
+	resp, body := get(t, tester, "/b")
+	expectBody(t, body, "from upstream /b")
+	expectStatus(t, resp, "Caddy; fwd=uri-miss; stored; key=GET-http-localhost:9080-/b")
+
+	if n := up.hits.Load(); n != 2 {
+		t.Errorf("the upstream got %d requests, want 2", n)
+	}
+}
+
+func TestRevalidation(t *testing.T) {
+	var conditional atomic.Int64
+	version := atomic.Value{}
+	version.Store("v1")
+
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		v := version.Load().(string)
+		etag := `"` + v + `"`
+		w.Header().Set("Etag", etag)
+		w.Header().Set("X-Served", fmt.Sprint(time.Now().UnixNano()))
+		if r.Header.Get("If-None-Match") == etag {
+			conditional.Add(1)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		_, _ = io.WriteString(w, "body "+v)
+	})
+	tester := startCaddy(t, t.TempDir(), "ttl 1s", `
+		cache
+		reverse_proxy `+up.addr())
+	const key = "GET-http-localhost:9080-/doc"
+
+	resp, body := get(t, tester, "/doc")
+	expectStatus(t, resp, "Caddy; fwd=uri-miss; stored; key="+key)
+	expectBody(t, body, "body v1")
+	served := resp.Header.Get("X-Served")
+
+	time.Sleep(1100 * time.Millisecond)
+
+	// Expired: the upstream confirms the response without sending it again.
+	resp, body = get(t, tester, "/doc")
+	expectStatus(t, resp, "Caddy; fwd=stale; fwd-status=304; detail=REVALIDATED; key="+key)
+	expectBody(t, body, "body v1")
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status %d, want 200", resp.StatusCode)
+	}
+	if conditional.Load() != 1 {
+		t.Errorf("the upstream got %d conditional requests, want 1", conditional.Load())
+	}
+	// The headers of the confirmation replace the stored ones.
+	if resp.Header.Get("X-Served") == served {
+		t.Error("the headers were not updated by the revalidation")
+	}
+
+	// And it is fresh again.
+	resp, body = get(t, tester, "/doc")
+	expectHit(t, resp, key, 1)
+	expectBody(t, body, "body v1")
+	if n := up.hits.Load(); n != 2 {
+		t.Errorf("the upstream got %d requests, want 2", n)
+	}
+
+	// When the response changed, the new one replaces it.
+	version.Store("v2")
+	time.Sleep(1100 * time.Millisecond)
+	resp, body = get(t, tester, "/doc")
+	expectStatus(t, resp, "Caddy; fwd=stale; stored; key="+key)
+	expectBody(t, body, "body v2")
+	resp, body = get(t, tester, "/doc")
+	expectHit(t, resp, key, 1)
+	expectBody(t, body, "body v2")
+}
+
+func TestRangeAndConditionalRequests(t *testing.T) {
+	const content = "0123456789abcdefghijklmnopqrstuvwxyz"
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "" || r.Header.Get("If-None-Match") != "" {
+			t.Errorf("the cache forwarded the client's range or precondition: %v", r.Header)
+		}
+		w.Header().Set("Etag", `"abc"`)
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, content)
+	})
+	tester := startCaddy(t, t.TempDir(), "ttl 1h", `
+		cache
+		reverse_proxy `+up.addr())
+
+	// The first request is for a range: the whole response is stored and
+	// the range served from it.
+	resp, body := get(t, tester, "/file", "Range: bytes=10-15")
+	if resp.StatusCode != http.StatusPartialContent || resp.Header.Get("Content-Range") != "bytes 10-15/36" {
+		t.Errorf("status %d, Content-Range %q", resp.StatusCode, resp.Header.Get("Content-Range"))
+	}
+	expectBody(t, body, "abcdef")
+	expectStatus(t, resp, "Caddy; fwd=uri-miss; stored; key=GET-http-localhost:9080-/file")
+
+	resp, body = get(t, tester, "/file")
+	expectHit(t, resp, "GET-http-localhost:9080-/file", 3600)
+	expectBody(t, body, content)
+
+	resp, body = get(t, tester, "/file", "Range: bytes=-4")
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Errorf("suffix range: status %d", resp.StatusCode)
+	}
+	expectBody(t, body, "wxyz")
+
+	resp, _ = get(t, tester, "/file", "Range: bytes=100-200")
+	if resp.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+		t.Errorf("unsatisfiable range: status %d", resp.StatusCode)
+	}
+
+	resp, body = get(t, tester, "/file", `If-None-Match: "abc"`)
+	if resp.StatusCode != http.StatusNotModified || body != "" {
+		t.Errorf("matching If-None-Match: status %d, body %q", resp.StatusCode, body)
+	}
+	resp, body = get(t, tester, "/file", `If-None-Match: "other"`)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("non-matching If-None-Match: status %d", resp.StatusCode)
+	}
+	expectBody(t, body, content)
+
+	// A conditional request for a response not in the cache yet.
+	resp, _ = get(t, tester, "/other", `If-None-Match: "abc"`)
+	if resp.StatusCode != http.StatusNotModified {
+		t.Errorf("conditional miss: status %d", resp.StatusCode)
+	}
+
+	if n := up.hits.Load(); n != 2 {
+		t.Errorf("the upstream got %d requests, want 2", n)
+	}
+}
+
+func TestUncacheableRangeRequestKeepsItsRange(t *testing.T) {
+	const content = "0123456789abcdefghijklmnopqrstuvwxyz"
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		http.ServeContent(w, r, "file.txt", time.Time{}, strings.NewReader(content))
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache
+		reverse_proxy `+up.addr())
+
+	// What the cache cannot store, the upstream answers itself, range included.
+	for range 2 {
+		resp, body := get(t, tester, "/file", "Range: bytes=10-15")
+		if resp.StatusCode != http.StatusPartialContent {
+			t.Errorf("status %d, want 206", resp.StatusCode)
+		}
+		expectBody(t, body, "abcdef")
+		expectStatus(t, resp, "Caddy; fwd=uri-miss; detail=NO-STORE; key=GET-http-localhost:9080-/file")
+	}
+}
+
+func TestVary(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Vary", "X-Lang")
+		_, _ = io.WriteString(w, "lang="+r.Header.Get("X-Lang"))
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache
+		reverse_proxy `+up.addr())
+
+	for _, lang := range []string{"fr", "en", "fr", "en", ""} {
+		_, body := get(t, tester, "/page", "X-Lang: "+lang)
+		expectBody(t, body, "lang="+lang)
+	}
+	if n := up.hits.Load(); n != 3 {
+		t.Errorf("the upstream got %d requests, want 3", n)
+	}
+}
+
+func TestVaryIgnored(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Vary", "Origin")
+		_, _ = io.WriteString(w, "image")
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache {
+			key {
+				disable_vary
+			}
+		}
+		reverse_proxy `+up.addr())
+
+	for _, origin := range []string{"https://a.example", "https://b.example", "https://c.example"} {
+		get(t, tester, "/image", "Origin: "+origin)
+	}
+	if n := up.hits.Load(); n != 1 {
+		t.Errorf("the upstream got %d requests, want 1", n)
+	}
+}
+
+func TestCompressedVariants(t *testing.T) {
+	text := strings.Repeat("Hello, gzip. ", 200)
+	tester := startCaddy(t, t.TempDir(), "", `
+		route /gzip {
+			cache
+			encode gzip
+			header Content-Type text/plain
+			respond "`+text+`"
+		}`)
+
+	// The test client does not ask for compression by itself.
+	resp, body := get(t, tester, "/gzip", "Accept-Encoding: gzip")
+	if resp.Header.Get("Content-Encoding") != "gzip" {
+		t.Fatalf("not compressed: %v", resp.Header)
+	}
+	compressed := body
+
+	// The same capabilities spelled differently select the same response.
+	resp, body = get(t, tester, "/gzip", "Accept-Encoding: GZIP;q=1.0, identity")
+	if !strings.Contains(resp.Header.Get("Cache-Status"), "; hit; ") || body != compressed {
+		t.Errorf("Cache-Status: %s", resp.Header.Get("Cache-Status"))
+	}
+
+	// A client that does not accept gzip gets its own.
+	resp, body = get(t, tester, "/gzip")
+	if resp.Header.Get("Content-Encoding") != "" {
+		t.Errorf("compressed response sent to a client that did not ask for it")
+	}
+	expectBody(t, body, text)
+}
+
+func TestUncacheableResponses(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/cookie":
+			w.Header().Set("Set-Cookie", "session=1")
+		case "/private":
+			w.Header().Set("Cache-Control", "private, max-age=60")
+		case "/no-store":
+			w.Header().Set("Cache-Control", "no-store")
+		case "/error":
+			w.WriteHeader(http.StatusInternalServerError)
+		case "/not-found":
+			w.WriteHeader(http.StatusNotFound)
+		}
+		_, _ = io.WriteString(w, "body of "+r.URL.Path)
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache
+		reverse_proxy `+up.addr())
+
+	cases := map[string]string{
+		"/cookie":    "SET-COOKIE",
+		"/private":   "PRIVATE",
+		"/no-store":  "NO-STORE",
+		"/error":     "UNCACHEABLE-STATUS",
+		"/not-found": "UNCACHEABLE-STATUS",
+	}
+	for path, reason := range cases {
+		for range 2 {
+			resp, body := get(t, tester, path)
+			expectStatus(t, resp, "Caddy; fwd=uri-miss; detail="+reason+"; key=GET-http-localhost:9080-"+path)
+			expectBody(t, body, "body of "+path)
+		}
+	}
+	if n := up.hits.Load(); n != int64(2*len(cases)) {
+		t.Errorf("the upstream got %d requests, want %d", n, 2*len(cases))
+	}
+	if n := cacheStats(t).Entries; n != 0 {
+		t.Errorf("%d responses stored", n)
+	}
+}
+
+func TestConcurrentRequestsShareOneFetch(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		_, _ = io.WriteString(w, "slow response")
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache
+		reverse_proxy `+up.addr())
+
+	const clients = 30
+	statuses := make([]string, clients)
+	var wg sync.WaitGroup
+	for i := range clients {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, body := get(t, tester, "/slow")
+			expectBody(t, body, "slow response")
+			statuses[i] = resp.Header.Get("Cache-Status")
+		}()
+	}
+	wg.Wait()
+
+	if n := up.hits.Load(); n != 1 {
+		t.Errorf("the upstream got %d requests, want 1", n)
+	}
+	leaders, followers := 0, 0
+	for _, status := range statuses {
+		switch {
+		case strings.Contains(status, "fwd=uri-miss; stored"):
+			leaders++
+		case strings.Contains(status, "fwd=uri-miss; collapsed"), strings.Contains(status, "; hit; "):
+			followers++
+		default:
+			t.Errorf("unexpected Cache-Status: %s", status)
+		}
+	}
+	if leaders != 1 || followers != clients-1 {
+		t.Errorf("%d requests fetched and %d waited, want 1 and %d", leaders, followers, clients-1)
+	}
+}
+
+func TestUncacheableResponsesAreNotSerialized(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.Header().Set("Cache-Control", "private")
+		_, _ = io.WriteString(w, "personal")
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache
+		reverse_proxy `+up.addr())
+
+	// The first request finds out the response is private.
+	get(t, tester, "/me")
+
+	start := time.Now()
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, body := get(t, tester, "/me")
+			expectBody(t, body, "personal")
+		}()
+	}
+	wg.Wait()
+
+	// One after the other they would take two seconds.
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("10 requests for a private response took %v", elapsed)
+	}
+}
+
+func TestStaleIfError(t *testing.T) {
+	var failing atomic.Bool
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if failing.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, "down")
+			return
+		}
+		_, _ = io.WriteString(w, "healthy")
+	})
+	tester := startCaddy(t, t.TempDir(), `
+			ttl 1s
+			stale 4s`, `
+		cache
+		reverse_proxy `+up.addr())
+	const key = "GET-http-localhost:9080-/svc"
+
+	_, body := get(t, tester, "/svc")
+	expectBody(t, body, "healthy")
+
+	failing.Store(true)
+	time.Sleep(1100 * time.Millisecond)
+
+	// The upstream answers with an error: the stale response is served.
+	resp, body := get(t, tester, "/svc")
+	expectStatus(t, resp, "Caddy; fwd=stale; fwd-status=503; detail=STALE; key="+key)
+	expectBody(t, body, "healthy")
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status %d, want 200", resp.StatusCode)
+	}
+
+	// The upstream does not answer at all.
+	up.CloseClientConnections()
+	up.Close()
+	resp, body = get(t, tester, "/svc")
+	expectStatus(t, resp, "Caddy; fwd=stale; detail=STALE; key="+key)
+	expectBody(t, body, "healthy")
+
+	// Past the stale period the error gets through.
+	time.Sleep(4 * time.Second)
+	resp, _ = get(t, tester, "/svc")
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("status %d once the stale period is over, want 502", resp.StatusCode)
+	}
+}
+
+func TestStaleWhileUpdating(t *testing.T) {
+	var slow atomic.Bool
+	var version atomic.Int64
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if slow.Load() {
+			time.Sleep(600 * time.Millisecond)
+		}
+		_, _ = fmt.Fprintf(w, "version %d", version.Add(1))
+	})
+	tester := startCaddy(t, t.TempDir(), `
+			ttl 1s
+			stale 10s`, `
+		cache
+		reverse_proxy `+up.addr())
+
+	_, body := get(t, tester, "/page")
+	expectBody(t, body, "version 1")
+
+	slow.Store(true)
+	time.Sleep(1100 * time.Millisecond)
+
+	// The first request after the expiry updates the response…
+	updated := make(chan string)
+	go func() {
+		_, body := get(t, tester, "/page")
+		updated <- body
+	}()
+	time.Sleep(150 * time.Millisecond)
+
+	// …and the others are served the stale one meanwhile, without waiting.
+	start := time.Now()
+	resp, body := get(t, tester, "/page")
+	if elapsed := time.Since(start); elapsed > 300*time.Millisecond {
+		t.Errorf("the stale response took %v", elapsed)
+	}
+	expectBody(t, body, "version 1")
+	if status := resp.Header.Get("Cache-Status"); !strings.HasPrefix(status, "Caddy; hit; ttl=-") || !strings.Contains(status, "detail=UPDATING") {
+		t.Errorf("Cache-Status: %s", status)
+	}
+
+	expectBody(t, <-updated, "version 2")
+	_, body = get(t, tester, "/page")
+	expectBody(t, body, "version 2")
+	if n := up.hits.Load(); n != 2 {
+		t.Errorf("the upstream got %d requests, want 2", n)
+	}
+}
+
+func TestMustRevalidateIsNeverServedStale(t *testing.T) {
+	var failing atomic.Bool
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if failing.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Cache-Control", "max-age=1, must-revalidate")
+		_, _ = io.WriteString(w, "strict")
+	})
+	tester := startCaddy(t, t.TempDir(), "stale 1h", `
+		cache
+		reverse_proxy `+up.addr())
+
+	get(t, tester, "/strict")
+	resp, _ := get(t, tester, "/strict")
+	expectHit(t, resp, "GET-http-localhost:9080-/strict", 1)
+
+	failing.Store(true)
+	time.Sleep(1100 * time.Millisecond)
+	resp, _ = get(t, tester, "/strict")
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status %d, want the 503 of the upstream", resp.StatusCode)
+	}
+}
+
+// TestClientDisconnect checks that a response keeps being stored when the
+// client that triggered its fetch goes away.
+func TestClientDisconnect(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "0123456789")
+		w.(http.Flusher).Flush()
+		time.Sleep(400 * time.Millisecond)
+		_, _ = io.WriteString(w, "abcdefghij")
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache
+		reverse_proxy `+up.addr())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, testURL+"/download", nil)
+	resp, err := tester.Client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := make([]byte, 10)
+	if _, err := io.ReadFull(resp.Body, head); err != nil || string(head) != "0123456789" {
+		t.Fatalf("read %q, %v", head, err)
+	}
+	// The client leaves in the middle of the download.
+	cancel()
+	_ = resp.Body.Close()
+
+	time.Sleep(800 * time.Millisecond)
+
+	resp, body := get(t, tester, "/download")
+	expectHit(t, resp, "GET-http-localhost:9080-/download", 120)
+	expectBody(t, body, "0123456789abcdefghij")
+	if n := up.hits.Load(); n != 1 {
+		t.Errorf("the upstream got %d requests, want 1", n)
+	}
+}
+
+func TestTruncatedUpstreamResponseIsNotStored(t *testing.T) {
+	var broken atomic.Bool
+	broken.Store(true)
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if !broken.Load() {
+			_, _ = io.WriteString(w, strings.Repeat("x", 1000))
+			return
+		}
+		w.Header().Set("Content-Length", "1000")
+		_, _ = io.WriteString(w, strings.Repeat("x", 500))
+		w.(http.Flusher).Flush()
+		panic(http.ErrAbortHandler)
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache
+		reverse_proxy `+up.addr())
+
+	req, _ := http.NewRequest(http.MethodGet, testURL+"/file", nil)
+	resp, err := tester.Client.Do(req)
+	if err == nil {
+		_, err = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+	}
+	if err == nil {
+		t.Error("the client was not told the response is incomplete")
+	}
+	if n := cacheStats(t).Entries; n != 0 {
+		t.Fatalf("a truncated response was stored")
+	}
+
+	broken.Store(false)
+	resp, body := get(t, tester, "/file")
+	expectStatus(t, resp, "Caddy; fwd=uri-miss; stored; key=GET-http-localhost:9080-/file")
+	expectBody(t, body, strings.Repeat("x", 1000))
+
+	dir := cacheStats(t).Path
+	if left, _ := os.ReadDir(filepath.Join(dir, tmpDirName)); len(left) != 0 {
+		t.Errorf("%d temporary files left", len(left))
+	}
+}
+
+// TestLargeResponseIsStreamed is the reason this cache exists: a response
+// much larger than the memory budget goes to the client and to the disk as
+// it arrives, without being held in memory, on a miss as on a hit.
+func TestLargeResponseIsStreamed(t *testing.T) {
+	const (
+		chunk  = 1 << 20
+		chunks = 96
+	)
+	block := bodyFor("large", chunk)
+	want := sha256.New()
+	for range chunks {
+		want.Write(block)
+	}
+
+	firstChunkRead := make(chan struct{})
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(block)
+		w.(http.Flusher).Flush()
+		// The client must get the beginning while the rest is still to come.
+		select {
+		case <-firstChunkRead:
+		case <-time.After(5 * time.Second):
+			t.Error("the response was not streamed: the client got nothing before its end")
+		}
+		for range chunks - 1 {
+			_, _ = w.Write(block)
+		}
+	})
+	tester := startCaddy(t, t.TempDir(), `
+			max_size 512Mi
+			max_memory 1Mi`, `
+		cache
+		reverse_proxy `+up.addr())
+	tester.Client.Timeout = time.Minute
+
+	download := func(signal chan struct{}) (http.Header, uint64) {
+		runtime.GC()
+		var before runtime.MemStats
+		runtime.ReadMemStats(&before)
+
+		var peak atomic.Uint64
+		stop := make(chan struct{})
+		sampled := make(chan struct{})
+		go func() {
+			defer close(sampled)
+			var m runtime.MemStats
+			for {
+				select {
+				case <-stop:
+					return
+				case <-time.After(5 * time.Millisecond):
+					runtime.ReadMemStats(&m)
+					if m.HeapAlloc > peak.Load() {
+						peak.Store(m.HeapAlloc)
+					}
+				}
+			}
+		}()
+
+		resp, err := tester.Client.Get(testURL + "/large")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		got := sha256.New()
+		if signal != nil {
+			if _, err := io.CopyN(got, resp.Body, chunk); err != nil {
+				t.Fatalf("reading the first chunk: %v", err)
+			}
+			close(signal)
+		}
+		n, err := io.Copy(got, resp.Body)
+		if err != nil {
+			t.Fatalf("after %d bytes: %v", n, err)
+		}
+		close(stop)
+		<-sampled
+
+		if !bytes.Equal(got.Sum(nil), want.Sum(nil)) {
+			t.Error("the body is damaged")
+		}
+
+		return resp.Header, max(peak.Load(), before.HeapAlloc) - before.HeapAlloc
+	}
+
+	header, grew := download(firstChunkRead)
+	if !strings.Contains(header.Get("Cache-Status"), "fwd=uri-miss; stored") {
+		t.Errorf("Cache-Status: %s", header.Get("Cache-Status"))
+	}
+	t.Logf("heap grew by %d MiB while relaying %d MiB from the upstream", grew>>20, chunks)
+	if grew > 32<<20 {
+		t.Errorf("the heap grew by %d MiB while relaying a %d MiB response", grew>>20, chunks)
+	}
+
+	for range 3 {
+		header, grew = download(nil)
+		if !strings.Contains(header.Get("Cache-Status"), "hit; ttl=") {
+			t.Errorf("Cache-Status: %s", header.Get("Cache-Status"))
+		}
+		if grew > 32<<20 {
+			t.Errorf("the heap grew by %d MiB while serving a %d MiB response from the cache", grew>>20, chunks)
+		}
+	}
+	t.Logf("heap grew by %d MiB while serving it from the cache", grew>>20)
+
+	if n := up.hits.Load(); n != 1 {
+		t.Errorf("the upstream got %d requests, want 1", n)
+	}
+	st := cacheStats(t)
+	if st.MemoryBytes > 1<<20 {
+		t.Errorf("the cache uses %d bytes of memory, over its limit", st.MemoryBytes)
+	}
+	if st.DiskBytes < chunks*chunk {
+		t.Errorf("%d bytes on disk, less than the response", st.DiskBytes)
+	}
+}
+
+func TestLimitsAreEnforced(t *testing.T) {
+	const size = 100_000
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(bodyFor(r.URL.Path, size))
+	})
+	dir := t.TempDir()
+	tester := startCaddy(t, dir, `
+			max_size 2Mi
+			max_memory 1Mi`, `
+		cache
+		reverse_proxy `+up.addr())
+
+	for round := range 4 {
+		for i := range 60 {
+			path := fmt.Sprintf("/object/%d", i)
+			_, body := get(t, tester, path)
+			if body != string(bodyFor(path, size)) {
+				t.Fatalf("round %d: %s is damaged", round, path)
+			}
+		}
+		st := cacheStats(t)
+		if st.DiskBytes > 2<<20 || st.MemoryBytes > 1<<20 {
+			t.Fatalf("round %d: limits exceeded: %+v", round, st)
+		}
+	}
+
+	var onDisk int64
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			onDisk += info.Size()
+		}
+		return nil
+	})
+	if onDisk > 2<<20 {
+		t.Errorf("%d bytes on disk, over the limit", onDisk)
+	}
+	st := cacheStats(t)
+	if st.Evicted == 0 || st.Entries == 0 {
+		t.Errorf("unexpected stats: %+v", st)
+	}
+
+	// A response larger than what may be stored is relayed all the same.
+	up.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(bodyFor("big", 3<<20))
+	})
+	for range 2 {
+		resp, body := get(t, tester, "/big")
+		if body != string(bodyFor("big", 3<<20)) {
+			t.Error("the oversized response is damaged")
+		}
+		if strings.Contains(resp.Header.Get("Cache-Status"), "hit") {
+			t.Errorf("Cache-Status: %s", resp.Header.Get("Cache-Status"))
+		}
+	}
+	if st := cacheStats(t); st.DiskBytes > 2<<20 {
+		t.Errorf("limits exceeded by an oversized response: %+v", st)
+	}
+}
+
+func TestCacheSurvivesReloadAndRestart(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "persistent")
+	})
+	dir := t.TempDir()
+	site := `
+		cache
+		reverse_proxy ` + up.addr()
+	const key = "GET-http-localhost:9080-/keep"
+
+	tester := startCaddy(t, dir, "ttl 1h", site)
+	get(t, tester, "/keep")
+
+	// A reload with other settings keeps the cache as it is.
+	tester = startCaddy(t, dir, `
+			ttl 1h
+			max_size 1Gi
+			max_memory 64Mi`, site)
+	resp, body := get(t, tester, "/keep")
+	expectHit(t, resp, key, 3600)
+	expectBody(t, body, "persistent")
+	if st := cacheStats(t); st.MaxSize != 1<<30 || st.MaxMemory != 64<<20 {
+		t.Errorf("the new limits were not applied: %+v", st)
+	}
+
+	// Moving the cache elsewhere closes the store, as stopping Caddy does…
+	tester = startCaddy(t, t.TempDir(), "ttl 1h", site)
+	resp, _ = get(t, tester, "/keep")
+	expectStatus(t, resp, "Caddy; fwd=uri-miss; stored; key="+key)
+
+	// …and coming back to it finds the responses on disk.
+	tester = startCaddy(t, dir, "ttl 1h", site)
+	resp, body = get(t, tester, "/keep")
+	if tier := expectHit(t, resp, key, 3600); tier != "DISK" {
+		t.Errorf("served from %s after a restart, want DISK", tier)
+	}
+	expectBody(t, body, "persistent")
+
+	if n := up.hits.Load(); n != 2 {
+		t.Errorf("the upstream got %d requests, want 2", n)
+	}
+}
+
+func TestAdminAPI(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, r.URL.Path)
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache
+		reverse_proxy `+up.addr())
+
+	paths := []string{"/a/1", "/a/2", "/b/1", "/b/2", "/c"}
+	for _, path := range paths {
+		get(t, tester, path)
+	}
+	if st := cacheStats(t); st.Entries != len(paths) || st.Stored != int64(len(paths)) || st.DiskBytes == 0 {
+		t.Errorf("unexpected stats: %+v", st)
+	}
+
+	isHit := func(path string) bool {
+		resp, _ := get(t, tester, path)
+		return strings.Contains(resp.Header.Get("Cache-Status"), "; hit; ")
+	}
+
+	if n := purge(t, "key=GET-http-localhost:9080-/c"); n != 1 {
+		t.Errorf("purged %d responses by key, want 1", n)
+	}
+	if isHit("/c") {
+		t.Error("/c is still cached after its purge")
+	}
+
+	if n := purge(t, "prefix=GET-http-localhost:9080-/a/"); n != 2 {
+		t.Errorf("purged %d responses by prefix, want 2", n)
+	}
+	if isHit("/a/1") || !isHit("/b/1") {
+		t.Error("the purge by prefix removed the wrong responses")
+	}
+
+	if n := purge(t, `regex=/b/\d$`); n != 2 {
+		t.Errorf("purged %d responses by regex, want 2", n)
+	}
+	if isHit("/b/2") {
+		t.Error("/b/2 is still cached after its purge")
+	}
+
+	purge(t, "all=true")
+	if st := cacheStats(t); st.Entries != 0 || st.DiskBytes != 0 {
+		t.Errorf("the cache is not empty after purging everything: %+v", st)
+	}
+
+	resp, err := http.Post(adminURL+"/cache/purge", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("a purge without target got status %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestUnsafeMethodsInvalidate(t *testing.T) {
+	var version atomic.Int64
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			version.Add(1)
+			if r.URL.Query().Has("fail") {
+				w.WriteHeader(http.StatusBadRequest)
+			}
+			return
+		}
+		_, _ = fmt.Fprintf(w, "version %d", version.Load())
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache
+		reverse_proxy `+up.addr())
+
+	_, body := get(t, tester, "/item")
+	expectBody(t, body, "version 0")
+
+	resp, _ := fetch(t, tester, http.MethodPost, "/item")
+	expectStatus(t, resp, "Caddy; fwd=bypass; detail=UNSUPPORTED-METHOD")
+	_, body = get(t, tester, "/item")
+	expectBody(t, body, "version 1")
+
+	// A failed request changed nothing.
+	get(t, tester, "/other")
+	fetch(t, tester, http.MethodPost, "/other?fail")
+	resp, _ = get(t, tester, "/other")
+	expectHit(t, resp, "GET-http-localhost:9080-/other", 120)
 }
 
 func TestHead(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port     9080
-		https_port    9443
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, "the body")
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
 		cache
-	}
-	localhost:9080 {
-		route /cache-head {
-			cache
-			respond "Hello, HEAD!"
-		}
-	}`, "caddyfile")
+		reverse_proxy `+up.addr())
+	const key = "GET-http-localhost:9080-/doc"
 
-	headReq, _ := http.NewRequest(http.MethodHead, "http://localhost:9080/cache-head", nil)
-	resp1, _ := tester.AssertResponse(headReq, 200, "")
-	if resp1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=HEAD-http-localhost:9080-/cache-head" {
-		t.Errorf("unexpected Cache-Status header %v", resp1.Header)
-	}
-	if resp1.Header.Get("Content-Length") != "12" {
-		t.Errorf("unexpected Content-Length header %v", resp1.Header)
-	}
+	// A HEAD request does not fill the cache…
+	resp, _ := fetch(t, tester, http.MethodHead, "/doc")
+	expectStatus(t, resp, "Caddy; fwd=uri-miss; detail=HEAD; key="+key)
 
-	resp2, _ := tester.AssertResponse(headReq, 200, "")
-	compareHit(t, resp2.Header, "HEAD-http-localhost:9080-/cache-head", "DEFAULT", 119)
-	if resp2.Header.Get("Content-Length") != "12" {
-		t.Errorf("unexpected Content-Length header %v", resp2.Header)
+	// …but is answered from it.
+	get(t, tester, "/doc")
+	resp, body := fetch(t, tester, http.MethodHead, "/doc")
+	expectHit(t, resp, key, 120)
+	if body != "" || resp.Header.Get("Content-Length") != "8" || resp.Header.Get("Content-Type") != "text/plain" {
+		t.Errorf("HEAD from the cache: body %q, headers %v", body, resp.Header)
+	}
+	if n := up.hits.Load(); n != 2 {
+		t.Errorf("the upstream got %d requests, want 2", n)
 	}
 }
 
-func TestQueryString(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port     9080
-		https_port    9443
-		cache {
+func TestModes(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/bypass") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
+		w.Header().Set("Etag", `"v1"`)
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		_, _ = io.WriteString(w, "content")
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		route /default {
+			cache
+			reverse_proxy `+up.addr()+`
+		}
+		route /strict {
+			cache {
+				mode strict
+			}
+			reverse_proxy `+up.addr()+`
+		}
+		route /bypass {
+			cache {
+				mode bypass_response
+			}
+			reverse_proxy `+up.addr()+`
+		}`)
+
+	// By default clients cannot force their way past the cache.
+	get(t, tester, "/default")
+	for _, header := range []string{"Cache-Control: no-cache", "Pragma: no-cache", "Cache-Control: max-age=0", "Cache-Control: no-store"} {
+		resp, _ := get(t, tester, "/default", header)
+		expectHit(t, resp, "GET-http-localhost:9080-/default", 120)
+	}
+
+	// In strict mode they are obeyed.
+	get(t, tester, "/strict")
+	resp, _ := get(t, tester, "/strict")
+	expectHit(t, resp, "GET-http-localhost:9080-/strict", 120)
+	resp, body := get(t, tester, "/strict", "Cache-Control: no-cache")
+	expectStatus(t, resp, "Caddy; fwd=stale; fwd-status=304; detail=REVALIDATED; key=GET-http-localhost:9080-/strict")
+	expectBody(t, body, "content")
+	resp, _ = get(t, tester, "/strict", "Cache-Control: no-store")
+	expectStatus(t, resp, "Caddy; fwd=bypass; detail=REQUEST-NO-STORE; key=GET-http-localhost:9080-/strict")
+	resp, _ = get(t, tester, "/strict?absent", "Cache-Control: only-if-cached")
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Errorf("only-if-cached for a response not in the cache: status %d, want 504", resp.StatusCode)
+	}
+
+	// The response directives can be ignored too.
+	get(t, tester, "/bypass")
+	resp, _ = get(t, tester, "/bypass")
+	expectHit(t, resp, "GET-http-localhost:9080-/bypass", 120)
+}
+
+// TestKeyTemplate covers the case of many URLs for one upstream object: the
+// key is built from what identifies the object, so they share one response.
+func TestKeyTemplate(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "object at "+r.URL.Path)
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		@image path_regexp image ^/img/download/(.+)/([0-9]+).*\.([A-Za-z0-9]+)$
+		cache @image {
 			key {
-				disable_query
+				template {re.image.1}/{re.image.2}.{re.image.3}
 			}
 		}
+		rewrite @image /bucket/images/{re.image.1}/{re.image.2}/full.{re.image.3}
+		reverse_proxy `+up.addr())
+
+	resp, body := get(t, tester, "/img/download/2024/5/17/123__safe_cute.png")
+	expectStatus(t, resp, `Caddy; fwd=uri-miss; stored; key="2024/5/17/123.png"`)
+	expectBody(t, body, "object at /bucket/images/2024/5/17/123/full.png")
+
+	for _, url := range []string{"/img/download/2024/5/17/123.png", "/img/download/2024/5/17/123__other_tags.png?download=1"} {
+		resp, body = get(t, tester, url)
+		expectHit(t, resp, `"2024/5/17/123.png"`, 120)
+		expectBody(t, body, "object at /bucket/images/2024/5/17/123/full.png")
 	}
-	localhost:9080 {
-		route /query-string {
+
+	_, body = get(t, tester, "/img/download/2024/5/17/124.png")
+	expectBody(t, body, "object at /bucket/images/2024/5/17/124/full.png")
+
+	if n := up.hits.Load(); n != 2 {
+		t.Errorf("the upstream got %d requests, want 2", n)
+	}
+}
+
+func TestDirectiveOptions(t *testing.T) {
+	tester := startCaddy(t, t.TempDir(), "", `
+		route /named {
+			cache {
+				cache_name Edge
+				ttl 10s
+				key {
+					hide
+				}
+			}
+			respond "named"
+		}
+		route /control {
+			cache {
+				default_cache_control "public, max-age=30"
+			}
+			respond "control"
+		}
+		route /excluded/* {
+			cache {
+				regex {
+					exclude ^/excluded/
+				}
+			}
+			respond "excluded"
+		}
+		route /status {
+			cache {
+				allowed_additional_status_codes 404
+			}
+			respond "nope" 404
+		}
+		route /query {
 			cache {
 				key {
 					disable_query
 				}
 			}
-			respond "Hello, query string!"
-		}
-	}`, "caddyfile")
+			respond "query"
+		}`)
 
-	resp1, _ := tester.AssertGetResponse(`http://localhost:9080/query-string?query=string`, 200, "Hello, query string!")
-	if resp1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/query-string" {
-		t.Errorf("unexpected Cache-Status header %v", resp1.Header)
+	get(t, tester, "/named")
+	resp, _ := get(t, tester, "/named")
+	if status := resp.Header.Get("Cache-Status"); status != "Edge; hit; ttl=10; detail=DISK" && status != "Edge; hit; ttl=9; detail=DISK" {
+		t.Errorf("Cache-Status: %s", status)
 	}
+
+	resp, _ = get(t, tester, "/control")
+	if cc := resp.Header.Get("Cache-Control"); cc != "public, max-age=30" {
+		t.Errorf("Cache-Control: %q", cc)
+	}
+	resp, _ = get(t, tester, "/control")
+	expectHit(t, resp, "GET-http-localhost:9080-/control", 30)
+	if cc := resp.Header.Get("Cache-Control"); cc != "public, max-age=30" {
+		t.Errorf("Cache-Control of the hit: %q", cc)
+	}
+
+	for range 2 {
+		resp, _ = get(t, tester, "/excluded/page")
+		expectStatus(t, resp, "Caddy; fwd=bypass; detail=EXCLUDED")
+	}
+
+	get(t, tester, "/status")
+	resp, body := get(t, tester, "/status")
+	expectHit(t, resp, "GET-http-localhost:9080-/status", 120)
+	if resp.StatusCode != http.StatusNotFound || body != "nope" {
+		t.Errorf("cached 404: status %d, body %q", resp.StatusCode, body)
+	}
+
+	get(t, tester, "/query?a=1")
+	resp, _ = get(t, tester, "/query?b=2")
+	expectHit(t, resp, "GET-http-localhost:9080-/query", 120)
 }
 
-func TestQueryStringSort(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port     9080
-		https_port    9443
-		cache {
-			key {
-				sort_query
-			}
+// TestHeadersSetBeforeTheCache covers the headers a directive in front of
+// the cache gives every response, such as a long max-age for the browsers:
+// they neither decide how long the cache keeps a response nor get stored.
+func TestHeadersSetBeforeTheCache(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/own" {
+			w.Header().Set("Cache-Control", "max-age=60")
 		}
-	}
-	localhost:9080 {
-		route /query-string-sort {
-			cache
-			respond "Hello, query string sort!"
-		}
-	}`, "caddyfile")
-
-	resp1, _ := tester.AssertGetResponse(`http://localhost:9080/query-string-sort?b=2&a=1`, 200, "Hello, query string sort!")
-	if resp1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/query-string-sort?a=1&b=2" {
-		t.Errorf("unexpected Cache-Status header %v", resp1.Header.Get("Cache-Status"))
-	}
-
-	resp2, _ := tester.AssertGetResponse(`http://localhost:9080/query-string-sort?a=1&b=2`, 200, "Hello, query string sort!")
-	compareHit(t, resp2.Header, "GET-http-localhost:9080-/query-string-sort?a=1&b=2", "DEFAULT", 119)
-
-	resp3, _ := tester.AssertGetResponse(`http://localhost:9080/query-string-sort?word=beta&word=alpha`, 200, "Hello, query string sort!")
-	if resp3.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/query-string-sort?word=alpha&word=beta" {
-		t.Errorf("unexpected Cache-Status header %v", resp3.Header.Get("Cache-Status"))
-	}
-}
-
-func TestMaxAge(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port     9080
-		https_port    9443
+		_, _ = io.WriteString(w, "image")
+	})
+	tester := startCaddy(t, t.TempDir(), "ttl 5s", `
+		header Cache-Control "public, max-age=31536000"
+		header Content-Disposition attachment
 		cache
-	}
-	localhost:9080 {
-		route /cache-max-age {
-			cache
-			header Cache-Control "max-age=60"
-			respond "Hello, max-age!"
+		reverse_proxy `+up.addr())
+
+	for i := range 2 {
+		resp, _ := get(t, tester, "/plain")
+		if got := resp.Header.Values("Cache-Control"); len(got) != 1 || got[0] != "public, max-age=31536000" {
+			t.Errorf("request %d: Cache-Control %q", i, got)
 		}
-	}`, "caddyfile")
-
-	resp1, _ := tester.AssertGetResponse(`http://localhost:9080/cache-max-age`, 200, "Hello, max-age!")
-	if resp1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/cache-max-age" {
-		t.Errorf("unexpected Cache-Status header %v", resp1.Header)
-	}
-
-	resp2, _ := tester.AssertGetResponse(`http://localhost:9080/cache-max-age`, 200, "Hello, max-age!")
-	compareHit(t, resp2.Header, "GET-http-localhost:9080-/cache-max-age", "DEFAULT", 59)
-
-	time.Sleep(2 * time.Second)
-	resp3, _ := tester.AssertGetResponse(`http://localhost:9080/cache-max-age`, 200, "Hello, max-age!")
-	compareHit(t, resp3.Header, "GET-http-localhost:9080-/cache-max-age", "DEFAULT", 57)
-}
-
-func TestMaxStale(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port     9080
-		https_port    9443
-		cache {
-			stale 5s
+		if got := resp.Header.Values("Content-Disposition"); len(got) != 1 || got[0] != "attachment" {
+			t.Errorf("request %d: Content-Disposition %q", i, got)
+		}
+		if i == 1 {
+			// The upstream said nothing: the configured ttl applies.
+			expectHit(t, resp, "GET-http-localhost:9080-/plain", 5)
 		}
 	}
-	localhost:9080 {
-		route /cache-max-stale {
-			cache
-			header Cache-Control "max-age=3"
-			respond "Hello, max-stale!"
+
+	for i := range 2 {
+		resp, _ := get(t, tester, "/own")
+		if got := resp.Header.Values("Cache-Control"); len(got) != 2 || got[1] != "max-age=60" {
+			t.Errorf("request %d: Cache-Control %q", i, got)
 		}
-	}`, "caddyfile")
-
-	maxStaleURL := "http://localhost:9080/cache-max-stale"
-
-	resp1, _ := tester.AssertGetResponse(maxStaleURL, 200, "Hello, max-stale!")
-	if resp1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/cache-max-stale" {
-		t.Errorf("unexpected Cache-Status header %v", resp1.Header)
-	}
-
-	resp2, _ := tester.AssertGetResponse(maxStaleURL, 200, "Hello, max-stale!")
-	compareHit(t, resp2.Header, "GET-http-localhost:9080-/cache-max-stale", "DEFAULT", 2)
-
-	time.Sleep(3 * time.Second)
-	reqMaxStale, _ := http.NewRequest(http.MethodGet, maxStaleURL, nil)
-	reqMaxStale.Header = http.Header{"Cache-Control": []string{"max-stale=3"}}
-	resp3, _ := tester.AssertResponse(reqMaxStale, 200, "Hello, max-stale!")
-	compareHit(t, resp3.Header, "GET-http-localhost:9080-/cache-max-stale", "DEFAULT", -1, "; fwd=stale")
-
-	time.Sleep(3 * time.Second)
-	resp4, _ := tester.AssertResponse(reqMaxStale, 200, "Hello, max-stale!")
-	if resp4.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/cache-max-stale" {
-		t.Errorf("unexpected Cache-Status header %v", resp4.Header.Get("Cache-Status"))
+		if i == 1 {
+			// What the upstream says is obeyed.
+			expectHit(t, resp, "GET-http-localhost:9080-/own", 60)
+		}
 	}
 }
 
-func TestSMaxAge(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port 9080
-		https_port 9443
-		cache {
-			ttl 1000s
-		}
-	}
-	localhost:9080 {
-		route /cache-s-maxage {
-			cache
-			header Cache-Control "s-maxage=5"
-			respond "Hello, s-maxage!"
-		}
-	}`, "caddyfile")
-
-	resp1, _ := tester.AssertGetResponse(`http://localhost:9080/cache-s-maxage`, 200, "Hello, s-maxage!")
-	if resp1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/cache-s-maxage" {
-		t.Errorf("unexpected Cache-Status header %v", resp1.Header.Get("Cache-Status"))
-	}
-
-	resp2, _ := tester.AssertGetResponse(`http://localhost:9080/cache-s-maxage`, 200, "Hello, s-maxage!")
-	compareHit(t, resp2.Header, "GET-http-localhost:9080-/cache-s-maxage", "DEFAULT", 4)
-}
-
-func TestAgeHeader(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port     9080
-		https_port    9443
-		cache {
-			ttl 1000s
-		}
-	}
-	localhost:9080 {
-		route /age-header {
-			cache
-			header Cache-Control "max-age=60"
-			respond "Hello, Age header!"
-		}
-	}`, "caddyfile")
-
-	resp1, _ := tester.AssertGetResponse(`http://localhost:9080/age-header`, 200, "Hello, Age header!")
-	if resp1.Header.Get("Age") != "" {
-		t.Errorf("unexpected Age header %v", resp1.Header.Get("Age"))
-	}
-
-	resp2, _ := tester.AssertGetResponse(`http://localhost:9080/age-header`, 200, "Hello, Age header!")
-	if resp2.Header.Get("Age") == "" {
-		t.Error("Age header should be present")
-	}
-	if resp2.Header.Get("Age") != "1" {
-		t.Error("Age header should be present")
-	}
-
-	time.Sleep(10 * time.Second)
-	resp3, _ := tester.AssertGetResponse(`http://localhost:9080/age-header`, 200, "Hello, Age header!")
-	if resp3.Header.Get("Age") != "11" {
-		t.Error("Age header should be present")
-	}
-}
-
-func TestKeyGeneration(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port     9080
-		https_port    9443
-		cache {
-			ttl 1000s
-		}
-	}
-	localhost:9080 {
-		route /key-template-route {
-			cache {
-				key {
-					template {method}-{host}-{path}-WITH_SUFFIX
-				}
-			}
-			respond "Hello, template route!"
-		}
-		route /key-headers-route {
-			cache {
-				key {
-					headers X-Header X-Internal
-				}
-			}
-			respond "Hello, headers route!"
-		}
-		route /key-hash-route {
-			cache {
-				key {
-					hash
-				}
-			}
-			respond "Hello, hash route!"
-		}
-	}`, "caddyfile")
-
-	resp1, _ := tester.AssertGetResponse(`http://localhost:9080/key-template-route`, 200, "Hello, template route!")
-	if resp1.Header.Get("Age") != "" {
-		t.Errorf("unexpected Age header %v", resp1.Header.Get("Age"))
-	}
-	if !strings.Contains(resp1.Header.Get("Cache-Status"), "key=GET-localhost-/key-template-route-WITH_SUFFIX") {
-		t.Errorf("unexpected Cache-Status header %v", resp1.Header.Get("Cache-Status"))
-	}
-
-	resp2, _ := tester.AssertGetResponse(`http://localhost:9080/key-template-route`, 200, "Hello, template route!")
-	if resp2.Header.Get("Age") == "" {
-		t.Error("Age header should be present")
-	}
-	if resp2.Header.Get("Age") != "1" {
-		t.Error("Age header should be present")
-	}
-	if !strings.Contains(resp2.Header.Get("Cache-Status"), "key=GET-localhost-/key-template-route-WITH_SUFFIX") {
-		t.Errorf("unexpected Cache-Status header %v", resp2.Header.Get("Cache-Status"))
-	}
-
-	rq, _ := http.NewRequest(http.MethodGet, "http://localhost:9080/key-headers-route", nil)
-	rq.Header = http.Header{
-		"X-Internal": []string{"my-value"},
-	}
-	resp1, _ = tester.AssertResponse(rq, 200, "Hello, headers route!")
-	if resp1.Header.Get("Age") != "" {
-		t.Errorf("unexpected Age header %v", resp1.Header.Get("Age"))
-	}
-	if !strings.Contains(resp1.Header.Get("Cache-Status"), "key=GET-http-localhost:9080-/key-headers-route--my-value") {
-		t.Errorf("unexpected Cache-Status header %v", resp1.Header.Get("Cache-Status"))
-	}
-
-	rq.Header = http.Header{
-		"X-Header":   []string{"first"},
-		"X-Internal": []string{"my-value"},
-	}
-	resp1, _ = tester.AssertResponse(rq, 200, "Hello, headers route!")
-	if resp1.Header.Get("Age") != "" {
-		t.Errorf("unexpected Age header %v", resp1.Header.Get("Age"))
-	}
-	if !strings.Contains(resp1.Header.Get("Cache-Status"), "key=GET-http-localhost:9080-/key-headers-route-first-my-value") {
-		t.Errorf("unexpected Cache-Status header %v", resp1.Header.Get("Cache-Status"))
-	}
-}
-
-func TestNotHandledRoute(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port 9080
-		https_port 9443
-		cache {
-			ttl 1000s
-			regex {
-				exclude ".*handled"
-			}
-		}
-	}
-	localhost:9080 {
-		route /not-handled {
-			cache
-			header Cache-Control "max-age=60"
-			header Age "max-age=5"
-			respond "Hello, Age header!"
-		}
-	}`, "caddyfile")
-
-	resp1, _ := tester.AssertGetResponse(`http://localhost:9080/not-handled`, 200, "Hello, Age header!")
-	if resp1.Header.Get("Cache-Status") != "Souin; fwd=bypass; detail=EXCLUDED-REQUEST-URI" {
-		t.Errorf("unexpected Cache-Status header value %v", resp1.Header.Get("Cache-Status"))
-	}
-}
-
-func TestMaxBodyByte(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port 9080
-		https_port 9443
-		cache {
-			ttl 5s
-			max_cacheable_body_bytes 30
-		}
-	}
-	localhost:9080 {
-		route /max-body-bytes-stored {
-			cache
-			respond "Hello, Max body bytes stored!"
-		}
-		route /max-body-bytes-not-stored {
-			cache
-			respond "Hello, Max body bytes not stored due to the response length!"
-		}
-	}`, "caddyfile")
-
-	respStored1, _ := tester.AssertGetResponse(`http://localhost:9080/max-body-bytes-stored`, 200, "Hello, Max body bytes stored!")
-	respStored2, _ := tester.AssertGetResponse(`http://localhost:9080/max-body-bytes-stored`, 200, "Hello, Max body bytes stored!")
-	if respStored1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/max-body-bytes-stored" {
-		t.Errorf("unexpected Cache-Status header value %v", respStored1.Header.Get("Cache-Status"))
-	}
-	if respStored1.Header.Get("Age") != "" {
-		t.Errorf("unexpected Age header %v", respStored1.Header.Get("Age"))
-	}
-
-	compareHit(t, respStored2.Header, "GET-http-localhost:9080-/max-body-bytes-stored", "DEFAULT", 4)
-	if respStored2.Header.Get("Age") == "" {
-		t.Error("Age header should be present")
-	}
-
-	respNotStored1, _ := tester.AssertGetResponse(`http://localhost:9080/max-body-bytes-not-stored`, 200, "Hello, Max body bytes not stored due to the response length!")
-	respNotStored2, _ := tester.AssertGetResponse(`http://localhost:9080/max-body-bytes-not-stored`, 200, "Hello, Max body bytes not stored due to the response length!")
-	if respNotStored1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; detail=UPSTREAM-RESPONSE-TOO-LARGE; key=GET-http-localhost:9080-/max-body-bytes-not-stored" {
-		t.Errorf("unexpected Cache-Status header value %v", respNotStored1.Header.Get("Cache-Status"))
-	}
-	if respNotStored1.Header.Get("Age") != "" {
-		t.Errorf("unexpected Age header %v", respNotStored1.Header.Get("Age"))
-	}
-
-	if respNotStored2.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; detail=UPSTREAM-RESPONSE-TOO-LARGE; key=GET-http-localhost:9080-/max-body-bytes-not-stored" {
-		t.Errorf("unexpected Cache-Status header value %v", respNotStored2.Header.Get("Cache-Status"))
-	}
-	if respNotStored2.Header.Get("Age") != "" {
-		t.Errorf("unexpected Age header %v", respNotStored2.Header.Get("Age"))
-	}
-}
-
-func TestAuthenticatedRoute(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port 9080
-		https_port 9443
-		cache {
-			ttl 1000s
-		}
-	}
-	localhost:9080 {
-		route /no-auth-bypass {
-			cache
-			respond "Hello, auth {http.request.header.Authorization}!"
-		}
-		route /auth-bypass {
-			cache {
-				key {
-					headers Authorization Content-Type
-				}
-			}
-			header Cache-Control "private, s-maxage=5"
-			respond "Hello, auth bypass {http.request.header.Authorization}!"
-		}
-		route /auth-bypass-vary {
-			cache {
-				key {
-					headers Authorization Content-Type
-				}
-			}
-			header Cache-Control "private, s-maxage=5"
-			header Vary "Content-Type, Authorization"
-			respond "Hello, auth vary bypass {http.request.header.Authorization}!"
-		}
-	}`, "caddyfile")
-
-	getRequestFor := func(endpoint, user string) *http.Request {
-		rq, _ := http.NewRequest(http.MethodGet, "http://localhost:9080"+endpoint, nil)
-		rq.Header = http.Header{"Authorization": []string{"Bearer " + user}, "Content-Type": []string{"text/plain"}}
-
-		return rq
-	}
-
-	respNoAuthBypass, _ := tester.AssertResponse(getRequestFor("/no-auth-bypass", "Alice"), 200, "Hello, auth Bearer Alice!")
-	if respNoAuthBypass.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; key=GET-http-localhost:9080-/no-auth-bypass; detail=PRIVATE-OR-AUTHENTICATED-RESPONSE" {
-		t.Errorf("unexpected Cache-Status header %v", respNoAuthBypass.Header.Get("Cache-Status"))
-	}
-
-	respAuthBypassAlice1, _ := tester.AssertResponse(getRequestFor("/auth-bypass", "Alice"), 200, "Hello, auth bypass Bearer Alice!")
-	if respAuthBypassAlice1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/auth-bypass-Bearer Alice-text/plain" {
-		t.Errorf("unexpected Cache-Status header %v", respAuthBypassAlice1.Header.Get("Cache-Status"))
-	}
-	respAuthBypassAlice2, _ := tester.AssertResponse(getRequestFor("/auth-bypass", "Alice"), 200, "Hello, auth bypass Bearer Alice!")
-	compareHit(t, respAuthBypassAlice2.Header, "GET-http-localhost:9080-/auth-bypass-Bearer Alice-text/plain", "DEFAULT", 4)
-
-	respAuthBypassBob1, _ := tester.AssertResponse(getRequestFor("/auth-bypass", "Bob"), 200, "Hello, auth bypass Bearer Bob!")
-	if respAuthBypassBob1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/auth-bypass-Bearer Bob-text/plain" {
-		t.Errorf("unexpected Cache-Status header %v", respAuthBypassBob1.Header.Get("Cache-Status"))
-	}
-	respAuthBypassBob2, _ := tester.AssertResponse(getRequestFor("/auth-bypass", "Bob"), 200, "Hello, auth bypass Bearer Bob!")
-	compareHit(t, respAuthBypassBob2.Header, "GET-http-localhost:9080-/auth-bypass-Bearer Bob-text/plain", "DEFAULT", 4)
-
-	respAuthVaryBypassAlice1, _ := tester.AssertResponse(getRequestFor("/auth-bypass-vary", "Alice"), 200, "Hello, auth vary bypass Bearer Alice!")
-	if respAuthVaryBypassAlice1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/auth-bypass-vary-Bearer Alice-text/plain" {
-		t.Errorf("unexpected Cache-Status header %v", respAuthVaryBypassAlice1.Header.Get("Cache-Status"))
-	}
-	respAuthVaryBypassAlice2, _ := tester.AssertResponse(getRequestFor("/auth-bypass-vary", "Alice"), 200, "Hello, auth vary bypass Bearer Alice!")
-	compareHit(t, respAuthVaryBypassAlice2.Header, "GET-http-localhost:9080-/auth-bypass-vary-Bearer Alice-text/plain", "DEFAULT", 4)
-}
-
-type testErrorHandler struct {
-	iterator int
-}
-
-func (t *testErrorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	t.iterator++
-	if t.iterator%2 == 0 {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Cache-Control", "must-revalidate")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("Hello must-revalidate!"))
-}
-
-func TestMustRevalidate(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port     9080
-		cache {
-			ttl 5s
-			stale 5s
-		}
-	}
-	localhost:9080 {
-		route /cache-default {
-			cache
-			reverse_proxy localhost:9081
-		}
-	}`, "caddyfile")
-
-	go func() {
-		errorHandler := testErrorHandler{}
-		_ = http.ListenAndServe(":9081", &errorHandler)
-	}()
-	time.Sleep(time.Second)
-	resp1, _ := tester.AssertGetResponse(`http://localhost:9080/cache-default`, http.StatusOK, "Hello must-revalidate!")
-	resp2, _ := tester.AssertGetResponse(`http://localhost:9080/cache-default`, http.StatusOK, "Hello must-revalidate!")
-	time.Sleep(6 * time.Second)
-	staleReq, _ := http.NewRequest(http.MethodGet, "http://localhost:9080/cache-default", nil)
-	staleReq.Header = http.Header{"Cache-Control": []string{"max-stale=3, stale-if-error=84600"}}
-	resp3, _ := tester.AssertResponse(staleReq, http.StatusOK, "Hello must-revalidate!")
-
-	if resp1.Header.Get("Cache-Control") != "must-revalidate" {
-		t.Errorf("unexpected resp1 Cache-Control header %v", resp1.Header.Get("Cache-Control"))
-	}
-	if resp1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/cache-default" {
-		t.Errorf("unexpected resp1 Cache-Status header %v", resp1.Header.Get("Cache-Status"))
-	}
-	if resp1.Header.Get("Age") != "" {
-		t.Errorf("unexpected resp1 Age header %v", resp1.Header.Get("Age"))
-	}
-
-	if resp2.Header.Get("Cache-Control") != "must-revalidate" {
-		t.Errorf("unexpected resp2 Cache-Control header %v", resp2.Header.Get("Cache-Control"))
-	}
-	compareHit(t, resp2.Header, "GET-http-localhost:9080-/cache-default", "DEFAULT", 4)
-	if resp2.Header.Get("Age") != "1" {
-		t.Errorf("unexpected resp2 Age header %v", resp2.Header.Get("Age"))
-	}
-
-	if resp3.Header.Get("Cache-Control") != "must-revalidate" {
-		t.Errorf("unexpected resp3 Cache-Control header %v", resp3.Header.Get("Cache-Control"))
-	}
-	compareHit(t, resp3.Header, "GET-http-localhost:9080-/cache-default", "DEFAULT", -2, "; fwd=stale; fwd-status=500")
-	if resp3.Header.Get("Age") != "7" {
-		t.Errorf("unexpected resp3 Age header %v", resp3.Header.Get("Age"))
-	}
-
-	resp4, _ := tester.AssertGetResponse(`http://localhost:9080/cache-default`, http.StatusOK, "Hello must-revalidate!")
-	if resp4.Header.Get("Cache-Control") != "must-revalidate" {
-		t.Errorf("unexpected resp4 Cache-Control header %v", resp4.Header.Get("Cache-Control"))
-	}
-	if resp4.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/cache-default" {
-		t.Errorf("unexpected resp4 Cache-Status header %v", resp4.Header.Get("Cache-Status"))
-	}
-	if resp4.Header.Get("Age") != "" {
-		t.Errorf("unexpected resp4 Age header %v", resp4.Header.Get("Age"))
-	}
-
-	time.Sleep(6 * time.Second)
-	staleReq, _ = http.NewRequest(http.MethodGet, "http://localhost:9080/cache-default", nil)
-	staleReq.Header = http.Header{"Cache-Control": []string{"max-stale=3"}}
-	resp5, _ := tester.AssertResponse(staleReq, http.StatusGatewayTimeout, "")
-
-	if resp5.Header.Get("Cache-Status") != "Souin; fwd=request; fwd-status=500; key=GET-http-localhost:9080-/cache-default; detail=REQUEST-REVALIDATION" {
-		t.Errorf("unexpected resp5 Cache-Status header %v", resp4.Header.Get("Cache-Status"))
-	}
-	if resp5.Header.Get("Age") != "" {
-		t.Errorf("unexpected resp5 Age header %v", resp4.Header.Get("Age"))
-	}
-}
-
-type staleIfErrorHandler struct {
-	iterator int
-}
-
-func (t *staleIfErrorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if t.iterator > 0 {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	t.iterator++
-	w.Header().Set("Cache-Control", "stale-if-error=86400")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("Hello stale-if-error!"))
-}
-
-func TestStaleIfError(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port     9080
-		cache {
-			ttl 5s
-			stale 5s
-		}
-	}
-	localhost:9080 {
-		route /stale-if-error {
-			cache
-			reverse_proxy localhost:9085
-		}
-	}`, "caddyfile")
-
-	go func() {
-		staleIfErrorHandler := staleIfErrorHandler{}
-		_ = http.ListenAndServe(":9085", &staleIfErrorHandler)
-	}()
-	time.Sleep(time.Second)
-	resp1, _ := tester.AssertGetResponse(`http://localhost:9080/stale-if-error`, http.StatusOK, "Hello stale-if-error!")
-	resp2, _ := tester.AssertGetResponse(`http://localhost:9080/stale-if-error`, http.StatusOK, "Hello stale-if-error!")
-
-	if resp1.Header.Get("Cache-Control") != "stale-if-error=86400" {
-		t.Errorf("unexpected resp1 Cache-Control header %v", resp1.Header.Get("Cache-Control"))
-	}
-	if resp1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/stale-if-error" {
-		t.Errorf("unexpected resp1 Cache-Status header %v", resp1.Header.Get("Cache-Status"))
-	}
-	if resp1.Header.Get("Age") != "" {
-		t.Errorf("unexpected resp1 Age header %v", resp1.Header.Get("Age"))
-	}
-
-	if resp2.Header.Get("Cache-Control") != "stale-if-error=86400" {
-		t.Errorf("unexpected resp2 Cache-Control header %v", resp2.Header.Get("Cache-Control"))
-	}
-	compareHit(t, resp2.Header, "GET-http-localhost:9080-/stale-if-error", "DEFAULT", 4)
-	if resp2.Header.Get("Age") != "1" {
-		t.Errorf("unexpected resp2 Age header %v", resp2.Header.Get("Age"))
-	}
-
-	time.Sleep(6 * time.Second)
-	staleReq, _ := http.NewRequest(http.MethodGet, "http://localhost:9080/stale-if-error", nil)
-	staleReq.Header = http.Header{"Cache-Control": []string{"stale-if-error=86400"}}
-	resp3, _ := tester.AssertResponse(staleReq, http.StatusOK, "Hello stale-if-error!")
-
-	if resp3.Header.Get("Cache-Control") != "stale-if-error=86400" {
-		t.Errorf("unexpected resp3 Cache-Control header %v", resp3.Header.Get("Cache-Control"))
-	}
-	compareHit(t, resp3.Header, "GET-http-localhost:9080-/stale-if-error", "DEFAULT", -2, "; fwd=stale; fwd-status=500")
-	if resp3.Header.Get("Age") != "7" {
-		t.Errorf("unexpected resp3 Age header %v", resp3.Header.Get("Age"))
-	}
-
-	resp4, _ := tester.AssertGetResponse(`http://localhost:9080/stale-if-error`, http.StatusOK, "Hello stale-if-error!")
-
-	compareHit(t, resp4.Header, "GET-http-localhost:9080-/stale-if-error", "DEFAULT", -2, "; fwd=stale; fwd-status=500")
-	if resp4.Header.Get("Age") != "7" && resp4.Header.Get("Age") != "8" {
-		t.Errorf("unexpected resp4 Age header %v", resp4.Header.Get("Age"))
-	}
-
-	time.Sleep(6 * time.Second)
-	resp5, _ := tester.AssertGetResponse(`http://localhost:9080/stale-if-error`, http.StatusInternalServerError, "")
-
-	if resp5.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; key=GET-http-localhost:9080-/stale-if-error; detail=UNCACHEABLE-STATUS-CODE" {
-		t.Errorf("unexpected resp5 Cache-Status header %v", resp5.Header.Get("Cache-Status"))
-	}
-
-	if resp5.Header.Get("Age") != "" {
-		t.Errorf("unexpected resp5 Age header %v", resp5.Header.Get("Age"))
-	}
-}
-
-type testETagsHandler struct{}
-
-const etagValue = "AAA-BBB"
-
-func (t *testETagsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if strings.Contains(r.Header.Get("If-None-Match"), etagValue) {
-		w.WriteHeader(http.StatusNotModified)
-
-		return
-	}
-	w.Header().Set("ETag", etagValue)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("Hello etag!"))
-}
-
-func Test_ETags(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port     9080
-		cache {
+func TestHandlerOverridesGlobalOptions(t *testing.T) {
+	tester := startCaddy(t, t.TempDir(), `
 			ttl 50s
-			stale 50s
-		}
-	}
-	localhost:9080 {
-		route /etags {
+			cache_name Global`, `
+		route /global {
 			cache
-			reverse_proxy localhost:9082
+			respond "global"
 		}
-	}`, "caddyfile")
-
-	go func() {
-		etagsHandler := testETagsHandler{}
-		_ = http.ListenAndServe(":9082", &etagsHandler)
-	}()
-	_, _ = tester.AssertGetResponse(`http://localhost:9080/etags`, http.StatusOK, "Hello etag!")
-	staleReq, _ := http.NewRequest(http.MethodGet, "http://localhost:9080/etags", nil)
-	staleReq.Header = http.Header{"If-None-Match": []string{etagValue}}
-	_, _ = tester.AssertResponse(staleReq, http.StatusNotModified, "")
-	staleReq.Header = http.Header{}
-	_, _ = tester.AssertResponse(staleReq, http.StatusOK, "Hello etag!")
-	staleReq.Header = http.Header{"If-None-Match": []string{etagValue}}
-	_, _ = tester.AssertResponse(staleReq, http.StatusNotModified, "")
-	staleReq.Header = http.Header{"If-None-Match": []string{"other"}}
-	_, _ = tester.AssertResponse(staleReq, http.StatusOK, "Hello etag!")
-}
-
-type testHugeMaxAgeHandler struct{}
-
-func (t *testHugeMaxAgeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "max-age=600")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("Hello, huge max age!"))
-}
-
-func TestHugeMaxAgeHandler(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port     9080
-		https_port    9443
-		cache
-	}
-	localhost:9080 {
-		route /huge-max-age {
-			cache
-			reverse_proxy localhost:9083
-		}
-	}`, "caddyfile")
-
-	go func() {
-		hugeMaxAgeHandler := testHugeMaxAgeHandler{}
-		_ = http.ListenAndServe(":9083", &hugeMaxAgeHandler)
-	}()
-	time.Sleep(time.Second)
-
-	resp1, _ := tester.AssertGetResponse(`http://localhost:9080/huge-max-age`, 200, "Hello, huge max age!")
-	if resp1.Header.Get("Age") != "" {
-		t.Errorf("unexpected Age header %v", resp1.Header.Get("Age"))
-	}
-	if resp1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/huge-max-age" {
-		t.Error("Cache-Status header should be present")
-	}
-
-	resp2, _ := tester.AssertGetResponse(`http://localhost:9080/huge-max-age`, 200, "Hello, huge max age!")
-	if resp2.Header.Get("Age") == "" {
-		t.Error("Age header should be present")
-	}
-	if resp2.Header.Get("Age") != "1" {
-		t.Error("Age header should be present")
-	}
-	compareHit(t, resp2.Header, "GET-http-localhost:9080-/huge-max-age", "DEFAULT", 599)
-
-	time.Sleep(2 * time.Second)
-	resp3, _ := tester.AssertGetResponse(`http://localhost:9080/huge-max-age`, 200, "Hello, huge max age!")
-	if resp3.Header.Get("Age") != "3" {
-		t.Error("Age header should be present")
-	}
-	compareHit(t, resp3.Header, "GET-http-localhost:9080-/huge-max-age", "DEFAULT", 597)
-}
-
-type testVaryHandler struct{}
-
-const variedHeader = "X-Varied"
-
-func (t *testVaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	time.Sleep(50 * time.Millisecond)
-	w.Header().Set("Vary", variedHeader)
-	w.Header().Set(variedHeader, r.Header.Get(variedHeader))
-	w.WriteHeader(http.StatusOK)
-	_, _ = fmt.Fprintf(w, "Hello, vary %s!", r.Header.Get(variedHeader))
-}
-
-func TestVaryHandler(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port     9080
-		https_port    9443
-		cache
-	}
-	localhost:9080 {
-		route /vary-multiple {
-			cache
-			reverse_proxy localhost:9084
-		}
-	}`, "caddyfile")
-
-	go func() {
-		varyHandler := testVaryHandler{}
-		_ = http.ListenAndServe(":9084", &varyHandler)
-	}()
-	time.Sleep(time.Second)
-
-	baseRq, _ := http.NewRequest(http.MethodGet, "http://localhost:9080/vary-multiple", nil)
-
-	rq1 := baseRq.Clone(context.Background())
-	rq1.Header.Set(variedHeader, "first")
-	rq2 := baseRq.Clone(context.Background())
-	rq2.Header.Set(variedHeader, "second")
-	rq3 := baseRq.Clone(context.Background())
-	rq3.Header.Set(variedHeader, "third")
-	rq4 := baseRq.Clone(context.Background())
-	rq4.Header.Set(variedHeader, "fourth")
-
-	requests := []*http.Request{
-		rq1,
-		rq2,
-		rq3,
-		rq4,
-	}
-
-	var wg sync.WaitGroup
-	resultMap := &sync.Map{}
-
-	for i, rq := range requests {
-		wg.Add(1)
-
-		go func(r *http.Request, iteration int) {
-			defer wg.Done()
-			res, _ := tester.AssertResponse(r, 200, fmt.Sprintf("Hello, vary %s!", r.Header.Get(variedHeader)))
-			resultMap.Store(iteration, res)
-		}(rq, i)
-	}
-
-	wg.Wait()
-
-	for i := 0; i < 4; i++ {
-		if res, ok := resultMap.Load(i); !ok {
-			t.Errorf("unexpected nil response for iteration %d", i)
-		} else {
-			rs, ok := res.(*http.Response)
-			if !ok {
-				t.Error("The object is not type of *http.Response")
-			}
-
-			if rs.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/vary-multiple" {
-				t.Errorf("The response %d doesn't match the expected header: %s", i, rs.Header.Get("Cache-Status"))
-			}
-		}
-	}
-
-	for i, rq := range requests {
-		wg.Add(1)
-
-		go func(r *http.Request, iteration int) {
-			defer wg.Done()
-			res, _ := tester.AssertResponse(r, 200, fmt.Sprintf("Hello, vary %s!", r.Header.Get(variedHeader)))
-			resultMap.Store(iteration, res)
-		}(rq, i)
-	}
-
-	wg.Wait()
-
-	checker := func(res any, ttl int) {
-		rs, ok := res.(*http.Response)
-		if !ok {
-			t.Error("The object is not type of *http.Response")
-		}
-
-		compareHit(t, rs.Header, "GET-http-localhost:9080-/vary-multiple", "DEFAULT", ttl)
-	}
-
-	if res, ok := resultMap.Load(0); !ok {
-		t.Errorf("unexpected nil response for iteration %d", 0)
-	} else {
-		checker(res, 119)
-	}
-
-	if res, ok := resultMap.Load(1); !ok {
-		t.Errorf("unexpected nil response for iteration %d", 1)
-	} else {
-		checker(res, 119)
-	}
-
-	if res, ok := resultMap.Load(2); !ok {
-		t.Errorf("unexpected nil response for iteration %d", 2)
-	} else {
-		checker(res, 119)
-	}
-
-	if res, ok := resultMap.Load(3); !ok {
-		t.Errorf("unexpected nil response for iteration %d", 3)
-	} else {
-		checker(res, 119)
-	}
-}
-
-func TestDisabledVaryHandler(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port     9080
-		https_port    9443
-		cache
-	}
-	localhost:9080 {
-		route /vary-multiple {
+		route /local {
 			cache {
-				key {
-					disable_vary
+				ttl 5s
+			}
+			respond "local"
+		}`)
+
+	get(t, tester, "/global")
+	resp, _ := get(t, tester, "/global")
+	if !strings.HasPrefix(resp.Header.Get("Cache-Status"), "Global; hit; ttl=5") && !strings.HasPrefix(resp.Header.Get("Cache-Status"), "Global; hit; ttl=49") {
+		t.Errorf("Cache-Status: %s", resp.Header.Get("Cache-Status"))
+	}
+
+	get(t, tester, "/local")
+	resp, _ = get(t, tester, "/local")
+	if !strings.HasPrefix(resp.Header.Get("Cache-Status"), "Global; hit; ttl=5;") && !strings.HasPrefix(resp.Header.Get("Cache-Status"), "Global; hit; ttl=4;") {
+		t.Errorf("Cache-Status: %s", resp.Header.Get("Cache-Status"))
+	}
+}
+
+func TestJSONConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	tester := caddytest.NewTester(t)
+	tester.InitServer(fmt.Sprintf(`{
+		"admin": {"listen": "localhost:2999"},
+		"apps": {
+			"cache": {
+				"path": %q,
+				"max_size": "64Mi",
+				"max_memory": 8388608,
+				"ttl": "1h"
+			},
+			"http": {
+				"http_port": 9080,
+				"servers": {
+					"test": {
+						"listen": [":9080"],
+						"routes": [{
+							"handle": [
+								{"handler": "cache", "stale": "30s", "key": {"disable_host": true}},
+								{"handler": "static_response", "body": "from json"}
+							]
+						}]
+					}
 				}
 			}
-			reverse_proxy localhost:9084
 		}
-	}`, "caddyfile")
+	}`, dir), "json")
 
-	go func() {
-		varyHandler := testVaryHandler{}
-		_ = http.ListenAndServe(":9084", &varyHandler)
-	}()
-	time.Sleep(time.Second)
+	get(t, tester, "/json")
+	resp, body := get(t, tester, "/json")
+	expectHit(t, resp, "GET-http-/json", 3600)
+	expectBody(t, body, "from json")
 
-	baseRq, _ := http.NewRequest(http.MethodGet, "http://localhost:9080/vary-multiple", nil)
-
-	rq1 := baseRq.Clone(context.Background())
-	rq1.Header.Set(variedHeader, "first")
-	rq2 := baseRq.Clone(context.Background())
-	rq2.Header.Set(variedHeader, "second")
-	rq3 := baseRq.Clone(context.Background())
-	rq3.Header.Set(variedHeader, "third")
-	rq4 := baseRq.Clone(context.Background())
-	rq4.Header.Set(variedHeader, "fourth")
-
-	requests := []*http.Request{
-		rq1,
-		rq2,
-		rq3,
-		rq4,
-	}
-
-	resultMap := &sync.Map{}
-
-	for i, rq := range requests {
-		res, _ := tester.AssertResponse(rq, 200, "Hello, vary first!")
-		resultMap.Store(i, res)
+	if st := cacheStats(t); st.Path != dir || st.MaxSize != 64<<20 || st.MaxMemory != 8<<20 {
+		t.Errorf("unexpected stats: %+v", st)
 	}
 }
 
-/*
-TODO: add opt-in to parse ESI
-func TestESITags(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port     9080
-		https_port    9443
-		cache {
-			ttl 1000s
-		}
-	}
-	localhost:9080 {
-		route /esi-include-1 {
+// TestRequestIsHandledTwiceAsReceived covers the responses the cache finds
+// out it cannot use after asking for them: the client's request then goes to
+// the upstream as it was received, not as the first attempt left it.
+func TestRequestIsHandledTwiceAsReceived(t *testing.T) {
+	var paths sync.Map
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		paths.Store(r.URL.Path+" "+r.Header.Get("X-Added"), true)
+		w.Header().Set("Cache-Control", "no-store")
+		http.ServeContent(w, r, "", time.Time{}, strings.NewReader("path="+r.URL.Path))
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		route {
 			cache
-			respond "esi-include-1 with some long content to ensure the compute works well. Also add some dummy text with some $pecial characters without recursive esi includes"
+			uri strip_prefix /api
+			request_header +X-Added once
+			reverse_proxy `+up.addr()+`
+		}`)
+
+	resp, body := get(t, tester, "/api/api/x", "Range: bytes=0-10")
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Errorf("status %d, want 206", resp.StatusCode)
+	}
+	expectBody(t, body, "path=/api/x")
+
+	paths.Range(func(key, _ any) bool {
+		if key != "/api/x once" {
+			t.Errorf("the upstream got a request for %q", key)
 		}
-		route /esi-include-2 {
-			cache
-			respond "esi-include-2"
-		}
-		route /esi-path {
-			cache
-			header Cache-Control "max-age=60"
-			respond "Hello <esi:include src=\"http://localhost:9080/esi-include-1\"/> and <esi:include src=\"http://localhost:9080/esi-include-2\"/>!"
-		}
-	}`, "caddyfile")
-
-	resp1, _ := tester.AssertGetResponse(`http://localhost:9080/esi-path`, 200, "Hello esi-include-1 with some long content to ensure the compute works well. Also add some dummy text with some $pecial characters without recursive esi includes and esi-include-2!")
-	if resp1.Header.Get("Age") != "" {
-		t.Errorf("unexpected Age header %v", resp1.Header.Get("Age"))
-	}
-	if resp1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/esi-path" {
-		t.Errorf("unexpected Cache-Status header %v", resp1.Header.Get("Cache-Status"))
-	}
-	if resp1.Header.Get("Content-Length") != "180" {
-		t.Errorf("unexpected Content-Length header %v", resp1.Header.Get("Content-Length"))
-	}
-
-	resp2, _ := tester.AssertGetResponse(`http://localhost:9080/esi-path`, 200, "Hello esi-include-1 with some long content to ensure the compute works well. Also add some dummy text with some $pecial characters without recursive esi includes and esi-include-2!")
-	if resp2.Header.Get("Age") == "" {
-		t.Error("Age header should be present")
-	}
-	if resp2.Header.Get("Age") != "1" {
-		t.Error("Age header should be present")
-	}
-
-	resp3, _ := tester.AssertGetResponse(`http://localhost:9080/esi-include-1`, 200, "esi-include-1 with some long content to ensure the compute works well. Also add some dummy text with some $pecial characters without recursive esi includes")
-	if resp3.Header.Get("Age") == "" {
-		t.Error("Age header should be present")
-	}
-	if resp3.Header.Get("Cache-Status") == "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/esi-include-1" {
-		t.Error("Cache-Status should be already stored")
-	}
-
-	resp4, _ := tester.AssertGetResponse(`http://localhost:9080/esi-include-2`, 200, "esi-include-2")
-	if resp4.Header.Get("Age") == "" {
-		t.Error("Age header should be present")
-	}
-	if resp4.Header.Get("Cache-Status") == "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/esi-include-2" {
-		t.Error("Cache-Status should be already stored")
-	}
+		return true
+	})
 }
-*/
 
-func TestCacheableStatusCode(t *testing.T) {
-	caddyTester := caddytest.NewTester(t)
-	caddyTester.InitServer(`
+func TestFailedReloadLeavesTheCacheAlone(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(bodyFor(r.URL.Path, 300_000))
+	})
+	dir := t.TempDir()
+	tester := startCaddy(t, dir, "max_size 100Mi", `
+		cache
+		reverse_proxy `+up.addr())
+
+	for i := range 10 {
+		get(t, tester, fmt.Sprintf("/object/%d", i))
+	}
+	before := cacheStats(t)
+
+	// This configuration shrinks the cache to less than it holds, but is
+	// refused once its first site is set up, for the limits of its second.
+	loadError(t, fmt.Sprintf(`
 	{
 		admin localhost:2999
-		http_port     9080
-		https_port    9443
+		http_port 9080
 		cache {
-			ttl 10s
+			path %s
+			max_size 1Mi
 		}
 	}
 	localhost:9080 {
 		cache
-
-		respond /cache-200 "" 200 {
-			close
-		}
-		respond /cache-204 "" 204 {
-			close
-		}
-		respond /cache-301 "" 301 {
-			close
-		}
-		respond /cache-405 "" 405 {
-			close
-		}
-	}`, "caddyfile")
-
-	cacheChecker := func(tester *caddytest.Tester, path string, expectedStatusCode int, expectedCached bool) {
-		resp1, _ := tester.AssertGetResponse("http://localhost:9080"+path, expectedStatusCode, "")
-		if resp1.Header.Get("Age") != "" {
-			t.Errorf("unexpected Age header %v", resp1.Header.Get("Age"))
-		}
-
-		cacheStatus := "Souin; fwd=uri-miss; "
-		if expectedCached {
-			cacheStatus += "stored; "
-		} else {
-			cacheStatus += "detail=UPSTREAM-ERROR-OR-EMPTY-RESPONSE; "
-		}
-		cacheStatus += "key=GET-http-localhost:9080-" + path
-
-		if resp1.Header.Get("Cache-Status") != cacheStatus {
-			t.Errorf("unexpected first Cache-Status header %v", resp1.Header.Get("Cache-Status"))
-		}
-
-		resp1, _ = tester.AssertGetResponse("http://localhost:9080"+path, expectedStatusCode, "")
-
-		cacheStatus = "Souin; "
-		detail := ""
-		if expectedCached {
-			if resp1.Header.Get("Age") != "1" {
-				t.Errorf("unexpected Age header %v", resp1.Header.Get("Age"))
-			}
-			cacheStatus += "hit; ttl=9; "
-			detail = "; detail=DEFAULT"
-		} else {
-			cacheStatus += "fwd=uri-miss; detail=UPSTREAM-ERROR-OR-EMPTY-RESPONSE; "
-		}
-		cacheStatus += "key=GET-http-localhost:9080-" + path + detail
-
-		if resp1.Header.Get("Cache-Status") != cacheStatus {
-			t.Errorf("unexpected second Cache-Status header %v", resp1.Header.Get("Cache-Status"))
-		}
+		reverse_proxy %s
 	}
-
-	cacheChecker(caddyTester, "/cache-200", 200, false)
-	cacheChecker(caddyTester, "/cache-204", 204, true)
-	cacheChecker(caddyTester, "/cache-301", 301, true)
-	cacheChecker(caddyTester, "/cache-405", 405, true)
-}
-
-func TestExpires(t *testing.T) {
-	expiresValue := time.Now().Add(time.Hour * 24)
-	caddyTester := caddytest.NewTester(t)
-	caddyTester.InitServer(fmt.Sprintf(`
-	{
-		admin localhost:2999
-		http_port     9080
-		https_port    9443
+	localhost:9081 {
 		cache {
-			ttl 10s
+			max_size 2Mi
 		}
+	}`, dir, up.addr()))
+
+	after := cacheStats(t)
+	if after.MaxSize != 100<<20 || after.Entries != before.Entries {
+		t.Errorf("a refused configuration changed the cache: %+v, was %+v", after, before)
 	}
-	localhost:9080 {
-		route /expires-only {
-			cache
-			header Expires "%[1]s"
-			respond "Hello, expires-only!"
-		}
-		route /expires-with-max-age {
-			cache
-			header Expires "%[1]s"
-			header Cache-Control "max-age=60"
-			respond "Hello, expires-with-max-age!"
-		}
-		route /expires-with-s-maxage {
-			cache
-			header Expires "%[1]s"
-			header Cache-Control "s-maxage=5"
-			respond "Hello, expires-with-s-maxage!"
-		}
-	}`, expiresValue.Format(time.RFC1123)), "caddyfile")
-
-	cacheChecker := func(tester *caddytest.Tester, path string, expectedBody string, expectedDuration int) {
-		resp1, _ := tester.AssertGetResponse("http://localhost:9080"+path, 200, expectedBody)
-		if resp1.Header.Get("Age") != "" {
-			t.Errorf("unexpected Age header %v", resp1.Header.Get("Age"))
-		}
-
-		if resp1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-"+path {
-			t.Errorf("unexpected first Cache-Status header %v", resp1.Header.Get("Cache-Status"))
-		}
-
-		resp1, _ = tester.AssertGetResponse("http://localhost:9080"+path, 200, expectedBody)
-
-		if resp1.Header.Get("Age") != "1" {
-			t.Errorf("unexpected Age header %v", resp1.Header.Get("Age"))
-		}
-
-		compareHit(t, resp1.Header, "GET-http-localhost:9080-"+path, "DEFAULT", expectedDuration)
-	}
-
-	cacheChecker(caddyTester, "/expires-only", "Hello, expires-only!", int(time.Until(expiresValue).Seconds())-1)
-	cacheChecker(caddyTester, "/expires-with-max-age", "Hello, expires-with-max-age!", 59)
-	cacheChecker(caddyTester, "/expires-with-s-maxage", "Hello, expires-with-s-maxage!", 4)
+	resp, _ := get(t, tester, "/object/0")
+	expectHit(t, resp, "GET-http-localhost:9080-/object/0", 120)
 }
 
-func TestComplexQuery(t *testing.T) {
-	caddyTester := caddytest.NewTester(t)
-	caddyTester.InitServer(`
-	{
-		admin localhost:2999
-		http_port     9080
-		https_port    9443
-		cache {
-			ttl 10s
-		}
-	}
-	localhost:9080 {
-		route /complex-query {
-			cache
-			respond "Hello, {query}!"
-		}
-	}`, "caddyfile")
-
-	cacheChecker := func(tester *caddytest.Tester, query string, expectedDuration int) {
-		body := fmt.Sprintf("Hello, %s!", query)
-		resp1, _ := tester.AssertGetResponse("http://localhost:9080/complex-query?"+query, 200, body)
-		if resp1.Header.Get("Age") != "" {
-			t.Errorf("unexpected Age header %v", resp1.Header.Get("Age"))
-		}
-
-		if resp1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/complex-query?"+query {
-			t.Errorf("unexpected first Cache-Status header %v", resp1.Header.Get("Cache-Status"))
-		}
-
-		resp1, _ = tester.AssertGetResponse("http://localhost:9080/complex-query?"+query, 200, body)
-
-		if resp1.Header.Get("Age") != "1" {
-			t.Errorf("unexpected Age header %v", resp1.Header.Get("Age"))
-		}
-
-		compareHit(t, resp1.Header, "GET-http-localhost:9080-/complex-query?"+query, "DEFAULT", expectedDuration)
-	}
-
-	cacheChecker(caddyTester, "fields[]=id&pagination=true", 9)
-	cacheChecker(caddyTester, "fields[]=id&pagination=false", 9)
-}
-
-func TestBypassWithExpiresAndRevalidate(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		debug
-		admin localhost:2999
-		http_port 9080
-		https_port 9443
-		cache {
-			ttl 5s
-			stale 5s
-			mode bypass
-		}
-	}
-	localhost:9080 {
-		route /bypass-with-expires-and-revalidate {
-			cache
-			header Expires 0
-			header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate"
-			respond "Hello, expires and revalidate!"
-		}
-	}`, "caddyfile")
-
-	respStored1, _ := tester.AssertGetResponse(`http://localhost:9080/bypass-with-expires-and-revalidate`, 200, "Hello, expires and revalidate!")
-	if respStored1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/bypass-with-expires-and-revalidate" {
-		t.Errorf("unexpected Cache-Status header value %v", respStored1.Header.Get("Cache-Status"))
-	}
-	if respStored1.Header.Get("Age") != "" {
-		t.Errorf("unexpected Age header %v", respStored1.Header.Get("Age"))
-	}
-
-	respStored2, _ := tester.AssertGetResponse(`http://localhost:9080/bypass-with-expires-and-revalidate`, 200, "Hello, expires and revalidate!")
-	compareHit(t, respStored2.Header, "GET-http-localhost:9080-/bypass-with-expires-and-revalidate", "DEFAULT", 4)
-	if respStored2.Header.Get("Age") == "" {
-		t.Error("Age header should be present")
-	}
-
-	time.Sleep(5 * time.Second)
-	respStored3, _ := tester.AssertGetResponse(`http://localhost:9080/bypass-with-expires-and-revalidate`, 200, "Hello, expires and revalidate!")
-	compareHit(t, respStored3.Header, "GET-http-localhost:9080-/bypass-with-expires-and-revalidate", "DEFAULT", -1, "; fwd=stale")
-	if respStored3.Header.Get("Age") == "" {
-		t.Error("Age header should be present")
-	}
-
-	time.Sleep(5 * time.Second)
-	respStored4, _ := tester.AssertGetResponse(`http://localhost:9080/bypass-with-expires-and-revalidate`, 200, "Hello, expires and revalidate!")
-	if respStored4.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/bypass-with-expires-and-revalidate" {
-		t.Errorf("unexpected Cache-Status header value %v", respStored4.Header.Get("Cache-Status"))
-	}
-	if respStored4.Header.Get("Age") != "" {
-		t.Errorf("unexpected Age header %v", respStored4.Header.Get("Age"))
-	}
-}
-
-func TestAllowedAdditionalStatusCode(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		debug
-		admin localhost:2999
-		http_port 9080
-		https_port 9443
-		cache {
-			allowed_additional_status_codes 202 400
-			ttl 5s
-		}
-	}
-	localhost:9080 {
-		route /bypass-with-expires-and-revalidate {
-			cache
-			respond "Hello, additional status code!"
-		}
-	}`, "caddyfile")
-
-	respStored1, _ := tester.AssertGetResponse(`http://localhost:9080/bypass-with-expires-and-revalidate`, 200, "Hello, additional status code!")
-	if respStored1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/bypass-with-expires-and-revalidate" {
-		t.Errorf("unexpected Cache-Status header value %v", respStored1.Header.Get("Cache-Status"))
-	}
-	if respStored1.Header.Get("Age") != "" {
-		t.Errorf("unexpected Age header %v", respStored1.Header.Get("Age"))
-	}
-
-	respStored2, _ := tester.AssertGetResponse(`http://localhost:9080/bypass-with-expires-and-revalidate`, 200, "Hello, additional status code!")
-	compareHit(t, respStored2.Header, "GET-http-localhost:9080-/bypass-with-expires-and-revalidate", "DEFAULT", 4)
-	if respStored2.Header.Get("Age") == "" {
-		t.Error("Age header should be present")
-	}
-}
-
-type testTimeoutHandler struct {
-	iterator int
-}
-
-func (t *testTimeoutHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	t.iterator++
-	if t.iterator%2 == 0 {
-		time.Sleep(5 * time.Second)
-
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("Hello timeout!"))
-}
-
-func TestTimeout(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port     9080
-		cache {
-			ttl 1ns
-			stale 1ns
-			timeout {
-				backend 1s
-			}
-		}
-	}
-	localhost:9080 {
-		route /cache-timeout {
-			cache
-			reverse_proxy localhost:9086
-		}
-	}`, "caddyfile")
-
-	go func() {
-		errorHandler := testTimeoutHandler{}
-		_ = http.ListenAndServe(":9086", &errorHandler)
-	}()
-	time.Sleep(time.Second)
-	resp1, _ := tester.AssertGetResponse(`http://localhost:9080/cache-timeout`, http.StatusOK, "Hello timeout!")
-	time.Sleep(time.Millisecond)
-	resp2, _ := tester.AssertGetResponse(`http://localhost:9080/cache-timeout`, http.StatusGatewayTimeout, "Internal server error")
-
-	if resp1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/cache-timeout" {
-		t.Errorf("unexpected resp1 Cache-Status header %v", resp1.Header.Get("Cache-Status"))
-	}
-
-	if resp1.Header.Get("Age") != "" {
-		t.Errorf("unexpected resp1 Age header %v", resp1.Header.Get("Age"))
-	}
-
-	if resp2.Header.Get("Cache-Status") != "Souin; fwd=bypass; detail=DEADLINE-EXCEEDED" {
-		t.Errorf("unexpected resp2 Cache-Status header %v", resp2.Header.Get("Cache-Status"))
-	}
-}
-
-type testSetCookieHandler struct{}
-
-const xCookieName = "X-Cookie-Name"
-
-func (t *testSetCookieHandler) ServeHTTP(w http.ResponseWriter, rq *http.Request) {
-	w.Header().Set("Set-Cookie", "foo="+rq.Header.Get(xCookieName))
-
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("Hello set-cookie!"))
-}
-
-func TestSetCookieNotStored(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		admin localhost:2999
-		http_port     9080
-		cache {
-			ttl 5s
-		}
-	}
-	localhost:9080 {
-		route /cache-set-cookie {
-			cache
-			reverse_proxy localhost:9087 {
-				header_down +Cache-Control no-cache=Set-Cookie
-			}
-		}
-	}`, "caddyfile")
-
-	go func() {
-		setCookieHandler := testSetCookieHandler{}
-		_ = http.ListenAndServe(":9087", &setCookieHandler)
-	}()
-	time.Sleep(time.Second)
-	rq, _ := http.NewRequest("GET", "http://localhost:9080/cache-set-cookie", nil)
-	rq.Header.Set(xCookieName, "bar")
-
-	resp1, _ := tester.AssertResponse(rq, http.StatusOK, "Hello set-cookie!")
-	time.Sleep(time.Millisecond)
-
-	rq.Header.Set(xCookieName, "baz")
-	resp2, _ := tester.AssertResponse(rq, http.StatusOK, "Hello set-cookie!")
-
-	if resp1.Header.Get("Set-Cookie") != "foo=bar" {
-		t.Errorf("unexpected resp1 Set-Cookie header %v", resp1.Header.Get("Set-Cookie"))
-	}
-
-	if resp1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/cache-set-cookie" {
-		t.Errorf("unexpected resp1 Cache-Status header %v", resp1.Header.Get("Cache-Status"))
-	}
-
-	if resp1.Header.Get("Age") != "" {
-		t.Errorf("unexpected resp1 Age header %v", resp1.Header.Get("Age"))
-	}
-
-	if resp2.Header.Get("Cache-Status") != "Souin; fwd=request; fwd-status=200; key=GET-http-localhost:9080-/cache-set-cookie; detail=REQUEST-REVALIDATION" {
-		t.Errorf("unexpected resp2 Cache-Status header %v", resp2.Header.Get("Cache-Status"))
-	}
-
-	if resp2.Header.Get("Set-Cookie") != "foo=baz" {
-		t.Errorf("unexpected resp2 Set-Cookie header %v", resp1.Header.Get("Set-Cookie"))
-	}
-}
-
-func TestAPIPlatformInvalidation(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		debug
-		admin localhost:2999
-		http_port     9080
-		cache {
-			api {
-				souin
-			}
-		}
-	}
-	localhost:9080 {
-		route /api-platform-invalidation {
-			cache
-
-			header Vary "Content-Type"
-			respond "Hello invalidation!"
-		}
-	}`, "caddyfile")
-
-	time.Sleep(time.Second)
-	reqResetCache, _ := http.NewRequest("PURGE", "http://localhost:2999/souin-api/souin/flush", nil)
-	reqSouinAPIList, _ := http.NewRequest(http.MethodGet, "http://localhost:2999/souin-api/souin", nil)
-	reqSouinAPISK, _ := http.NewRequest(http.MethodGet, "http://localhost:2999/souin-api/souin/surrogate_keys", nil)
-
-	_, _ = tester.AssertResponse(reqResetCache, http.StatusNoContent, "")
-	_, _ = tester.AssertResponse(reqSouinAPIList, http.StatusOK, "[]")
-	_, _ = tester.AssertResponse(reqSouinAPISK, http.StatusOK, "{}")
-	_, _ = tester.AssertGetResponse("http://localhost:9080/api-platform-invalidation", http.StatusOK, "Hello invalidation!")
-	resp4 := tester.AssertResponseCode(reqSouinAPIList, http.StatusOK)
-	resp5 := tester.AssertResponseCode(reqSouinAPISK, http.StatusOK)
-
-	var list []string
-	_ = json.NewDecoder(resp4.Body).Decode(&list)
-
-	if len(list) != 1 {
-		t.Errorf("unexpected list %#v", list)
-	}
-
-	var items map[string]string
-	_ = json.NewDecoder(resp5.Body).Decode(&items)
-
-	if len(items) != 2 {
-		t.Errorf("unexpected list %#v", items)
-	}
-}
-
-func TestRange(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
-	{
-		debug
-		admin localhost:2999
-		http_port     9080
-		cache {
-			api {
-				souin
-			}
-		}
-	}
-	localhost:9080 {
-		route /range-request {
-			cache
-
-			respond "Hello range-request!"
-		}
-	}`, "caddyfile")
-
-	reqRange, _ := http.NewRequest(http.MethodGet, "http://localhost:9080/range-request", nil)
-	reqRange.Header.Set("Range", "bytes=0-4, 6-10")
-
-	// The multipart byteranges payload is produced by http.ServeContent, whose
-	// boundary is randomly generated per response, so the body cannot be matched
-	// verbatim. Parse the multipart instead and assert the individual parts.
-	wantParts := []rangePart{
-		{contentRange: "bytes 0-4/20", body: "Hello"},
-		{contentRange: "bytes 6-10/20", body: "range"},
-	}
-
-	resp1 := tester.AssertResponseCode(reqRange, http.StatusPartialContent)
-	assertMultipartRanges(t, resp1, wantParts)
-
-	if resp1.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/range-request" {
-		t.Errorf("unexpected resp1 Cache-Status header %v", resp1.Header.Get("Cache-Status"))
-	}
-
-	if resp1.Header.Get("Age") != "" {
-		t.Errorf("unexpected resp1 Age header %v", resp1.Header.Get("Age"))
-	}
-
-	resp2 := tester.AssertResponseCode(reqRange, http.StatusPartialContent)
-	assertMultipartRanges(t, resp2, wantParts)
-
-	compareHit(t, resp2.Header, "GET-http-localhost:9080-/range-request", "DEFAULT", 119)
-
-	if resp2.Header.Get("Age") != "1" {
-		t.Errorf("unexpected resp2 Age header %v", resp2.Header.Get("Age"))
-	}
-}
-
-type rangePart struct {
-	contentRange string
-	body         string
-}
-
-// assertMultipartRanges parses a multipart/byteranges response body and asserts
-// the Content-Range header and payload of each part, ignoring the randomly
-// generated multipart boundary.
-func assertMultipartRanges(t *testing.T, resp *http.Response, want []rangePart) {
+// loadError submits a configuration that must be refused and returns why.
+func loadError(t *testing.T, config string) string {
 	t.Helper()
 
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-
-	mediaType, params, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	resp, err := http.Post(adminURL+"/load", "text/caddyfile", strings.NewReader(config))
 	if err != nil {
-		t.Fatalf("cannot parse Content-Type %q: %v", resp.Header.Get("Content-Type"), err)
+		t.Fatal(err)
 	}
-	if mediaType != "multipart/byteranges" {
-		t.Fatalf("expected multipart/byteranges Content-Type, got %q", mediaType)
-	}
+	defer func() { _ = resp.Body.Close() }()
 
-	mr := multipart.NewReader(resp.Body, params["boundary"])
-	got := make([]rangePart, 0, len(want))
-	for {
-		part, err := mr.NextPart()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("reading multipart part: %v", err)
-		}
-
-		body, err := io.ReadAll(part)
-		if err != nil {
-			t.Fatalf("reading multipart part body: %v", err)
-		}
-
-		got = append(got, rangePart{contentRange: part.Header.Get("Content-Range"), body: string(body)})
+	body, _ := io.ReadAll(resp.Body)
+	// The admin API starts answering with the warnings of the adapter, so a
+	// configuration refused afterwards still has a 200 status.
+	if resp.StatusCode == http.StatusOK && !bytes.Contains(body, []byte(`"error"`)) {
+		t.Errorf("configuration accepted:\n%s", config)
 	}
 
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("unexpected multipart parts\n got: %#v\nwant: %#v", got, want)
-	}
+	return string(body)
 }
 
-func TestCoalescing(t *testing.T) {
-	tester := caddytest.NewTester(t)
-	tester.InitServer(`
+func TestInvalidConfigurations(t *testing.T) {
+	// Something to submit the configurations to.
+	dir := t.TempDir()
+	startCaddy(t, dir, "", "")
+
+	site := func(cache string) string {
+		return `
+		{
+			admin localhost:2999
+			http_port 9080
+		}
+		localhost:9080 {
+			cache {
+				` + cache + `
+			}
+		}`
+	}
+
+	cases := map[string]string{
+		"redis {\n url 127.0.0.1:6379\n }": "storage backends were removed",
+		"storers badger":                   "storage backends were removed",
+		"max_size lots":                    "invalid size",
+		"max_size 0":                       "max_size must be positive",
+		"max_memory 4k":                    "max_memory must be at least",
+		"mode relaxed":                     "unknown cache mode",
+		"ttl":                              "wrong argument count",
+		"ttl soon":                         "invalid duration",
+		"surprise":                         "unsupported cache option",
+		"regex {\n exclude ( \n }":         "regex exclude",
+	}
+	for options, want := range cases {
+		if got := loadError(t, site(options)); !strings.Contains(got, want) {
+			t.Errorf("%q refused with %s, want an error about %q", options, got, want)
+		}
+	}
+
+	// One directory is one cache, with one set of limits.
+	got := loadError(t, fmt.Sprintf(`
 	{
 		admin localhost:2999
-		http_port     9080
+		http_port 9080
 		cache {
-			ttl 5s
+			path %s
 		}
 	}
 	localhost:9080 {
-		route /cache-set-cookie-coalescing {
-			cache
-			reverse_proxy localhost:9087 {
-				header_down +Cache-Control no-cache=Set-Cookie
+		route /a {
+			cache {
+				max_size 1Gi
 			}
 		}
-	}`, "caddyfile")
-
-	go func() {
-		setCookieHandler := testSetCookieHandler{}
-		_ = http.ListenAndServe(":9087", &setCookieHandler)
-	}()
-	time.Sleep(time.Second)
-	baseRq, _ := http.NewRequest("GET", "http://localhost:9080/cache-set-cookie-coalescing", nil)
-
-	rq1 := baseRq.Clone(context.Background())
-	rq1.Header.Set(xCookieName, "bar")
-	rq2 := baseRq.Clone(context.Background())
-	rq2.Header.Set(xCookieName, "baz")
-	rq3 := baseRq.Clone(context.Background())
-	rq3.Header.Set(xCookieName, "foo")
-
-	requests := []*http.Request{
-		rq1,
-		rq2,
-		rq3,
-	}
-
-	var wg sync.WaitGroup
-	resultMap := &sync.Map{}
-
-	for i, rq := range requests {
-		wg.Add(1)
-
-		go func(r *http.Request, iteration int) {
-			defer wg.Done()
-			res, _ := tester.AssertResponse(r, 200, "Hello set-cookie!")
-			resultMap.Store(iteration, res)
-		}(rq, i)
-	}
-
-	wg.Wait()
-
-	for i := 0; i < len(requests); i++ {
-		if res, ok := resultMap.Load(i); !ok {
-			t.Errorf("unexpected nil response for iteration %d", i)
-		} else {
-			rs, ok := res.(*http.Response)
-			if !ok {
-				t.Error("The object is not type of *http.Response")
-			}
-
-			if rs.Header.Get("Cache-Status") != "Souin; fwd=uri-miss; stored; key=GET-http-localhost:9080-/cache-set-cookie-coalescing" {
-				t.Errorf("The response %d doesn't match the expected header: %s", i, rs.Header.Get("Cache-Status"))
-			}
-			if rs.Header.Get("Set-Cookie") != fmt.Sprintf("foo=%s", requests[i].Header.Get(xCookieName)) {
-				t.Errorf("The response %d doesn't match the expected header: %s", i, rs.Header.Get("Cache-Status"))
+		route /b {
+			cache {
+				max_size 2Gi
 			}
 		}
+	}`, dir))
+	if !strings.Contains(got, "configured with different") {
+		t.Errorf("conflicting limits refused with %s", got)
 	}
 }

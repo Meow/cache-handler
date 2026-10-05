@@ -1,26 +1,39 @@
 Caddy Module: http.handlers.cache
 ================================
 
-This is a distributed HTTP cache module for Caddy based on [Souin](https://github.com/darkweak/souin) cache.
+An HTTP cache for Caddy that works the way nginx's `proxy_cache` does: responses are stored as files in a directory of bounded size, and the most requested ones are also kept in memory, within a strict budget.
 
-> [!WARNING]
-> Since `v1.7.0` Souin (the development repository that cache-handler is based on) implements only one storage. If you need a specific storage you have to take it from [the storages repository](https://github.com/darkweak/storages) and add it either in your code, during the build otherwise.  
-(e.g. with otter using caddy) You have to build your caddy module with the desired storage `xcaddy build --with github.com/caddyserver/cache-handler --with github.com/darkweak/storages/otter/caddy` and configure otter in your Caddyfile/JSON configuration file.  
-See the [documentation about the storages](https://docs.souin.io/docs/storages).
+> [!NOTE]
+> Earlier versions of this module were an adapter for [Souin](https://github.com/darkweak/souin) and its pluggable storage backends. This version is self-contained: it has one storage, built in, and no dependency on Souin. See [Migrating from the Souin based versions](#migrating-from-the-souin-based-versions).
 
 ## Features
 
-* [RFC 7234](https://httpwg.org/specs/rfc7234.html) compliant HTTP Cache.
-* Sets [the `Cache-Status` HTTP Response Header](https://httpwg.org/http-extensions/draft-ietf-httpbis-cache-header.html)
-* REST API to purge the cache and list stored resources.
-* ESI tags processing (using the [go-esi package](https://github.com/darkweak/go-esi)).
-* Builtin support for distributed cache.
+* Two storage tiers, both bounded: `max_size` on disk, `max_memory` in RAM.
+* Responses are streamed to the client and to the cache at the same time. A body is never buffered whole in memory, whatever its size.
+* The cache survives restarts and crashes: files are written atomically and the index is rebuilt from them in the background.
+* Concurrent requests for a missing response share one upstream request.
+* A response keeps being stored when the client that asked for it disconnects.
+* Expired responses are revalidated with `If-None-Match` / `If-Modified-Since` instead of being downloaded again, and can be served stale while they are updated or when the upstream fails.
+* `Range`, `If-None-Match`, `If-Modified-Since` and `HEAD` requests are answered from the cache.
+* `Vary` support, with `Accept-Encoding` normalized so that compressed variants are not multiplied.
+* Sets the [`Cache-Status`](https://www.rfc-editor.org/rfc/rfc9211) and `Age` response headers.
+* Statistics and purge on Caddy's admin endpoint.
 
-## Minimal Configuration
-Using the minimal configuration the responses will be cached for `120s`
+## Building
+
+```sh
+xcaddy build --with github.com/caddyserver/cache-handler
+```
+
+## Minimal configuration
+
 ```caddy
 {
-    cache
+    cache {
+        ttl 24h
+        max_memory 8Gi
+        max_size 25Gi
+    }
 }
 
 example.com {
@@ -29,403 +42,229 @@ example.com {
 }
 ```
 
-## Global Option Syntax
-Here are all the available options for the global options
+The `cache` directive is ordered before `rewrite`. The global `cache` block is optional: it sets the defaults every `cache` directive inherits.
+
+## Options
+
+The global option and the directive take the same options. A directive inherits from the global option whatever it does not set itself.
+
 ```caddy
-{
-    log {
-        level debug
+cache [<matcher>] {
+    path /var/cache/caddy
+    max_size 25Gi
+    max_memory 8Gi
+    inactive 30d
+
+    ttl 24h
+    stale 1h
+    lock_timeout 5s
+    mode strict
+    cache_name Caddy
+    default_cache_control "public, max-age=3600"
+    max_cacheable_body_bytes 1Gi
+    allowed_additional_status_codes 404 410
+
+    key {
+        disable_host
+        disable_method
+        disable_query
+        disable_scheme
+        disable_vary
+        sort_query
+        headers Authorization X-Tenant
+        template {http.request.uri.path}
+        hide
     }
-    cache {
-        allowed_http_verbs GET POST PATCH
-        api {
-            basepath /some-basepath
-            prometheus
-            souin {
-                basepath /souin-changed-endpoint-path
-            }
-        }
-        badger {
-            path the_path_to_a_file.json
-        }
-        cache_keys {
-            .*\.css {
-                disable_body
-                disable_host
-                disable_method
-                disable_query
-                headers X-Token Authorization
-                hide
-            }
-        }
-        cache_name Another
-        cdn {
-            api_key XXXX
-            dynamic
-            email darkweak@protonmail.com
-            hostname domain.com
-            network your_network
-            provider fastly
-            strategy soft
-            service_id 123456_id
-            zone_id anywhere_zone
-        }
-        etcd {
-            configuration {
-                # Your etcd configuration here
-            }
-        }
-        key {
-            disable_body
-            disable_host
-            disable_method
-            headers Content-Type Authorization
-        }
-        log_level debug
-        mode bypass
-        nuts {
-            path /path/to/the/storage
-        }
-        olric {
-            url url_to_your_cluster:3320
-            path the_path_to_a_file.yaml
-            configuration {
-                # Your olric configuration here
-            }
-        }
-        regex {
-            exclude /test2.*
-        }
-        stale 200s
-        ttl 1000s
-        default_cache_control no-store
-    }
-}
-
-:4443
-respond "Hello World!"
-```
-
-## Cache directive Syntax
-Here are all the available options for the directive options
-
-```
-@match path /path
-
-handle @match {
-    cache {
-        cache_name ChangeName
-        cache_keys {
-            (host1|host2).*\.css {
-                disable_body
-                disable_host
-                disable_method
-                disable_query
-                headers X-Token Authorization
-            }
-        }
-        cdn {
-            api_key XXXX
-            dynamic
-            email darkweak@protonmail.com
-            hostname domain.com
-            network your_network
-            provider fastly
-            strategy soft
-            service_id 123456_id
-            zone_id anywhere_zone
-        }
-        key {
-            disable_body
-            disable_host
-            disable_method
-            disable_query
-            headers Content-Type Authorization
-        }
-        log_level debug
-        regex {
-            exclude /test2.*
-        }
-        stale 200s
-        ttl 1000s
-        default_cache_control no-store
+    regex {
+        exclude ^/admin/
     }
 }
 ```
 
-## Provider Syntax
+| Option | Default | Description |
+|---|---|---|
+| `path` | `cache` in Caddy's data directory | Directory the responses are stored in. Directives using the same directory share one cache. The directory must be used by one Caddy process only. |
+| `max_size` | `10Gi` | Disk space the cache may take. The least recently used responses are removed to stay under it. |
+| `max_memory` | `256Mi` | RAM the cache may take, for its index and for the most requested responses. `off` keeps the responses on disk only. |
+| `inactive` | none | Removes the responses that were not requested for this long, fresh or not. |
+| `ttl` | `120s` | How long a response is fresh when the upstream does not say (no `Cache-Control: max-age` / `s-maxage`, no `Expires`). |
+| `stale` | `0` | How long past its freshness a response may still be served while it is being updated, or when the upstream fails. `Cache-Control: stale-while-revalidate` and `stale-if-error` in a response override it. |
+| `lock_timeout` | `5s` | How long a request waits for another one that is already fetching the same response, before going to the upstream itself. |
+| `mode` | | Which `Cache-Control` directives are honoured. By default those of the responses, but not those of the requests: a client cannot force its way past the cache. `strict` also honours the requests' (`no-cache`, `no-store`, `max-age`, `min-fresh`, `max-stale`, `only-if-cached`). `bypass_response` ignores the responses' and caches everything for `ttl`. `bypass` and `bypass_request` are accepted as aliases of `bypass_response` and of the default. |
+| `cache_name` | `Caddy` | Name of the cache in the `Cache-Status` header. |
+| `default_cache_control` | | `Cache-Control` given to the responses that have none. |
+| `max_cacheable_body_bytes` | half of `max_size` | Responses with a larger body are relayed without being stored. |
+| `allowed_additional_status_codes` | | Status codes to cache for `ttl`, besides 200, 203, 204, 300, 301 and 308. |
+| `key` | | Tunes the cache key, see below. |
+| `regex` `exclude` | | Requests whose URI matches are not cached. |
 
-### Badger
-The badger provider must have either the path or the configuration directive.
-```
-badger-path.com {
-    cache {
-        badger {
-            path /tmp/badger/first-match
-        }
+`max_size`, `max_memory` and `inactive` belong to the directory: two directives using the same `path` cannot disagree on them. Set them once in the global option, or give each cache its own `path`.
+
+Sizes are a number of bytes or a number with a unit: `k`, `m`, `g`, `t` and `Ki`, `Mi`, `Gi`, `Ti` are powers of 1024, `KB`, `MB`, `GB`, `TB` powers of 1000.
+
+In JSON, the handler is `{"handler": "cache", ...}` and the global options are the `cache` app, with the same option names.
+
+## How it works
+
+### Storage
+
+Every stored response is one file under `path`. It is written to a temporary file while it arrives and renamed into place when it is complete, so that a file is always whole: a crash or an interrupted download leaves nothing behind but a temporary file that is deleted on the next start. Files are never modified afterwards.
+
+An index of the files is kept in memory. On start it is rebuilt by reading the directory in the background; meanwhile, requests find the files that are not indexed yet directly on disk, so the cache is warm immediately.
+
+A response requested at least twice in a few minutes is copied to memory, provided it is requested more than the response it would push out. Responses in memory are still on disk: memory is an accelerator, never the only copy.
+
+### Limits
+
+`max_size` covers the cache files and the downloads in progress. When a response does not fit, the least recently used ones are deleted to make room. A response larger than half of `max_size` (or than `max_cacheable_body_bytes`) is not stored.
+
+`max_memory` covers the index (about 200 bytes plus the key per file) and the bodies and headers kept in memory. The bodies live outside the Go heap, in memory mapped for that purpose and returned to the system when the budget shrinks, so they do not weigh on the garbage collector. When the index alone approaches the budget, which takes millions of files, the least recently used files are removed.
+
+What is not counted is what serving requests takes: a few tens of kilobytes of buffers per request in progress, whatever the size of the response.
+
+### Fetching
+
+On a miss, the response is relayed to the client as it arrives from the upstream while it is written to the cache. If the client disconnects, the download goes on for the benefit of the next requests, as long as the upstream keeps sending.
+
+Other requests for the same response wait for the first one, up to `lock_timeout`, and are then served from the cache. When the response turns out not to be cacheable, they are released at once and, for a minute, requests for it are not made to wait at all.
+
+When the request that triggers a fetch asks for a range or carries a precondition, the whole response is fetched and stored first, and the request is answered from it.
+
+### Expiry
+
+A response past its freshness is not discarded. The next request for it revalidates it: the upstream is sent the `ETag` and `Last-Modified` of the stored response and, if it answers `304 Not Modified`, the stored response is fresh again without having been transferred. Otherwise the new response replaces it.
+
+With `stale` set, the other requests arriving during this update are served the stale response immediately, and a failure of the upstream (an error before the response, or a 5xx) is answered with the stale response too. Responses marked `must-revalidate`, `proxy-revalidate` or `no-cache` are never served stale.
+
+### What is cached
+
+Only `GET` requests fill the cache; `HEAD` requests are answered from it. A response is stored unless:
+
+* its status is not one of 200, 203, 204, 300, 301, 302, 307, 308, 404, 405, 410, 414, 501 or of `allowed_additional_status_codes`;
+* it does not say how long it is fresh and its status is not one `ttl` applies to;
+* it has `Cache-Control: no-store` or `private`;
+* it has a `Set-Cookie` header, or `Vary: *`;
+* the request had an `Authorization` header, and the response has none of `public`, `s-maxage`, `must-revalidate`, and `Authorization` is neither in `Vary` nor in the `key` `headers`;
+* it is already expired and has no `ETag` or `Last-Modified` to revalidate it with;
+* its body is larger than what may be stored.
+
+A successful `POST`, `PUT`, `PATCH` or `DELETE` request removes the response stored for its URI.
+
+The cache stores what the handlers after it produce. Headers set by a directive placed before it, such as `header Cache-Control "public, max-age=31536000"` for the browsers, are given to every response, served from the cache or not: they are not stored and do not decide how long a response is kept.
+
+## Cache key
+
+The default key is `METHOD-SCHEME-HOST-PATH?QUERY`, for instance `GET-https-example.com-/logo.png?v=2`. A different key means a different stored response, so the key should contain what makes the response different and nothing else.
+
+| `key` option | Effect |
+|---|---|
+| `disable_host`, `disable_method`, `disable_scheme` | Leaves that part out of the key. |
+| `disable_query` | Leaves the query string out: `/a?x=1` and `/a?x=2` are the same response. |
+| `sort_query` | Sorts the query parameters: `/a?x=1&y=2` and `/a?y=2&x=1` are the same response. |
+| `headers` | Adds the value of these request headers to the key. |
+| `template` | Replaces the key altogether. Caddy placeholders are supported. |
+| `disable_vary` | Ignores the `Vary` header of the responses. |
+| `hide` | Does not show the key in the `Cache-Status` header. |
+
+The key is computed before the request is rewritten. When several URLs are rewritten to the same upstream object, build the key from what identifies the object so that they share one stored response:
+
+```caddy
+@image path_regexp image ^/img/download/(.+)/([0-9]+).*\.([A-Za-z0-9]+)$
+cache @image {
+    key {
+        template {re.image.1}/{re.image.2}.{re.image.3}
     }
 }
-```
-```
-badger-configuration.com {
-    cache {
-        badger {
-            configuration {
-                # Required value
-                ValueDir <string>
-
-                # Optional
-                SyncWrites <bool>
-                NumVersionsToKeep <int>
-                ReadOnly <bool>
-                Compression <int>
-                InMemory <bool>
-                MetricsEnabled <bool>
-                MemTableSize <int>
-                BaseTableSize <int>
-                BaseLevelSize <int>
-                LevelSizeMultiplier <int>
-                TableSizeMultiplier <int>
-                MaxLevels <int>
-                VLogPercentile <float>
-                ValueThreshold <int>
-                NumMemtables <int>
-                BlockSize <int>
-                BloomFalsePositive <float>
-                BlockCacheSize <int>
-                IndexCacheSize <int>
-                NumLevelZeroTables <int>
-                NumLevelZeroTablesStall <int>
-                ValueLogFileSize <int>
-                ValueLogMaxEntries <int>
-                NumCompactors <int>
-                CompactL0OnClose <bool>
-                LmaxCompaction <bool>
-                ZSTDCompressionLevel <int>
-                VerifyValueChecksum <bool>
-                EncryptionKey <string>
-                EncryptionKeyRotationDuration <Duration>
-                BypassLockGuard <bool>
-                ChecksumVerificationMode <int>
-                DetectConflicts <bool>
-                NamespaceOffset <int>
-            }
-        }
-    }
-}
+rewrite @image /bucket/images/{re.image.1}/{re.image.2}/full.{re.image.3}
+reverse_proxy s3.example.com
 ```
 
-### Etcd
-The etcd provider must have the configuration directive.
-```
-etcd-configuration.com {
-    cache {
-        etcd {
-            configuration {
-                Endpoints etcd1:2379 etcd2:2379 etcd3:2379
-                AutoSyncInterval 1s
-                DialTimeout 1s
-                DialKeepAliveTime 1s
-                DialKeepAliveTimeout 1s
-                MaxCallSendMsgSize 10000000
-                MaxCallRecvMsgSize 10000000
-                Username john
-                Password doe
-                RejectOldCluster false
-                PermitWithoutStream false
-            }
-        }
-    }
-}
+Responses with a `Vary` header are stored once per combination of the request headers they list. An upstream that sends `Vary: Origin` to every browser, as object storages with CORS enabled do, makes one copy per origin: use `disable_vary` if the response does not actually depend on it.
+
+## The Cache-Status header
+
+| Value | Meaning |
+|---|---|
+| `Caddy; hit; ttl=3541; detail=MEMORY` | Served from memory, fresh for 3541 more seconds. |
+| `Caddy; hit; ttl=3541; detail=DISK` | Served from disk. |
+| `Caddy; hit; ttl=-12; detail=UPDATING` | Served stale while another request updates it. |
+| `Caddy; fwd=uri-miss; stored` | Fetched from the upstream and stored. |
+| `Caddy; fwd=uri-miss; collapsed` | Waited for another request fetching the same response. |
+| `Caddy; fwd=uri-miss; detail=<REASON>` | Fetched from the upstream and not stored: `NO-STORE`, `PRIVATE`, `SET-COOKIE`, `VARY-STAR`, `AUTHORIZATION`, `UNCACHEABLE-STATUS`, `EXPIRED`, `TOO-LARGE`, `HEAD`, `LOCK-TIMEOUT`, `STORAGE-ERROR`. |
+| `Caddy; fwd=stale; fwd-status=304; detail=REVALIDATED` | Expired, confirmed by the upstream, served from the cache. |
+| `Caddy; fwd=stale; stored` | Expired, replaced by a new response from the upstream. |
+| `Caddy; fwd=stale; fwd-status=503; detail=STALE` | Expired and served anyway because the upstream failed. |
+| `Caddy; fwd=bypass; detail=<REASON>` | Not handled by the cache: `UNSUPPORTED-METHOD`, `EXCLUDED`, `KEY-TOO-LONG`, `REQUEST-NO-STORE`. |
+
+The key follows as `; key=...` unless it is hidden.
+
+## Admin API
+
+The cache is observed and purged through [Caddy's admin endpoint](https://caddyserver.com/docs/api), `localhost:2019` by default.
+
+```sh
+# State of the caches: entries, bytes on disk and in memory, hits, misses, evictions…
+curl localhost:2019/cache/stats
+
+# Remove the response stored for a key, as shown in Cache-Status
+curl -X POST 'localhost:2019/cache/purge?key=GET-https-example.com-/logo.png'
+
+# Remove the responses whose key starts with a prefix, or matches a regular expression
+curl -X POST 'localhost:2019/cache/purge?prefix=GET-https-example.com-/img/'
+curl -X POST --data-urlencode 'regex=\.css$' -G 'localhost:2019/cache/purge'
+
+# Empty the caches
+curl -X POST 'localhost:2019/cache/purge?all=true'
 ```
 
-### NutsDB
-The nutsdb provider must have either the path or the configuration directive.
-```
-nuts-path.com {
-    cache {
-        nuts {
-            path /tmp/nuts-path
-        }
-    }
-}
-```
-```
-nuts-configuration.com {
-    cache {
-        nuts {
-            configuration {
-                Dir /tmp/nuts-configuration
-                EntryIdxMode 1
-                RWMode 0
-                SegmentSize 1024
-                NodeNum 42
-                SyncEnable true
-                StartFileLoadingMode 1
-            }
-        }
-    }
-}
-```
+With several caches, add `path=<directory>` to purge one of them only.
 
-### Olric
-The olric provider must have either the url directive to work as client mode.
-```
-olric-url.com {
-    cache {
-        olric {
-            url olric:3320
-        }
-    }
-}
-```
+## Coming from nginx
 
-The olric provider must have either the path or the configuration directive to work as embedded mode.
-```
-olric-path.com {
-    cache {
-        olric {
-            path /path/to/olricd.yml
-        }
-    }
-}
-```
-```
-olric-configuration.com {
-    cache {
-        nuts {
-            configuration {
-                Dir /tmp/nuts-configuration
-                EntryIdxMode 1
-                RWMode 0
-                SegmentSize 1024
-                NodeNum 42
-                SyncEnable true
-                StartFileLoadingMode 1
-            }
-        }
-    }
-}
-```
+| nginx | Here |
+|---|---|
+| `proxy_cache_path /var/www/cache` | `path /var/www/cache` |
+| `max_size=25000m` | `max_size 25000m` |
+| `keys_zone=name:8m` | Not needed: the index is part of `max_memory`. |
+| `inactive=720m` | `inactive 720m` |
+| `levels=1:2`, `use_temp_path=off` | Not needed. |
+| `proxy_cache_valid 6h` | `ttl 6h`. Add `allowed_additional_status_codes 302` to cover the same statuses. |
+| `proxy_cache_key $request_filename` | `key { template ... }`, see [Cache key](#cache-key). |
+| `proxy_cache_lock on` | Always on. `proxy_cache_lock_timeout` is `lock_timeout`. |
+| `proxy_cache_revalidate on` | Always on. |
+| `proxy_cache_use_stale updating error timeout http_5xx` | `stale <duration>` |
+| `proxy_cache_background_update on` | With `stale`, one request waits for the update and the others are served stale meanwhile. |
+| `proxy_ignore_headers Cache-Control Expires` | `mode bypass_response` |
+| `proxy_cache_bypass`, `proxy_no_cache` | A matcher on the `cache` directive, or `regex { exclude }`. |
+| `$upstream_cache_status` | The `Cache-Status` response header. |
 
-### Redis
-The redis provider must have either the URL or the configuration directive.
+What nginx leaves to the page cache of the kernel, serving hot files from RAM, is done here explicitly and within `max_memory`. Files that are not in memory are still served through the page cache like nginx does.
 
-```
-redis-url.com {
-    cache {
-        redis {
-            url 127.0.0.1:6379
-        }
-    }
-}
-```
-```
-redis-configuration.com {
-    cache {
-        redis {
-            configuration {
-                Network my-network
-                Addr 127.0.0.1:6379
-                Username user
-                Password password
-                DB 1
-                MaxRetries 1
-                MinRetryBackoff 5s
-                MaxRetryBackoff 5s
-                DialTimeout 5s
-                ReadTimeout 5s
-                WriteTimeout 5s
-                PoolFIFO true
-                PoolSize 99999
-                PoolTimeout 10s
-                MinIdleConns 100
-                MaxIdleConns 100
-                ConnMaxIdleTime 5s
-                ConnMaxLifetime 5s
-            }
-        }
-    }
-}
-```
+## Migrating from the Souin based versions
 
-You can also use the configuration. Refer to the [Souin docs](https://docs.souin.io/docs/storages/redis/)
-or [rueidis client options](https://github.com/redis/rueidis/blob/main/rueidis.go#L56) to define your config as key value.
+The storage backends are gone, and with them the need to build Caddy with a storage module: remove `badger`, `etcd`, `nats`, `nuts`, `olric`, `otter`, `redis`, `simplefs` and `storers` from your configuration and set `path`, `max_size` and `max_memory` instead. A configuration that still uses a removed option is refused with a message saying what to use instead.
 
-What does these directives mean?  
-|  Key                                      |  Description                                                                                                                                 |  Value example                                                                                                          |
-|:------------------------------------------|:---------------------------------------------------------------------------------------------------------------------------------------------|:------------------------------------------------------------------------------------------------------------------------|
-| `allowed_http_verbs`                      | The HTTP verbs allowed to be cached                                                                                                          | `GET POST PATCH`<br/><br/>`(default: GET HEAD)`                                                                         |
-| `allowed_additional_status_codes`            | The additional HTTP status codes allowed to be cached                                                                                        | `202 400`                                                                         |
-| `api`                                     | The cache-handler API cache management                                                                                                       |                                                                                                                         |
-| `api.basepath`                            | BasePath for all APIs to avoid conflicts                                                                                                     | `/your-non-conflict-route`<br/><br/>`(default: /souin-api)`                                                             |
-| `api.prometheus`                          | Enable the Prometheus metrics                                                                                                                |                                                                                                                         |
-| `api.souin.basepath`                      | Souin API basepath                                                                                                                           | `/another-souin-api-route`<br/><br/>`(default: /souin)`                                                                 |
-| `badger`                                  | Configure the Badger cache storage                                                                                                           |                                                                                                                         |
-| `badger.path`                             | Configure Badger with a file                                                                                                                 | `/anywhere/badger_configuration.json`                                                                                   |
-| `badger.configuration`                    | Configure Badger directly in the Caddyfile or your JSON caddy configuration                                                                  | [See the Badger configuration for the options](https://dgraph.io/docs/badger/get-started/)                              |
-| `cache_name`                              | Override the cache name to use in the Cache-Status response header                                                                           | `Another` `Caddy` `Cache-Handler` `Souin`                                                                               |
-| `cache_keys`                              | Define the key generation rules for each URI matching the key regexp                                                                         |                                                                                                                         |
-| `cache_keys.{your regexp}`                | Regexp that the URI should match to override the key generation                                                                              | `.+\.css`                                                                                                               |
-| `cache_keys.{your regexp}`                | Regexp that the URI should match to override the key generation                                                                              | `.+\.css`                                                                                                               |
-| `cache_keys.{your regexp}.disable_body`   | Disable the body part in the key matching the regexp (GraphQL context)                                                                       | `true`<br/><br/>`(default: false)`                                                                                      |
-| `cache_keys.{your regexp}.disable_host`   | Disable the host part in the key matching the regexp                                                                                         | `true`<br/><br/>`(default: false)`                                                                                      |
-| `cache_keys.{your regexp}.disable_method` | Disable the method part in the key matching the regexp                                                                                       | `true`<br/><br/>`(default: false)`                                                                                      |
-| `cache_keys.{your regexp}.disable_query`  | Disable the query string part in the key matching the regexp                                                                                 | `true`<br/><br/>`(default: false)`                                                                                      |
-| `cache_keys.{your regexp}.headers`        | Add headers to the key matching the regexp                                                                                                   | `Authorization Content-Type X-Additional-Header`                                                                        |
-| `cache_keys.{your regexp}.hide`           | Prevent the key from being exposed in the `Cache-Status` HTTP response header                                                                | `true`<br/><br/>`(default: false)`                                                                                      |
-| `cdn`                                     | The CDN management, if you use any cdn to proxy your requests Souin will handle that                                                         |                                                                                                                         |
-| `cdn.provider`                            | The provider placed before Souin                                                                                                             | `akamai`<br/><br/>`fastly`<br/><br/>`souin`                                                                             |
-| `cdn.api_key`                             | The api key used to access to the provider                                                                                                   | `XXXX`                                                                                                                  |
-| `cdn.dynamic`                             | Enable the dynamic keys returned by your backend application                                                                                 | `(default: true)`                                                                                                       |
-| `cdn.email`                               | The api key used to access to the provider if required, depending the provider                                                               | `XXXX`                                                                                                                  |
-| `cdn.hostname`                            | The hostname if required, depending the provider                                                                                             | `domain.com`                                                                                                            |
-| `cdn.network`                             | The network if required, depending the provider                                                                                              | `your_network`                                                                                                          |
-| `cdn.strategy`                            | The strategy to use to purge the cdn cache, soft will keep the content as a stale resource                                                   | `hard`<br/><br/>`(default: soft)`                                                                                       |
-| `cdn.service_id`                          | The service id if required, depending the provider                                                                                           | `123456_id`                                                                                                             |
-| `cdn.zone_id`                             | The zone id if required, depending the provider                                                                                              | `anywhere_zone`                                                                                                         |
-| `default_cache_control`                   | Set the default value of `Cache-Control` response header if not set by upstream (Souin treats empty `Cache-Control` as `public` if omitted)  | `no-store`                                                                                                              |
-| `key`                                     | Override the key generation with the ability to disable unecessary parts                                                                     |                                                                                                                         |
-| `key.disable_body`                        | Disable the body part in the key (GraphQL context)                                                                                           | `true`<br/><br/>`(default: false)`                                                                                      |
-| `key.disable_host`                        | Disable the host part in the key                                                                                                             | `true`<br/><br/>`(default: false)`                                                                                      |
-| `key.disable_method`                      | Disable the method part in the key                                                                                                           | `true`<br/><br/>`(default: false)`                                                                                      |
-| `key.disable_query`                       | Disable the query string part in the key                                                                                                     | `true`<br/><br/>`(default: false)`                                                                                      |
-| `key.disable_scheme`                      | Disable the scheme string part in the key                                                                                                    | `true`<br/><br/>`(default: false)`                                                                                      |
-| `key.disable_vary`                        | Disable the varied headers part in the key                                                                                                   | `true`<br/><br/>`(default: false)`                                                                                      |
-| `key.hash`                                | Hash the key before store it in the storage to get smaller keys                                                                              | `true`<br/><br/>`(default: false)`                                                                                      |
-| `key.headers`                             | Add headers to the key matching the regexp                                                                                                   | `Authorization Content-Type X-Additional-Header`                                                                        |
-| `key.hide`                                | Prevent the key from being exposed in the `Cache-Status` HTTP response header                                                                | `true`<br/><br/>`(default: false)`                                                                                      |
-| `key.template`                            | Use caddy templates to create the key (when this option is enabled, disable_* directives are skipped)                                        | `KEY-{http.request.uri.path}-{http.request.uri.query}`                                                                  |
-| `max_cacheable_body_bytes`                | Set the maximum size (in bytes) for a response body to be cached (unlimited if omited)                                                       | `1048576` (1MB)                                                                                                         |
-| `mode`                                    | Bypass the RFC respect                                                                                                                       | One of `bypass` `bypass_request` `bypass_response` `strict` (default `strict`)                                          |
-| `nuts`                                    | Configure the Nuts cache storage                                                                                                             |                                                                                                                         |
-| `nuts.path`                               | Set the Nuts file path storage                                                                                                               | `/anywhere/nuts/storage`                                                                                                |
-| `nuts.configuration`                      | Configure Nuts directly in the Caddyfile or your JSON caddy configuration                                                                    | [See the Nuts configuration for the options](https://github.com/nutsdb/nutsdb#default-options)                          |
-| `etcd`                                    | Configure the Etcd cache storage                                                                                                             |                                                                                                                         |
-| `etcd.configuration`                      | Configure Etcd directly in the Caddyfile or your JSON caddy configuration                                                                    | [See the Etcd configuration for the options](https://pkg.go.dev/go.etcd.io/etcd/clientv3#Config)                        |
-| `olric`                                   | Configure the Olric cache storage                                                                                                            |                                                                                                                         |
-| `olric.path`                              | Configure Olric with a file                                                                                                                  | `/anywhere/olric_configuration.json`                                                                                    |
-| `olric.configuration`                     | Configure Olric directly in the Caddyfile or your JSON caddy configuration                                                                   | [See the Olric configuration for the options](https://github.com/buraksezer/olric/blob/master/cmd/olricd/olricd.yaml/)  |
-| `otter`                                   | Configure the Otter cache storage                                                                                                            |                                                                                                                         |
-| `otter.configuration`                     | Configure Otter directly in the Caddyfile or your JSON caddy configuration                                                                   |                                                                                                                         |
-| `otter.configuration.size`                | Set the size of the pool in Otter                                                                                                            | `999999` (default `10000`)                                                                                              |
-| `redis`                                   | Configure the Redis cache storage                                                                                                            |                                                                                                                         |
-| `redis.url`                               | Set the Redis url storage                                                                                                                    | `localhost:6379`                                                                                                        |
-| `redis.configuration`                     | Configure Redis directly in the Caddyfile or your JSON caddy configuration                                                                   | [See the Nuts configuration for the options](https://github.com/nutsdb/nutsdb#default-options)                          |
-| `regex.exclude`                           | The regex used to prevent paths being cached                                                                                                 | `^[A-z]+.*$`                                                                                                            |
-| `stale`                                   | The stale duration                                                                                                                           | `25m`                                                                                                                   |
-| `storers`                                 | Storers chain to fallback if a previous one is unreachable or don't have the resource                                                        | `otter nuts badger redis`                                                                                               |
-| `timeout`                                 | The timeout configuration                                                                                                                    |                                                                                                                         |
-| `timeout.backend`                         | The timeout duration to consider the backend as unreachable                                                                                  | `10s`                                                                                                                   |
-| `timeout.cache`                           | The timeout duration to consider the cache provider as unreachable                                                                           | `10ms`                                                                                                                  |
-| `ttl`                                     | The TTL duration                                                                                                                             | `120s`                                                                                                                  |
-| `log_level`                               | The log level                                                                                                                                | `One of DEBUG, INFO, WARN, ERROR, DPANIC, PANIC, FATAL it's case insensitive`                                           |
+| Removed | Instead |
+|---|---|
+| Storage providers, `storers` | `path`, `max_size`, `max_memory`. The cache is local to one Caddy instance. |
+| `api` | The API is always available on the admin endpoint, under `/cache/`. |
+| `cache_keys` | One `cache` directive per matcher, each with its `key` block. |
+| `headers` | `key { headers ... }` |
+| `timeout` | The timeouts of `reverse_proxy`. |
+| `allowed_http_verbs`, `key { disable_body }` | Only `GET` and `HEAD` are cached. |
+| `cdn`, surrogate keys, ESI | Not supported. |
+| `log_level` | Caddy's `log` option. |
+| `key { hash }` | Not needed: keys are always hashed on disk. |
 
-Other resources
----------------
-You can find an example for the [Caddyfile](Caddyfile) or the [JSON file](configuration.json).  
-See the [Souin](https://github.com/darkweak/souin) configuration for the full configuration, and its associated [Caddyfile](https://github.com/darkweak/souin/blob/master/plugins/caddy/Caddyfile)  
+Other differences:
 
-### Development and Stable Versions
+* Request `Cache-Control` directives are ignored unless `mode strict` is set.
+* Responses with a 404, 405, 410, 414 or 501 status are only cached when they say for how long, or when listed in `allowed_additional_status_codes`.
+* The `Cache-Status` header names the cache `Caddy` and has different details, see above.
+* The admin API moved from `/souin-api` to `/cache`.
 
-The **Souin** repository serves as the development version, where new features are introduced and tested. Once these features have been thoroughly stabilized, they are integrated into the **cache-handler** repository through a dependency update. This ensures that **cache-handler** remains the stable and reliable version for production use.
+## Platform notes
+
+Linux, macOS and the BSDs are supported. On Linux, memory the cache gives up is returned to the system at once; on macOS and the BSDs the system takes it back when it needs it, so the resident size of the process may stay above what the cache uses for a while.
+
+On other systems the module builds and works, but the bodies kept in memory are on the Go heap, where freed memory is only returned by the garbage collector, and the cache directory is not protected against being used by two processes.

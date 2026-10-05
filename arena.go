@@ -1,0 +1,237 @@
+package httpcache
+
+import (
+	"io"
+	"os"
+	"sync"
+	"sync/atomic"
+)
+
+// arenaSegmentSize is how much address space the arena reserves at a time.
+// Pages are only backed by memory once a block is written to.
+const arenaSegmentSize = 16 << 20
+
+// arena hands out fixed-size blocks of memory that live outside the Go heap,
+// so the bodies kept in memory neither cost garbage collection time nor
+// inflate the heap target. It never has more than limit blocks in use and
+// returns the pages of the blocks above the limit to the operating system.
+type arena struct {
+	mu        sync.Mutex
+	blockSize int
+	segBlocks int
+	segs      [][]byte
+	// carved counts the blocks taken from segments at least once.
+	carved int
+	// free holds unused blocks whose pages are still resident, cold those
+	// whose pages were given back.
+	free    []uint32
+	cold    []uint32
+	limit   int
+	inUse   atomic.Int64
+	retired bool
+}
+
+func newArena() *arena {
+	bs := 4096
+	// Blocks are released page by page, so they must be page aligned.
+	if ps := os.Getpagesize(); ps > bs {
+		bs = ps
+	}
+
+	return &arena{blockSize: bs, segBlocks: arenaSegmentSize / bs}
+}
+
+// blocksFor returns how many blocks a body of size bytes takes.
+func (a *arena) blocksFor(size int64) int {
+	return int((size + int64(a.blockSize) - 1) / int64(a.blockSize))
+}
+
+// alloc returns a blob able to hold size bytes, or nil when that would exceed
+// the limit or memory cannot be obtained.
+func (a *arena) alloc(size int64) *blob {
+	n := a.blocksFor(size)
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.retired || int(a.inUse.Load())+n > a.limit {
+		return nil
+	}
+
+	for len(a.free)+len(a.cold)+len(a.segs)*a.segBlocks-a.carved < n {
+		seg, err := mapSegment(a.segBlocks * a.blockSize)
+		if err != nil {
+			return nil
+		}
+		a.segs = append(a.segs, seg)
+	}
+
+	b := &blob{a: a, size: size, blockSize: a.blockSize, ids: make([]uint32, n), blocks: make([][]byte, n)}
+	for i := range n {
+		var id uint32
+		switch {
+		case len(a.free) > 0:
+			id = a.free[len(a.free)-1]
+			a.free = a.free[:len(a.free)-1]
+		case len(a.cold) > 0:
+			id = a.cold[len(a.cold)-1]
+			a.cold = a.cold[:len(a.cold)-1]
+		default:
+			id = uint32(a.carved)
+			a.carved++
+		}
+		b.ids[i] = id
+		b.blocks[i] = a.block(id)
+	}
+	b.refs.Store(1)
+	a.inUse.Add(int64(n))
+
+	return b
+}
+
+func (a *arena) block(id uint32) []byte {
+	seg := a.segs[int(id)/a.segBlocks]
+	off := (int(id) % a.segBlocks) * a.blockSize
+
+	return seg[off : off+a.blockSize : off+a.blockSize]
+}
+
+func (a *arena) put(b *blob) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.free = append(a.free, b.ids...)
+	a.inUse.Add(-int64(len(b.ids)))
+	b.ids, b.blocks = nil, nil
+
+	a.trimLocked()
+	if a.retired && a.inUse.Load() == 0 {
+		a.unmapLocked()
+	}
+}
+
+// setLimit changes how many blocks may be in use. Blocks already handed out
+// stay valid; the caller is expected to release blobs until inUse fits.
+func (a *arena) setLimit(blocks int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.limit = blocks
+	a.trimLocked()
+}
+
+// trimLocked gives the pages of free blocks back to the operating system
+// until no more memory is resident than the limit allows.
+func (a *arena) trimLocked() {
+	target := max(a.limit, int(a.inUse.Load()))
+	for a.carved-len(a.cold) > target && len(a.free) > 0 {
+		id := a.free[len(a.free)-1]
+		a.free = a.free[:len(a.free)-1]
+		releasePages(a.block(id))
+		a.cold = append(a.cold, id)
+	}
+}
+
+// retire makes the arena refuse new allocations and unmaps its memory once
+// the last blob is released.
+func (a *arena) retire() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.retired = true
+	if a.inUse.Load() == 0 {
+		a.unmapLocked()
+	}
+}
+
+func (a *arena) unmapLocked() {
+	for _, seg := range a.segs {
+		unmapSegment(seg)
+	}
+	a.segs, a.free, a.cold, a.carved = nil, nil, nil, 0
+}
+
+// residentBytes reports how much memory the arena holds from the system.
+func (a *arena) residentBytes() int64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return int64(a.carved-len(a.cold)) * int64(a.blockSize)
+}
+
+// blob is a body held in arena blocks. It is reference counted: the index
+// owns one reference while the blob is attached to an entry, and every reader
+// owns one while it serves from it. References are only taken under the store
+// lock from an attached blob, so the count can never climb back from zero.
+type blob struct {
+	a         *arena
+	ids       []uint32
+	blocks    [][]byte
+	size      int64
+	blockSize int
+	refs      atomic.Int32
+}
+
+func (b *blob) acquire() {
+	b.refs.Add(1)
+}
+
+func (b *blob) release() {
+	if b.refs.Add(-1) == 0 {
+		b.a.put(b)
+	}
+}
+
+// fill reads the whole body from r, which holds it at offset off.
+func (b *blob) fill(r io.ReaderAt, off int64) error {
+	for i, blk := range b.blocks {
+		start := int64(i) * int64(b.blockSize)
+		n := min(int64(b.blockSize), b.size-start)
+		if _, err := r.ReadAt(blk[:n], off+start); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// blobReader reads a blob as a stream. The caller must hold a reference on
+// the blob for as long as it uses the reader.
+type blobReader struct {
+	b   *blob
+	off int64
+}
+
+func (r *blobReader) Read(p []byte) (int, error) {
+	if r.off >= r.b.size {
+		return 0, io.EOF
+	}
+
+	bs := int64(r.b.blockSize)
+	n := 0
+	for n < len(p) && r.off < r.b.size {
+		i := r.off / bs
+		start := r.off % bs
+		end := min(bs, r.b.size-i*bs)
+		c := copy(p[n:], r.b.blocks[i][start:end])
+		n += c
+		r.off += int64(c)
+	}
+
+	return n, nil
+}
+
+func (r *blobReader) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekCurrent:
+		offset += r.off
+	case io.SeekEnd:
+		offset += r.b.size
+	}
+	if offset < 0 {
+		return 0, os.ErrInvalid
+	}
+	r.off = offset
+
+	return offset, nil
+}

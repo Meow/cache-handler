@@ -1,94 +1,115 @@
 package httpcache
 
 import (
+	"fmt"
+	"sync"
+
 	"github.com/caddyserver/caddy/v2"
-	"github.com/darkweak/souin/configurationtypes"
-	"github.com/darkweak/souin/pkg/storage/types"
-	"github.com/darkweak/souin/pkg/surrogate/providers"
-	"github.com/darkweak/storages/core"
+	"github.com/caddyserver/caddy/v2/caddyconfig"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 )
 
-type notifierItem struct {
-	API              configurationtypes.API
-	SurrogateStorage providers.SurrogateInterface
-}
+const moduleName = "cache"
 
-// SouinApp contains the whole Souin necessary items
-type SouinApp struct {
-	DefaultCache
-	// The provider to use.
-	Storers []types.Storer
-	// Surrogate storage to support the configuration reload without surrogate-key data loss.
-	SurrogateStorage providers.SurrogateInterface
-	// SurrogateKeyDisabled opt-out the Surrogate key system.
-	SurrogateKeyDisabled bool
-	// Cache-key tweaking.
-	CacheKeys configurationtypes.CacheKeys `json:"cache_keys,omitempty"`
-	// API endpoints enablers.
-	API configurationtypes.API `json:"api,omitempty"`
-	// Logger level, fallback on caddy's one when not redefined.
-	LogLevel string `json:"log_level,omitempty"`
-
-	notifier chan notifierItem
-}
+// stores holds the open stores by directory. It outlives the configurations,
+// so that reloading Caddy keeps the index and the responses held in memory.
+var stores = caddy.NewUsagePool()
 
 func init() {
-	caddy.RegisterModule(new(SouinApp))
+	caddy.RegisterModule(new(App))
+	httpcaddyfile.RegisterGlobalOption(moduleName, parseCaddyfileGlobalOption)
 }
 
-// Provision implements caddy.Provisioner
-func (s *SouinApp) Provision(_ caddy.Context) error {
-	if s.notifier == nil {
-		s.notifier = make(chan notifierItem, 1)
-	}
+// App holds the cache options set globally, which every cache handler
+// inherits.
+type App struct {
+	Options
 
-	return nil
+	mu sync.Mutex
+	// claims records the store and the limits each directory is used with
+	// in this configuration.
+	claims map[string]claim
 }
 
-// Start will start the App
-func (s SouinApp) Start() error {
-	_, _ = up.Delete(stored_providers_key)
-	_, _ = up.LoadOrStore(stored_providers_key, newStorageProvider())
-
-	return nil
+type claim struct {
+	store  *Store
+	limits Limits
 }
 
-// Stop will stop the App
-func (s SouinApp) Stop() error {
-	core.ResetRegisteredStorages()
-
-	return nil
-}
-
-// CaddyModule implements caddy.ModuleInfo
-func (s SouinApp) CaddyModule() caddy.ModuleInfo {
+// CaddyModule implements caddy.Module.
+func (*App) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  moduleName,
-		New: func() caddy.Module { return new(SouinApp) },
+		New: func() caddy.Module { return new(App) },
 	}
 }
 
-func (s *SouinApp) withSurrogateStorer(surrogate providers.SurrogateInterface) {
-	defer close(s.notifier)
+// Provision implements caddy.Provisioner.
+func (a *App) Provision(caddy.Context) error {
+	_, err := a.resolve()
 
-	s.SurrogateStorage = surrogate
-	s.notifier <- notifierItem{
-		API:              s.API,
-		SurrogateStorage: surrogate,
-	}
+	return err
 }
 
-func (s *SouinApp) Validate() error {
+// Start implements caddy.App. It runs once the whole configuration is
+// accepted, which is when the limits it sets may be applied to the stores
+// inherited from the previous one: a configuration that fails to load must
+// not shrink the cache of the one that keeps running.
+func (a *App) Start() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	for _, c := range a.claims {
+		c.store.SetLimits(c.limits)
+	}
+
 	return nil
 }
 
-func (s *SouinApp) onMiddlewareLoaded() chan notifierItem {
-	return s.notifier
+// Stop implements caddy.App.
+func (*App) Stop() error {
+	return nil
+}
+
+// claim checks that the handlers of this configuration agree on the limits
+// of the cache held in a directory: a directory is one cache.
+func (a *App) claim(path string, limits Limits) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if other, ok := a.claims[path]; ok && other.limits != limits {
+		return fmt.Errorf("the cache directory %s is configured with different max_size, max_memory or inactive values: give each cache its own path or set these options once, globally", path)
+	}
+
+	return nil
+}
+
+// use records the store a handler of this configuration works with.
+func (a *App) use(store *Store, path string, limits Limits) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.claims == nil {
+		a.claims = make(map[string]claim)
+	}
+	a.claims[path] = claim{store: store, limits: limits}
+}
+
+func parseCaddyfileGlobalOption(d *caddyfile.Dispenser, _ any) (any, error) {
+	app := new(App)
+	if err := parseOptions(d, &app.Options); err != nil {
+		return nil, err
+	}
+
+	return httpcaddyfile.App{
+		Name:  moduleName,
+		Value: caddyconfig.JSON(app, nil),
+	}, nil
 }
 
 var (
-	_ caddy.App         = (*SouinApp)(nil)
-	_ caddy.Module      = (*SouinApp)(nil)
-	_ caddy.Provisioner = (*SouinApp)(nil)
-	_ caddy.Validator   = (*SouinApp)(nil)
+	_ caddy.App         = (*App)(nil)
+	_ caddy.Module      = (*App)(nil)
+	_ caddy.Provisioner = (*App)(nil)
 )

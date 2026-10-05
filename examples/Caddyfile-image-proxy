@@ -1,0 +1,51 @@
+# A cache in front of an object storage, equivalent to this nginx setup:
+#
+#   proxy_cache_path /var/www/cache levels=1:2 keys_zone=s3-cache:8m max_size=25000m inactive=720m use_temp_path=off;
+#
+#   location ~ ^/img/download/(.+)/([0-9]+).*\.([A-Za-z0-9]+)$ {
+#     rewrite ^/img/download/(.+)/([0-9]+).*\.([A-Za-z0-9]+)$ "/bucket/images/$1/$2/full.$3" break;
+#     proxy_pass             https://s3.example.com;
+#     proxy_cache            s3-cache;
+#     proxy_cache_valid      6h;
+#     proxy_cache_key        $request_filename;
+#     proxy_cache_lock       on;
+#     expires     max;
+#     add_header  Cache-Control public;
+#     add_header  Content-Disposition "attachment";
+#   }
+{
+	cache {
+		path /var/www/cache
+		max_size 25000m
+		max_memory 8Gi
+		inactive 720m
+		ttl 6h
+		# Keep serving what is stored while it is updated, or if the storage is down.
+		stale 1h
+	}
+}
+
+example.com {
+	@image path_regexp image ^/img/download/(.+)/([0-9]+).*\.([A-Za-z0-9]+)$
+
+	handle @image {
+		# Not stored: set on every response, cached or not.
+		header Cache-Control "public, max-age=31536000"
+		header Content-Disposition attachment
+
+		cache {
+			key {
+				# Every URL of an image maps to the same object, whatever comes
+				# between its number and its extension: they share one stored
+				# response, as they did with $request_filename.
+				template {re.image.1}/{re.image.2}.{re.image.3}
+				# Object storages with CORS enabled send Vary: Origin, which
+				# would store one copy of each image per site embedding it.
+				disable_vary
+			}
+		}
+
+		rewrite /bucket/images/{re.image.1}/{re.image.2}/full.{re.image.3}
+		reverse_proxy https://s3.example.com
+	}
+}

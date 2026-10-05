@@ -1,6 +1,10 @@
 {
-    order cache before rewrite
-    cache # Enables the cache for all requests for 2 minutes by default and stores in the badger provider
+	# Enables the cache with its defaults: responses are fresh for 2 minutes,
+	# stored in Caddy's data directory, within 10GiB of disk and 256MiB of RAM.
+	cache
 }
 
-:80
+:80 {
+	cache
+	reverse_proxy 127.0.0.1:9000
+}
