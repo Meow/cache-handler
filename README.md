@@ -336,6 +336,50 @@ curl -X POST 'localhost:2019/cache/purge?all=true'
 
 With several caches, add `path=<directory>` to purge one of them only.
 
+## Performance
+
+Serving a response from the cache takes about what Caddy takes to produce a trivial one itself, and much less than asking an upstream for it. [`bench/bench.sh`](bench/bench.sh) measures this with `ab` (ApacheBench): it builds Caddy from the working tree and requests one URL over 64 keep-alive connections on the loopback interface, without the cache and with it in several configurations. The scenarios are the routes of [`bench/Caddyfile`](bench/Caddyfile).
+
+These are its results on a Ryzen 9 9900X, each the median of 3 runs of 100000 requests. The first row of each group has no cache, and is what the others are compared to.
+
+| | Requests/s | vs. no cache | p50 | p99 | Served from |
+|---|---:|---:|---:|---:|---|
+| **A text of 13 bytes, from `respond`** | | | | | |
+| No cache | 265558 | | 0.20 ms | 0.81 ms | |
+| `cache` | 253077 | 0.95x | 0.21 ms | 0.85 ms | Memory |
+| `cache`, `max_memory off` | 223184 | 0.84x | 0.23 ms | 1.08 ms | Disk |
+| `cache`, `min_uses 2` | 260393 | 0.98x | 0.21 ms | 0.83 ms | Memory |
+| `cache`, response with `Vary` | 237425 | 0.89x | 0.22 ms | 0.97 ms | Memory |
+| `cache`, `key` `template` | 253539 | 0.95x | 0.21 ms | 0.87 ms | Memory |
+| `cache`, response with `no-store` | 216463 | 0.82x | 0.22 ms | 1.22 ms | Not stored |
+| **An image of 42KiB, from `file_server`** | | | | | |
+| No cache | 112416 | | 0.46 ms | 1.75 ms | |
+| `cache` | 108360 | 0.96x | 0.47 ms | 1.94 ms | Memory |
+| `cache`, `max_memory off` | 94029 | 0.84x | 0.50 ms | 2.48 ms | Disk |
+| `cache`, `min_uses 2` | 108438 | 0.96x | 0.46 ms | 1.89 ms | Memory |
+| `cache`, `slice 16Ki` | 96430 | 0.86x | 0.53 ms | 2.06 ms | Memory, 3 slices |
+| **The same image, from `reverse_proxy` to a `file_server`** | | | | | |
+| No cache | 62630 | | 0.78 ms | 3.28 ms | |
+| `cache` | 110556 | 1.77x | 0.46 ms | 1.88 ms | Memory |
+| `cache`, `max_memory off` | 96726 | 1.54x | 0.49 ms | 2.38 ms | Disk |
+
+* A response served from memory is within 5% of the handler it stands in for, when that handler is as cheap as a handler gets: `respond` with a constant, or `file_server` with a file the system holds in memory.
+* Served from disk, it is about 15% fewer requests per second. The file was in the page cache of the system: a disk that has to be read is not what was measured.
+* A response that varies takes a second lookup, and one stored in slices is put together from several.
+* A response that cannot be stored passes through the cache at a cost: 18% fewer requests per second here, against a handler that does next to nothing, which is where it shows most.
+* In front of a reverse proxy, the cache answers 1.5 to 1.8 times the requests the upstream does, and that upstream is as fast and as close as one can be: Caddy's own `file_server`, on the same machine.
+
+Read these numbers with care. `ab` runs on the same machine as Caddy, on a single thread: it competes with it for the processor, and in the fastest rows it may be what sets the pace. Single runs of a scenario differ by 10% or so, hence the median, and a difference of a few percent between two rows means nothing. What is measured is one response requested over and over: not the storing of new responses, not TLS, not a network.
+
+To run it on your own hardware, with Go and `ab` installed:
+
+```sh
+bench/bench.sh
+
+# With Caddy on a single thread, so that it is slower than ab
+GOMAXPROCS=1 bench/bench.sh
+```
+
 ## Coming from nginx
 
 | nginx | Here |
