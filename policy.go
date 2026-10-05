@@ -139,6 +139,13 @@ func (c *config) evaluate(r *http.Request, status int, h http.Header, now time.T
 	if len(h["Set-Cookie"]) > 0 {
 		return reject("SET-COOKIE")
 	}
+	// Trailers would be lost and a stream of events has no end to store.
+	if len(h["Trailer"]) > 0 {
+		return reject("TRAILER")
+	}
+	if strings.HasPrefix(strings.ToLower(h.Get("Content-Type")), "text/event-stream") {
+		return reject("EVENT-STREAM")
+	}
 
 	var cc directives
 	if !c.ignoreResponse {
@@ -179,7 +186,7 @@ func (c *config) evaluate(r *http.Request, status int, h http.Header, now time.T
 	}
 
 	if age, err := strconv.ParseInt(h.Get("Age"), 10, 64); err == nil && age > 0 {
-		v.age = min(time.Duration(age)*time.Second, maxLifetime)
+		v.age = time.Duration(min(age, int64(maxLifetime/time.Second))) * time.Second
 		v.lifetime -= v.age
 	}
 
@@ -259,7 +266,9 @@ func normalizeAcceptEncoding(v string) string {
 		coding, params, _ := strings.Cut(part, ";")
 		coding = strings.ToLower(strings.TrimSpace(coding))
 		switch coding {
-		case "gzip", "br", "zstd", "deflate":
+		// The wildcard lets the server pick a coding, which makes it a
+		// capability of its own.
+		case "gzip", "br", "zstd", "deflate", "*":
 		default:
 			continue
 		}
@@ -305,7 +314,9 @@ func (c *config) buildKey(r *http.Request, method string) string {
 			b.WriteString(r.Host)
 			b.WriteByte('-')
 		}
-		b.WriteString(r.URL.Path)
+		// The path as it was sent: once decoded, different paths can read
+		// the same.
+		b.WriteString(r.URL.EscapedPath())
 		if !c.key.DisableQuery && r.URL.RawQuery != "" {
 			b.WriteByte('?')
 			if c.key.SortQuery {
@@ -316,13 +327,23 @@ func (c *config) buildKey(r *http.Request, method string) string {
 		}
 	}
 
+	// The values are quoted so that no value can pass for the end of the
+	// URL or for another header, which would let a request choose the key
+	// of another one.
 	for _, name := range c.keyHeaders {
 		b.WriteByte('-')
-		b.WriteString(strings.Join(r.Header.Values(name), ","))
+		b.WriteString(name)
+		b.WriteString(`="`)
+		for _, c := range []byte(strings.Join(r.Header.Values(name), ",")) {
+			if c == '"' || c == '\\' {
+				b.WriteByte('\\')
+			}
+			b.WriteByte(c)
+		}
+		b.WriteByte('"')
 	}
 
-	// A NUL separates the key from what selects a variant of it.
-	return strings.ReplaceAll(b.String(), "\x00", "")
+	return b.String()
 }
 
 func sortQuery(raw string) string {

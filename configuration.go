@@ -71,6 +71,10 @@ type Options struct {
 	// responses, which are served from memory. "off" keeps the responses on
 	// disk only. Default: 256MiB.
 	MaxMemory Size `json:"max_memory,omitempty"`
+	// Number of files the cache may hold: one per stored response, one per
+	// URL whose responses vary, and one per download in progress.
+	// Default: no limit other than max_size.
+	MaxFileCount int64 `json:"max_file_count,omitempty"`
 	// Remove the responses that were not requested for that long.
 	// Default: keep them until the space is needed.
 	Inactive caddy.Duration `json:"inactive,omitempty"`
@@ -111,6 +115,9 @@ func (o Options) inherit(parent Options) Options {
 	}
 	if o.MaxMemory == 0 {
 		o.MaxMemory = parent.MaxMemory
+	}
+	if o.MaxFileCount == 0 {
+		o.MaxFileCount = parent.MaxFileCount
 	}
 	if o.Inactive == 0 {
 		o.Inactive = parent.Inactive
@@ -181,6 +188,7 @@ func (o Options) resolve() (*config, error) {
 			MaxSize:   int64(o.MaxSize),
 			MaxMemory: int64(o.MaxMemory),
 			Inactive:  time.Duration(o.Inactive),
+			MaxFiles:  o.MaxFileCount,
 		},
 	}
 
@@ -206,6 +214,10 @@ func (o Options) resolve() (*config, error) {
 		c.limits.MaxMemory = 0
 	case c.limits.MaxMemory < minMaxMemory:
 		return nil, fmt.Errorf("max_memory must be at least %s, or off", Size(minMaxMemory))
+	}
+
+	if c.limits.MaxFiles < 0 {
+		return nil, fmt.Errorf("max_file_count must be positive")
 	}
 
 	if c.ttl < 0 || c.stale < 0 || c.lockTimeout < 0 || c.limits.Inactive < 0 || c.maxBody < 0 {
@@ -253,7 +265,7 @@ func (o Options) resolve() (*config, error) {
 	return c, nil
 }
 
-const storageRemoved = "storage backends were removed, the cache now stores on disk and in memory by itself: use path, max_size and max_memory"
+const storageRemoved = "storage backends were removed, the cache now stores on disk and in memory by itself: use path, max_size, max_memory and max_file_count"
 
 // removedOptions are the options of the Souin based versions of this module
 // that no longer exist, with what to do instead.
@@ -314,6 +326,16 @@ func parseOptions(d *caddyfile.Dispenser, o *Options) error {
 				if o.MaxMemory == 0 {
 					o.MaxMemory = SizeOff
 				}
+			case "max_file_count":
+				var arg string
+				if !d.AllArgs(&arg) {
+					return d.ArgErr()
+				}
+				count, err := strconv.ParseInt(arg, 10, 64)
+				if err != nil || count <= 0 {
+					return d.Errf("invalid max_file_count %q: expected a positive number of files", arg)
+				}
+				o.MaxFileCount = count
 			case "max_cacheable_body_bytes":
 				if err := parseSizeArg(d, &o.MaxBodyBytes); err != nil {
 					return err

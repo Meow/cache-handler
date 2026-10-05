@@ -23,13 +23,13 @@ It works the way nginx's `proxy_cache` does: responses are stored as files in a 
 | | This module | [caddyserver/cache-handler](https://github.com/caddyserver/cache-handler) (Souin) | nginx `proxy_cache` |
 |---|---|---|---|
 | Storage | Files on disk, plus the hottest responses in memory. Built in. | Pluggable: Badger, NutsDB, Otter, SimpleFS, Redis, etcd, NATS, Olric. Each is a separate module to build in; without one, an in-memory map. | Files on disk; RAM through the page cache of the kernel. |
-| Disk limit | `max_size`, enforced, downloads in progress included. | Depends on the storage. | `max_size`, enforced periodically by the cache manager. |
+| Disk limit | `max_size` and `max_file_count`, enforced, downloads in progress included. | Depends on the storage. | `max_size`, enforced periodically by the cache manager. |
 | Memory limit | `max_memory`, enforced: index and in-memory responses, held outside the Go heap. | None for the handler: each response in transit is buffered whole, several times over. The default storage is unbounded. | `keys_zone` for the index; the page cache is the kernel's. |
-| Response bodies | Streamed, a few tens of kilobytes of buffer per request whatever the size. | Buffered whole in memory before the client gets the first byte, and again on every hit. | Streamed, buffered to a temporary file. |
+| Response bodies | Streamed through the cache file, a few tens of kilobytes of buffer per request whatever the size. | Buffered whole in memory before the client gets the first byte, and again on every hit. | Streamed, buffered to a temporary file. |
 | Large files | Fine: bounded by disk only. | Bounded by RAM, times the number of concurrent requests. | Fine. |
-| Concurrent requests for a missing response | One upstream request; the others are served from it as it arrives. | One upstream request; the others get the response once it is complete. | With `proxy_cache_lock`, the others wait for the complete response, or for a timeout. |
+| Concurrent requests for a missing response | One upstream request; the others are served from it as it arrives, whatever the speed of the first client. | One upstream request; the others get the response once it is complete. | With `proxy_cache_lock`, the others wait for the complete response, or for a timeout. |
 | `Range` request for a missing response | Streamed as the response arrives, while the whole response is stored. | Served once the whole response is buffered. | The whole response is fetched; ranges can be fetched and cached individually with the `slice` module. |
-| Client disconnects during a download | The download continues and is stored. | The download is aborted, nothing is stored. | The download continues and is stored. |
+| Client disconnects during a download | The download continues and is stored, if its length is known. | The download is aborted, nothing is stored. | The download continues and is stored. |
 | Expired responses | Revalidated with a conditional request; optionally served stale meanwhile or on error. | Revalidated; optionally served stale. | Refetched, or revalidated with `proxy_cache_revalidate`; optionally served stale. |
 | Restart | The cache is kept, and usable at once. | Depends on the storage. | The cache is kept. |
 | Shared between instances | No. | Yes, with a distributed storage. | No. |
@@ -44,12 +44,13 @@ Known limits of this module, besides what the notice above lists:
 
 * A request for a range far into a response that is not cached yet waits until the download reaches it. Ranges are not fetched from the upstream individually (what nginx's `slice` module does), so a large file is always downloaded from its beginning.
 * The request that triggers a download is held open until the download ends, even if it asked for a range that ends earlier. Its bytes are sent as soon as they arrive; requests arriving meanwhile are not affected.
+* Requests are only served from a download in progress when the response announces its length. Others wait for the complete response.
 * The cache directory belongs to one Caddy process.
-* Only Linux, macOS and the BSDs get the memory tier outside the Go heap, see [Platform notes](#platform-notes).
+* Linux, macOS and the BSDs only, see [Platform notes](#platform-notes).
 
 ## Features
 
-* Two storage tiers, both bounded: `max_size` on disk, `max_memory` in RAM.
+* Two storage tiers, both bounded: `max_size` on disk, `max_memory` in RAM. The number of files can be bounded too, with `max_file_count`.
 * Responses are streamed to the client and to the cache at the same time. A body is never buffered whole in memory, whatever its size.
 * Requests arriving while a response is being downloaded are served from it as it arrives: one upstream request, and nobody waits for the end of the download to get its beginning.
 * A `Range` request for a response that is not cached is streamed as the response arrives, while the whole response is stored.
@@ -97,6 +98,7 @@ cache [<matcher>] {
     path /var/cache/caddy
     max_size 25Gi
     max_memory 8Gi
+    max_file_count 1000000
     inactive 30d
 
     ttl 24h
@@ -130,6 +132,7 @@ cache [<matcher>] {
 | `path` | `cache` in Caddy's data directory | Directory the responses are stored in. Directives using the same directory share one cache. The directory must be used by one Caddy process only. |
 | `max_size` | `10Gi` | Disk space the cache may take. The least recently used responses are removed to stay under it. |
 | `max_memory` | `256Mi` | RAM the cache may take, for its index and for the most requested responses. `off` keeps the responses on disk only. |
+| `max_file_count` | none | Number of files the cache may hold. The least recently used responses are removed to stay under it. Use it when the filesystem runs out of inodes before it runs out of space, which many small responses can do. |
 | `inactive` | none | Removes the responses that were not requested for this long, fresh or not. |
 | `ttl` | `120s` | How long a response is fresh when the upstream does not say (no `Cache-Control: max-age` / `s-maxage`, no `Expires`). |
 | `stale` | `0` | How long past its freshness a response may still be served while it is being updated, or when the upstream fails. `Cache-Control: stale-while-revalidate` and `stale-if-error` in a response override it. |
@@ -142,7 +145,7 @@ cache [<matcher>] {
 | `key` | | Tunes the cache key, see below. |
 | `regex` `exclude` | | Requests whose URI matches are not cached. |
 
-`max_size`, `max_memory` and `inactive` belong to the directory: two directives using the same `path` cannot disagree on them. Set them once in the global option, or give each cache its own `path`.
+`max_size`, `max_memory`, `max_file_count` and `inactive` belong to the directory: two directives using the same `path` cannot disagree on them. Set them once in the global option, or give each cache its own `path`.
 
 Sizes are a number of bytes or a number with a unit: `k`, `m`, `g`, `t` and `Ki`, `Mi`, `Gi`, `Ti` are powers of 1024, `KB`, `MB`, `GB`, `TB` powers of 1000.
 
@@ -162,19 +165,25 @@ A response requested at least twice in a few minutes is copied to memory, provid
 
 `max_size` covers the cache files and the downloads in progress. When a response does not fit, the least recently used ones are deleted to make room. A response larger than half of `max_size` (or than `max_cacheable_body_bytes`) is not stored.
 
+`max_file_count` counts one file per stored response, one more per URL whose responses vary (it records which request headers select them), and one per download in progress. A download that would exceed it evicts the least recently used response first. Besides these files the cache directory holds up to 258 directories and two small files of its own, which are not counted.
+
 `max_memory` covers the index (about 200 bytes plus the key per file) and the bodies and headers kept in memory. The bodies live outside the Go heap, in memory mapped for that purpose and returned to the system when the budget shrinks, so they do not weigh on the garbage collector. When the index alone approaches the budget, which takes millions of files, the least recently used files are removed.
 
 What is not counted is what serving requests takes: a few tens of kilobytes of buffers per request in progress, whatever the size of the response.
 
 ### Fetching
 
-On a miss, the response is relayed to the client as it arrives from the upstream while it is written to the cache. If the client disconnects, the download goes on for the benefit of the next requests, as long as the upstream keeps sending.
+On a miss, the response is written to the cache as fast as the upstream sends it, and the client is served from the cache file while it fills, starting with the first bytes. The speed of the client does not matter to the download: a client on a slow connection, or one that stops reading, delays nobody else.
 
-Other requests for the same response do not go to the upstream. They wait, up to `lock_timeout`, for the upstream to start answering the first one, and are then served from the response being downloaded, as it arrives: a second viewer of a video starts watching while the first download is still in progress, and a request for a range gets it as soon as the download has reached it. When the response turns out not to be cacheable, the waiting requests are released at once and, for a minute, requests for it are not made to wait at all.
+Other requests for the same response do not go to the upstream. They wait, up to `lock_timeout`, for the upstream to start answering the first one, and are then served from the same file, as it fills: a second viewer of a video starts watching while the first download is still in progress, and a request for a range gets it as soon as the download has reached it. This applies to responses that announce their length (`Content-Length`). For the others, which could turn out too large to keep, the other requests wait for the complete response, and go to the upstream themselves after `lock_timeout`.
 
-The upstream is always asked for the whole response, whatever the client asked for. When the request that triggers the download asks for a range, the range is relayed to it as it comes by. When it carries a precondition (`If-None-Match`…) or asks for several ranges, the response is stored first and the request answered from it.
+When the response turns out not to be cacheable, the waiting requests are released at once and, for a minute, requests for it are not made to wait at all. During that minute, requests with a range or a precondition go straight to the upstream as they are.
 
-If a download fails midway, nothing is stored, and the requests that were being served from it are cut short rather than given a truncated response as if it were complete.
+The upstream is always asked for the whole response, whatever the client asked for. When the request that triggers the download asks for a range, it is sent that range as the download reaches it. When it carries a precondition (`If-None-Match`…) or asks for several ranges, the response is stored first and the request answered from it.
+
+If the client disconnects, the download goes on for the benefit of the next requests, provided the response announced its length and for as long as the upstream keeps sending. A response of unknown length is given up when the last client listening to it leaves.
+
+If a download fails midway, nothing is stored, and the requests that were being served from it are cut short rather than given a truncated response as if it were complete. If a response can no longer be stored while it downloads, for lack of space for instance, the client that triggered it still gets all of it.
 
 ### Expiry
 
@@ -192,7 +201,8 @@ Only `GET` requests fill the cache; `HEAD` requests are answered from it. A resp
 * it has a `Set-Cookie` header, or `Vary: *`;
 * the request had an `Authorization` header, and the response has none of `public`, `s-maxage`, `must-revalidate`, and `Authorization` is neither in `Vary` nor in the `key` `headers`;
 * it is already expired and has no `ETag` or `Last-Modified` to revalidate it with;
-* its body is larger than what may be stored.
+* its body is larger than what may be stored;
+* it announces trailers, or is a stream of events (`text/event-stream`).
 
 A successful `POST`, `PUT`, `PATCH` or `DELETE` request removes the response stored for its URI.
 
@@ -200,15 +210,15 @@ The cache stores what the handlers after it produce. Headers set by a directive 
 
 ## Cache key
 
-The default key is `METHOD-SCHEME-HOST-PATH?QUERY`, for instance `GET-https-example.com-/logo.png?v=2`. A different key means a different stored response, so the key should contain what makes the response different and nothing else.
+The default key is `METHOD-SCHEME-HOST-PATH?QUERY`, for instance `GET-https-example.com-/logo.png?v=2`. The path is taken as the client sent it, percent-encoding included. A different key means a different stored response, so the key should contain what makes the response different and nothing else.
 
 | `key` option | Effect |
 |---|---|
 | `disable_host`, `disable_method`, `disable_scheme` | Leaves that part out of the key. |
 | `disable_query` | Leaves the query string out: `/a?x=1` and `/a?x=2` are the same response. |
 | `sort_query` | Sorts the query parameters: `/a?x=1&y=2` and `/a?y=2&x=1` are the same response. |
-| `headers` | Adds the value of these request headers to the key. |
-| `template` | Replaces the key altogether. Caddy placeholders are supported. |
+| `headers` | Adds these request headers to the key, as `-Name="value"`. |
+| `template` | Replaces the key altogether. Caddy placeholders are supported. Build it from parts that cannot be mistaken for one another: with `{path}-{query}`, `/a-b` and `/a?b` are the same key. |
 | `disable_vary` | Ignores the `Vary` header of the responses. |
 | `hide` | Does not show the key in the `Cache-Status` header. |
 
@@ -236,11 +246,11 @@ Responses with a `Vary` header are stored once per combination of the request he
 | `Caddy; hit; ttl=-12; detail=UPDATING` | Served stale while another request updates it. |
 | `Caddy; fwd=uri-miss; stored` | Fetched from the upstream and stored. |
 | `Caddy; fwd=uri-miss; collapsed` | Served from the response another request was fetching from the upstream. |
-| `Caddy; fwd=uri-miss; detail=<REASON>` | Fetched from the upstream and not stored: `NO-STORE`, `PRIVATE`, `SET-COOKIE`, `VARY-STAR`, `AUTHORIZATION`, `UNCACHEABLE-STATUS`, `EXPIRED`, `TOO-LARGE`, `HEAD`, `LOCK-TIMEOUT`, `STORAGE-ERROR`. |
+| `Caddy; fwd=uri-miss; detail=<REASON>` | Fetched from the upstream and not stored: `NO-STORE`, `PRIVATE`, `SET-COOKIE`, `VARY-STAR`, `AUTHORIZATION`, `UNCACHEABLE-STATUS`, `EXPIRED`, `TOO-LARGE`, `TRAILER`, `EVENT-STREAM`, `UNCACHEABLE` (found so less than a minute ago), `HEAD`, `LOCK-TIMEOUT`, `CLIENT-GONE`, `STORAGE-ERROR`. |
 | `Caddy; fwd=stale; fwd-status=304; detail=REVALIDATED` | Expired, confirmed by the upstream, served from the cache. |
 | `Caddy; fwd=stale; stored` | Expired, replaced by a new response from the upstream. |
 | `Caddy; fwd=stale; fwd-status=503; detail=STALE` | Expired and served anyway because the upstream failed. |
-| `Caddy; fwd=bypass; detail=<REASON>` | Not handled by the cache: `UNSUPPORTED-METHOD`, `EXCLUDED`, `KEY-TOO-LONG`, `REQUEST-NO-STORE`. |
+| `Caddy; fwd=bypass; detail=<REASON>` | Not handled by the cache: `UNSUPPORTED-METHOD`, `EXCLUDED`, `INVALID-KEY`, `REQUEST-NO-STORE`, `ONLY-IF-CACHED`, `UNAVAILABLE`. |
 
 The key follows as `; key=...` unless it is hidden.
 
@@ -270,7 +280,7 @@ With several caches, add `path=<directory>` to purge one of them only.
 | nginx | Here |
 |---|---|
 | `proxy_cache_path /var/www/cache` | `path /var/www/cache` |
-| `max_size=25000m` | `max_size 25000m` |
+| `max_size=25000m` | `max_size 25000m`. nginx has no limit on the number of files; here there is `max_file_count`. |
 | `keys_zone=name:8m` | Not needed: the index is part of `max_memory`. |
 | `inactive=720m` | `inactive 720m` |
 | `levels=1:2`, `use_temp_path=off` | Not needed. |
@@ -315,7 +325,7 @@ Other differences:
 
 Linux, macOS and the BSDs are supported. On Linux, memory the cache gives up is returned to the system at once; on macOS and the BSDs the system takes it back when it needs it, so the resident size of the process may stay above what the cache uses for a while.
 
-On other systems the module builds and works, but the bodies kept in memory are on the Go heap, where freed memory is only returned by the garbage collector, and the cache directory is not protected against being used by two processes.
+Windows is not supported. The module builds there, but the cache relies on replacing and deleting files that are being read, which Windows refuses: responses could not be refreshed while they are served.
 
 ## Versions
 

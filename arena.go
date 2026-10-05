@@ -104,7 +104,6 @@ func (a *arena) put(b *blob) {
 	a.inUse.Add(-int64(len(b.ids)))
 	b.ids, b.blocks = nil, nil
 
-	a.trimLocked()
 	if a.retired && a.inUse.Load() == 0 {
 		a.unmapLocked()
 	}
@@ -117,18 +116,50 @@ func (a *arena) setLimit(blocks int) {
 	defer a.mu.Unlock()
 
 	a.limit = blocks
-	a.trimLocked()
+	// Enough for the limit moving as the index grows. A limit lowered by a
+	// lot is caught up with by trim.
+	a.trimLocked(64)
 }
 
 // trimLocked gives the pages of free blocks back to the operating system
-// until no more memory is resident than the limit allows.
-func (a *arena) trimLocked() {
+// until no more memory is resident than the limit allows, budget blocks at
+// most. It reports whether there is more to give back.
+func (a *arena) trimLocked(budget int) bool {
 	target := max(a.limit, int(a.inUse.Load()))
 	for a.carved-len(a.cold) > target && len(a.free) > 0 {
+		if budget == 0 {
+			return true
+		}
+		budget--
+
 		id := a.free[len(a.free)-1]
 		a.free = a.free[:len(a.free)-1]
 		releasePages(a.block(id))
 		a.cold = append(a.cold, id)
+	}
+
+	return false
+}
+
+// excess tells whether memory is left to give back to the system.
+func (a *arena) excess() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return a.carved-len(a.cold) > max(a.limit, int(a.inUse.Load())) && len(a.free) > 0
+}
+
+// trim gives back all the memory the limit no longer allows, in steps short
+// enough not to hold up the allocations meanwhile.
+func (a *arena) trim() {
+	for {
+		a.mu.Lock()
+		more := a.trimLocked(1024)
+		a.mu.Unlock()
+
+		if !more {
+			return
+		}
 	}
 }
 

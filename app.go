@@ -4,6 +4,7 @@
 package httpcache
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+	"go.uber.org/zap"
 )
 
 const moduleName = "cache"
@@ -25,19 +27,24 @@ func init() {
 }
 
 // App holds the cache options set globally, which every cache handler
-// inherits.
+// inherits, and the stores the handlers of its configuration work with.
 type App struct {
 	Options
 
-	mu sync.Mutex
-	// claims records the store and the limits each directory is used with
-	// in this configuration.
-	claims map[string]claim
-}
+	logger *zap.Logger
 
-type claim struct {
-	store  *Store
-	limits Limits
+	mu sync.Mutex
+	// claims records the limits each directory is used with in this
+	// configuration.
+	claims map[string]Limits
+	// opened holds the stores once the app is started. It is not written
+	// after ready is closed.
+	opened map[string]*Store
+	// held lists the directories whose store this app keeps open.
+	held []string
+	// ready is closed when the stores are open, or never will be.
+	ready     chan struct{}
+	readyOnce sync.Once
 }
 
 // CaddyModule implements caddy.Module.
@@ -49,54 +56,101 @@ func (*App) CaddyModule() caddy.ModuleInfo {
 }
 
 // Provision implements caddy.Provisioner.
-func (a *App) Provision(caddy.Context) error {
+func (a *App) Provision(ctx caddy.Context) error {
+	a.logger = ctx.Logger()
+	a.ready = make(chan struct{})
+
 	_, err := a.resolve()
 
 	return err
 }
 
-// Start implements caddy.App. It runs once the whole configuration is
-// accepted, which is when the limits it sets may be applied to the stores
-// inherited from the previous one: a configuration that fails to load must
-// not shrink the cache of the one that keeps running.
+// Start implements caddy.App. The stores are opened here rather than when
+// the handlers are provisioned, because this only runs for a configuration
+// that is accepted and meant to serve: checking a configuration
+// (caddy validate), or loading one that turns out to be refused, must not
+// touch the cache of the server that is running, nor apply new limits to it.
 func (a *App) Start() error {
+	defer a.readyOnce.Do(func() { close(a.ready) })
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	for _, c := range a.claims {
-		c.store.SetLimits(c.limits)
+	a.opened = make(map[string]*Store, len(a.claims))
+	for path, limits := range a.claims {
+		store, loaded, err := stores.LoadOrNew(path, func() (caddy.Destructor, error) {
+			return OpenStore(path, limits, a.logger)
+		})
+		if err != nil {
+			a.releaseLocked()
+			a.opened = nil
+
+			return fmt.Errorf("opening the cache in %s: %w", path, err)
+		}
+
+		a.held = append(a.held, path)
+		a.opened[path] = store.(*Store)
+		if loaded {
+			// The store comes from the previous configuration.
+			a.opened[path].SetLimits(limits)
+		}
 	}
 
 	return nil
 }
 
-// Stop implements caddy.App.
-func (*App) Stop() error {
+// Stop implements caddy.App. A store is closed once no configuration uses
+// it anymore, so a reload keeps it.
+func (a *App) Stop() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.releaseLocked()
+
 	return nil
 }
 
-// claim checks that the handlers of this configuration agree on the limits
-// of the cache held in a directory: a directory is one cache.
+// Cleanup implements caddy.CleanerUpper. It releases the requests that
+// would be waiting for an app that was never started.
+func (a *App) Cleanup() error {
+	a.readyOnce.Do(func() { close(a.ready) })
+
+	return nil
+}
+
+func (a *App) releaseLocked() {
+	for _, path := range a.held {
+		_, _ = stores.Delete(path)
+	}
+	a.held = nil
+}
+
+// claim registers that a handler of this configuration uses the directory
+// with the given limits. A directory is one cache, so it has one set of them.
 func (a *App) claim(path string, limits Limits) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if other, ok := a.claims[path]; ok && other.limits != limits {
-		return fmt.Errorf("the cache directory %s is configured with different max_size, max_memory or inactive values: give each cache its own path or set these options once, globally", path)
+	if a.claims == nil {
+		a.claims = make(map[string]Limits)
 	}
+	if other, ok := a.claims[path]; ok && other != limits {
+		return fmt.Errorf("the cache directory %s is configured with different max_size, max_memory, max_file_count or inactive values: give each cache its own path or set these options once, globally", path)
+	}
+	a.claims[path] = limits
 
 	return nil
 }
 
-// use records the store a handler of this configuration works with.
-func (a *App) use(store *Store, path string, limits Limits) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.claims == nil {
-		a.claims = make(map[string]claim)
+// store returns the store of a directory, waiting for the app to be started
+// if it is not yet. It returns nil if the cache is not available.
+func (a *App) store(ctx context.Context, path string) *Store {
+	select {
+	case <-a.ready:
+		return a.opened[path]
+	case <-ctx.Done():
+		return nil
 	}
-	a.claims[path] = claim{store: store, limits: limits}
 }
 
 func parseCaddyfileGlobalOption(d *caddyfile.Dispenser, _ any) (any, error) {
@@ -112,7 +166,8 @@ func parseCaddyfileGlobalOption(d *caddyfile.Dispenser, _ any) (any, error) {
 }
 
 var (
-	_ caddy.App         = (*App)(nil)
-	_ caddy.Module      = (*App)(nil)
-	_ caddy.Provisioner = (*App)(nil)
+	_ caddy.App          = (*App)(nil)
+	_ caddy.Module       = (*App)(nil)
+	_ caddy.Provisioner  = (*App)(nil)
+	_ caddy.CleanerUpper = (*App)(nil)
 )

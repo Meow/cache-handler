@@ -18,8 +18,8 @@ Changes made to the original work, starting from its 0.17.0 release:
   * admin.go, app.go, configuration.go and httpcache.go were rewritten for
     the new engine. cleaner.go and dispatch.go were removed.
   * The configuration options that belonged to Souin or to its storages were
-    removed, and path, max_size, max_memory, inactive and lock_timeout were
-    added.
+    removed, and path, max_size, max_memory, max_file_count, inactive and
+    lock_timeout were added.
   * The tests, README.md, the example configurations and go.mod were changed
     accordingly. The Go module path is github.com/Meow/cache-handler.
 

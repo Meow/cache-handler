@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"net/http"
 	"os"
@@ -58,6 +59,9 @@ type Limits struct {
 	// Inactive removes the responses that were not requested for that long.
 	// Zero keeps them until the space is needed.
 	Inactive time.Duration
+	// MaxFiles is the number of files the cache may hold, downloads in
+	// progress included. Zero does not limit it.
+	MaxFiles int64
 }
 
 // entry is what the index knows about a cache file.
@@ -93,6 +97,7 @@ type StoreStats struct {
 	Path        string `json:"path"`
 	Loading     bool   `json:"loading"`
 	Entries     int    `json:"entries"`
+	MaxFiles    int64  `json:"max_file_count"`
 	DiskBytes   int64  `json:"disk_bytes"`
 	MaxSize     int64  `json:"max_size"`
 	MemoryBytes int64  `json:"memory_bytes"`
@@ -138,9 +143,13 @@ type Store struct {
 	diskUsed  atomic.Int64
 	tempBytes atomic.Int64
 	maxSize   atomic.Int64
+	// tempFiles counts the responses being written.
+	tempFiles atomic.Int64
 
 	arena     *arena
 	promoteCh chan *entry
+	// trimCh wakes the janitor when memory is left to give back.
+	trimCh chan struct{}
 
 	// stripes serialize the operations that change which file an ID names.
 	stripes  [256]sync.Mutex
@@ -200,6 +209,7 @@ func OpenStore(dir string, limits Limits, log *zap.Logger) (*Store, error) {
 		index:     make(map[ID]*entry),
 		arena:     newArena(),
 		promoteCh: make(chan *entry, 256),
+		trimCh:    make(chan struct{}, 1),
 		flights:   make(map[ID]*flight),
 		passMemo:  make(map[ID]int64),
 		cancel:    cancel,
@@ -270,6 +280,7 @@ func (s *Store) Stats() StoreStats {
 		Path:        s.dir,
 		Loading:     !s.loaded,
 		Entries:     len(s.index),
+		MaxFiles:    s.limits.MaxFiles,
 		DiskBytes:   s.diskUsed.Load(),
 		MaxSize:     s.limits.MaxSize,
 		MemoryBytes: s.metaUsed + resident,
@@ -332,7 +343,12 @@ func (s *Store) Lookup(key string, reqHeader http.Header) (ID, *Hit) {
 		if hit == nil {
 			var err error
 			if hit, err = s.open(e, full); err != nil {
-				s.discard(e)
+				// Only a file that is gone or damaged is forgotten: failing
+				// to open it for lack of file descriptors, say, is no
+				// reason to lose it.
+				if errors.Is(err, fs.ErrNotExist) || errors.Is(err, errCorrupt) {
+					s.discard(e)
+				}
 				break
 			}
 		} else if hit.rec.key != full {
@@ -511,7 +527,9 @@ type Writer struct {
 	n        int64
 	max      int64
 	reserved int64
-	done     bool
+	// counted tells the file is part of tempFiles.
+	counted bool
+	done    bool
 
 	// declared is the body length the upstream announced, or -1.
 	declared int64
@@ -644,19 +662,42 @@ func (s *Store) newWriter(rec *record, maxBody int64) (*Writer, error) {
 		return nil, err
 	}
 
+	// The file about to be created counts against the limit on their number
+	// from now on, like the bytes written to it will against the size.
 	s.mu.Lock()
 	closed := s.closed
+	var victims []ID
+	full := false
+	if !closed {
+		s.tempFiles.Add(1)
+		victims = s.enforceLocked()
+		full = s.tail == nil && s.overFilesLocked()
+	}
 	s.mu.Unlock()
+	s.unlink(victims)
+
 	if closed {
 		return nil, errStoreClosed
 	}
+	if full {
+		s.tempFiles.Add(-1)
+		return nil, errNoSpace
+	}
 
-	f, err := os.CreateTemp(filepath.Join(s.dir, tmpDirName), "w-*")
+	tmp := filepath.Join(s.dir, tmpDirName)
+	f, err := os.CreateTemp(tmp, "w-*")
+	if errors.Is(err, fs.ErrNotExist) {
+		// The directory was emptied by hand.
+		if err = os.MkdirAll(tmp, 0o700); err == nil {
+			f, err = os.CreateTemp(tmp, "w-*")
+		}
+	}
 	if err != nil {
+		s.tempFiles.Add(-1)
 		return nil, err
 	}
 
-	w := &Writer{s: s, f: f, tmp: f.Name(), rec: rec, head: head, max: maxBody, declared: -1}
+	w := &Writer{s: s, f: f, tmp: f.Name(), rec: rec, head: head, max: maxBody, declared: -1, counted: true}
 	if w.info, err = f.Stat(); err == nil {
 		err = w.reserve(int64(len(head)))
 	}
@@ -695,6 +736,18 @@ func (w *Writer) reserve(n int64) error {
 	return nil
 }
 
+// release gives back what the file being written was accounted for. It is
+// called when the file is dropped, or under the store lock at the moment it
+// becomes an entry, so that it is never counted twice.
+func (w *Writer) release() {
+	w.s.tempBytes.Add(-w.reserved)
+	w.reserved = 0
+	if w.counted {
+		w.s.tempFiles.Add(-1)
+		w.counted = false
+	}
+}
+
 // Write appends to the body.
 func (w *Writer) Write(p []byte) (int, error) {
 	if w.done {
@@ -723,7 +776,7 @@ func (w *Writer) Abort() {
 
 	_ = w.f.Close()
 	_ = os.Remove(w.tmp)
-	w.s.tempBytes.Add(-w.reserved)
+	w.release()
 	w.progress(writerAborted)
 }
 
@@ -758,13 +811,13 @@ func (w *Writer) Commit() error {
 
 		stripe := &s.stripes[id[0]]
 		stripe.Lock()
-		victims, err = s.install(w.tmp, e)
+		victims, err = s.install(w, e)
 		stripe.Unlock()
 	}
 
-	s.tempBytes.Add(-w.reserved)
 	if err != nil {
 		_ = os.Remove(w.tmp)
+		w.release()
 		w.progress(writerAborted)
 		s.warn("storing a response failed", err)
 		return err
@@ -796,6 +849,9 @@ type Tail struct {
 	// flush, if set, is called before waiting for more of the body, so that
 	// what was read reaches the client meanwhile.
 	flush func()
+	// limit, if not negative, is where the body ends for this reader
+	// whatever becomes of the response. It is guarded by the lock of w.
+	limit int64
 	// err is the reason the body could not be read to its end.
 	err error
 }
@@ -814,7 +870,23 @@ func (w *Writer) Tail(ctx context.Context) (*Tail, error) {
 		return nil, os.ErrNotExist
 	}
 
-	return &Tail{w: w, f: f, ctx: ctx}, nil
+	return &Tail{w: w, f: f, ctx: ctx, limit: -1}, nil
+}
+
+// finishAt makes the reader stop at offset n, which must have been written,
+// instead of following the response to its end. The reader then gets these
+// bytes even if the response is given up: it is how the client of a
+// response that cannot be stored after all is still sent what was written.
+func (t *Tail) finishAt(n int64) {
+	w := t.w
+
+	w.pmu.Lock()
+	t.limit = n
+	if w.wake != nil {
+		close(w.wake)
+		w.wake = nil
+	}
+	w.pmu.Unlock()
 }
 
 // Close releases the file.
@@ -829,9 +901,12 @@ func (t *Tail) Read(p []byte) (int, error) {
 
 	for {
 		w.pmu.Lock()
-		avail, state := w.avail, w.state
+		avail, state, limit := w.avail, w.state, t.limit
+		if limit >= 0 {
+			avail = min(avail, limit)
+		}
 		var wake chan struct{}
-		if state == writerActive && t.off >= avail {
+		if state == writerActive && limit < 0 && t.off >= avail {
 			if w.wake == nil {
 				w.wake = make(chan struct{})
 			}
@@ -840,7 +915,9 @@ func (t *Tail) Read(p []byte) (int, error) {
 		w.pmu.Unlock()
 
 		switch {
-		case state == writerAborted:
+		case limit >= 0 && t.off >= limit:
+			return 0, io.EOF
+		case state == writerAborted && limit < 0:
 			t.err = errTailAborted
 			return 0, t.err
 		case w.declared >= 0 && t.off >= w.declared:
@@ -890,7 +967,7 @@ func (t *Tail) Seek(offset int64, whence int) (int64, error) {
 
 // install moves a finished file into place and indexes it. The caller holds
 // the stripe of the entry.
-func (s *Store) install(tmp string, e *entry) ([]ID, error) {
+func (s *Store) install(w *Writer, e *entry) ([]ID, error) {
 	shard := e.id[0]
 	if !s.dirMade[shard].Load() {
 		if err := os.MkdirAll(filepath.Dir(s.path(e.id)), 0o700); err != nil {
@@ -906,7 +983,7 @@ func (s *Store) install(tmp string, e *entry) ([]ID, error) {
 		return nil, errStoreClosed
 	}
 
-	if err := os.Rename(tmp, s.path(e.id)); err != nil {
+	if err := os.Rename(w.tmp, s.path(e.id)); err != nil {
 		// The directory may have been removed under us.
 		s.dirMade[shard].Store(false)
 		return nil, err
@@ -920,6 +997,9 @@ func (s *Store) install(tmp string, e *entry) ([]ID, error) {
 		e.hits, e.epoch = old.hits, old.epoch
 		s.removeLocked(old)
 	}
+	// The file stops being a download in progress as it becomes an entry:
+	// counted as both, it would evict its own weight in other responses.
+	w.release()
 	s.insertLocked(e, true)
 
 	return s.enforceLocked(), nil
@@ -995,10 +1075,18 @@ func (s *Store) enforceLocked() []ID {
 			s.demoteLocked(s.hotTail)
 			limit = s.hotLimitLocked()
 		}
+		// Giving a lot of memory back takes time, which is not spent here
+		// with the requests waiting.
+		if s.arena.excess() {
+			select {
+			case s.trimCh <- struct{}{}:
+			default:
+			}
+		}
 
 		overDisk := s.diskUsed.Load()+s.tempBytes.Load() > s.limits.MaxSize
 		overIndex := s.limits.MaxMemory > 0 && s.metaUsed > s.limits.MaxMemory
-		if s.tail == nil || (!overDisk && !overIndex) {
+		if s.tail == nil || (!overDisk && !overIndex && !s.overFilesLocked()) {
 			return victims
 		}
 
@@ -1006,6 +1094,11 @@ func (s *Store) enforceLocked() []ID {
 		s.removeLocked(s.tail)
 		s.evicted.Add(1)
 	}
+}
+
+// overFilesLocked tells whether the cache holds more files than allowed.
+func (s *Store) overFilesLocked() bool {
+	return s.limits.MaxFiles > 0 && int64(len(s.index))+s.tempFiles.Load() > s.limits.MaxFiles
 }
 
 func (s *Store) bumpLocked(e *entry, now int64) {
@@ -1272,6 +1365,9 @@ func (s *Store) janitor(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.expireInactive()
+			s.arena.trim()
+		case <-s.trimCh:
+			s.arena.trim()
 		}
 	}
 }

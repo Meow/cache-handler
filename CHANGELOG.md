@@ -7,7 +7,7 @@ First release of this module, forked from [caddyserver/cache-handler](https://gi
 ### Changed from caddyserver/cache-handler 0.17.0
 
 * The module path is `github.com/Meow/cache-handler`.
-* The cache no longer relies on [Souin](https://github.com/darkweak/souin). It has its own engine and one built-in storage: files in a directory bounded by `max_size`, with the most requested responses also kept in memory, bounded by `max_memory`.
+* The cache no longer relies on [Souin](https://github.com/darkweak/souin). It has its own engine and one built-in storage: files in a directory bounded by `max_size` and optionally `max_file_count`, with the most requested responses also kept in memory, bounded by `max_memory`.
 * Response bodies are streamed to the client and to the cache at once and are never held whole in memory.
 * Requests arriving while a response is being downloaded are served from it as it arrives.
 * A `Range` request that triggers a download is relayed its range as the response arrives.
@@ -20,7 +20,7 @@ First release of this module, forked from [caddyserver/cache-handler](https://gi
 
 ### Added
 
-* Options `path`, `max_size`, `max_memory`, `inactive`, `lock_timeout`.
+* Options `path`, `max_size`, `max_memory`, `max_file_count`, `inactive`, `lock_timeout`.
 * `key { sort_query }` and Caddy placeholders in `key { template }`.
 
 ### Removed

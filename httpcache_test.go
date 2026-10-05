@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -404,13 +405,26 @@ func TestUncacheableRangeRequestKeepsItsRange(t *testing.T) {
 		reverse_proxy `+up.addr())
 
 	// What the cache cannot store, the upstream answers itself, range included.
-	for range 2 {
+	for i, detail := range []string{"NO-STORE", "UNCACHEABLE", "UNCACHEABLE"} {
 		resp, body := get(t, tester, "/file", "Range: bytes=10-15")
 		if resp.StatusCode != http.StatusPartialContent {
 			t.Errorf("status %d, want 206", resp.StatusCode)
 		}
 		expectBody(t, body, "abcdef")
-		expectStatus(t, resp, "Caddy; fwd=uri-miss; detail=NO-STORE; key=GET-http-localhost:9080-/file")
+		expectStatus(t, resp, "Caddy; fwd=uri-miss; detail="+detail+"; key=GET-http-localhost:9080-/file")
+
+		// Finding out takes one more request to the upstream, once: from
+		// then on the client's request is all it gets.
+		if want := int64(i + 2); up.hits.Load() != want {
+			t.Errorf("the upstream got %d requests after %d from the client, want %d", up.hits.Load(), i+1, want)
+		}
+	}
+
+	// The same goes for a conditional request.
+	before := up.hits.Load()
+	get(t, tester, "/file", `If-None-Match: "x"`)
+	if n := up.hits.Load() - before; n != 1 {
+		t.Errorf("the upstream got %d requests for one conditional request", n)
 	}
 }
 
@@ -772,6 +786,242 @@ func TestFailedDownloadFailsThoseWhoJoinedIt(t *testing.T) {
 	}
 }
 
+// TestStatusOfAStoredResponse checks that a response stored with another
+// status than 200 reaches the client that triggered its download with it.
+func TestStatusOfAStoredResponse(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
+		switch r.URL.Path {
+		case "/moved":
+			w.Header().Set("Location", "/new")
+			w.WriteHeader(http.StatusMovedPermanently)
+		case "/gone":
+			w.WriteHeader(http.StatusGone)
+			_, _ = io.WriteString(w, "gone")
+		}
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache
+		reverse_proxy `+up.addr())
+	tester.Client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+	for path, status := range map[string]int{"/moved": http.StatusMovedPermanently, "/gone": http.StatusGone} {
+		for i, want := range []string{"fwd=uri-miss; stored", "hit; ttl="} {
+			resp, _ := get(t, tester, path)
+			if resp.StatusCode != status {
+				t.Errorf("%s, request %d: status %d, want %d", path, i, resp.StatusCode, status)
+			}
+			if !strings.Contains(resp.Header.Get("Cache-Status"), want) {
+				t.Errorf("%s, request %d: Cache-Status %s", path, i, resp.Header.Get("Cache-Status"))
+			}
+		}
+	}
+}
+
+// TestNothingIsStoredForAnUpstreamThatNeverAnswered covers a client giving
+// up on an upstream that hangs: the fetch is then given up too, and must not
+// leave an empty response in the cache.
+func TestNothingIsStoredForAnUpstreamThatNeverAnswered(t *testing.T) {
+	grace := clientGoneGrace
+	clientGoneGrace = 200 * time.Millisecond
+	defer func() { clientGoneGrace = grace }()
+
+	var hang atomic.Bool
+	hang.Store(true)
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if hang.Load() {
+			<-r.Context().Done()
+			return
+		}
+		_, _ = io.WriteString(w, "finally")
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache
+		reverse_proxy `+up.addr())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, testURL+"/slow", nil)
+	if resp, err := tester.Client.Do(req); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("got a response from an upstream that does not answer")
+	}
+
+	// Leave the abandoned fetch the time to be given up.
+	time.Sleep(600 * time.Millisecond)
+	if n := cacheStats(t).Entries; n != 0 {
+		t.Fatalf("%d responses stored for an upstream that never answered", n)
+	}
+
+	hang.Store(false)
+	resp, body := get(t, tester, "/slow")
+	expectStatus(t, resp, "Caddy; fwd=uri-miss; stored; key=GET-http-localhost:9080-/slow")
+	expectBody(t, body, "finally")
+}
+
+// TestSlowClientDoesNotHoldUpTheOthers checks that the client whose request
+// started a download does not set its pace: one that stops reading delays
+// neither the download nor the requests served from it.
+func TestSlowClientDoesNotHoldUpTheOthers(t *testing.T) {
+	const size = 16 << 20
+	content := bodyFor("large", size)
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(size))
+		_, _ = w.Write(content)
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache
+		reverse_proxy `+up.addr())
+
+	// A client that asks and then reads nothing.
+	conn, err := net.Dial("tcp", "localhost:9080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := io.WriteString(conn, "GET /large HTTP/1.1\r\nHost: localhost:9080\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the download to start", func() bool { return up.hits.Load() == 1 })
+
+	done := make(chan string, 2)
+	for _, headers := range [][]string{nil, {"Range: bytes=-1000"}} {
+		go func() {
+			_, body := get(t, tester, "/large", headers...)
+			done <- body
+		}()
+	}
+	for range 2 {
+		select {
+		case body := <-done:
+			if body != string(content) && body != string(content[size-1000:]) {
+				t.Errorf("got %d bytes that are not what was asked for", len(body))
+			}
+		case <-time.After(4 * time.Second):
+			t.Fatal("a request is held up by a client that does not read")
+		}
+	}
+
+	// The download itself completed.
+	resp, _ := get(t, tester, "/large", "Range: bytes=0-9")
+	if !strings.Contains(resp.Header.Get("Cache-Status"), "; hit; ") {
+		t.Errorf("Cache-Status: %s", resp.Header.Get("Cache-Status"))
+	}
+	if n := up.hits.Load(); n != 1 {
+		t.Errorf("the upstream got %d requests, want 1", n)
+	}
+}
+
+// TestResponseTooLargeToStoreIsStillDelivered covers a response that turns
+// out too large while it is downloaded: every client gets all of it.
+func TestResponseTooLargeToStoreIsStillDelivered(t *testing.T) {
+	content := string(bodyFor("big", 400_000))
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		// No length announced.
+		for off := 0; off < len(content); off += 50_000 {
+			_, _ = io.WriteString(w, content[off:off+50_000])
+			w.(http.Flusher).Flush()
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+	tester := startCaddy(t, t.TempDir(), "max_cacheable_body_bytes 100k", `
+		cache
+		reverse_proxy `+up.addr())
+
+	bodies := make(chan string, 3)
+	for range 3 {
+		go func() {
+			resp, err := tester.Client.Get(testURL + "/big")
+			if err != nil {
+				bodies <- err.Error()
+				return
+			}
+			defer func() { _ = resp.Body.Close() }()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				bodies <- err.Error()
+				return
+			}
+			bodies <- string(body)
+		}()
+		time.Sleep(20 * time.Millisecond)
+	}
+	for range 3 {
+		expectBody(t, <-bodies, content)
+	}
+
+	st := cacheStats(t)
+	if st.Entries != 0 {
+		t.Error("a response over the size limit was stored")
+	}
+	if left, _ := os.ReadDir(filepath.Join(st.Path, tmpDirName)); len(left) != 0 {
+		t.Errorf("%d temporary files left", len(left))
+	}
+}
+
+// TestStaleIsNotServedForAResponseTheCacheGaveUp checks that the stale
+// response only stands in for an upstream that failed.
+func TestStaleIsNotServedForAResponseTheCacheGaveUp(t *testing.T) {
+	var private atomic.Bool
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if private.Load() {
+			w.Header().Set("Cache-Control", "private")
+			http.ServeContent(w, r, "", time.Time{}, strings.NewReader("NEW PRIVATE CONTENT"))
+			return
+		}
+		_, _ = io.WriteString(w, "OLD PUBLIC CONTENT")
+	})
+	tester := startCaddy(t, t.TempDir(), `
+			ttl 1s
+			stale 1m`, `
+		cache
+		reverse_proxy `+up.addr())
+
+	get(t, tester, "/page")
+	private.Store(true)
+	time.Sleep(1100 * time.Millisecond)
+
+	resp, body := get(t, tester, "/page", "Range: bytes=0-10")
+	expectBody(t, body, "NEW PRIVATE")
+	if strings.Contains(resp.Header.Get("Cache-Status"), "STALE") {
+		t.Errorf("Cache-Status: %s", resp.Header.Get("Cache-Status"))
+	}
+	_, body = get(t, tester, "/page")
+	expectBody(t, body, "NEW PRIVATE CONTENT")
+}
+
+// TestWhatIsNotAPlainResponse covers responses that are relayed without
+// being stored because storing would lose part of them.
+func TestWhatIsNotAPlainResponse(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/trailers":
+			w.Header().Set("Trailer", "X-Checksum")
+			_, _ = io.WriteString(w, "body")
+			w.Header().Set("X-Checksum", "abc123")
+		case "/events":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: hello\n\n")
+		}
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache
+		reverse_proxy `+up.addr())
+
+	for range 2 {
+		resp, body := get(t, tester, "/trailers")
+		expectStatus(t, resp, "Caddy; fwd=uri-miss; detail=TRAILER; key=GET-http-localhost:9080-/trailers")
+		expectBody(t, body, "body")
+		if got := resp.Trailer.Get("X-Checksum"); got != "abc123" {
+			t.Errorf("trailer %q, want abc123", got)
+		}
+
+		resp, body = get(t, tester, "/events")
+		expectStatus(t, resp, "Caddy; fwd=uri-miss; detail=EVENT-STREAM; key=GET-http-localhost:9080-/events")
+		expectBody(t, body, "data: hello\n\n")
+	}
+}
+
 func TestUncacheableResponsesAreNotSerialized(t *testing.T) {
 	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(200 * time.Millisecond)
@@ -926,7 +1176,21 @@ func TestMustRevalidateIsNeverServedStale(t *testing.T) {
 // TestClientDisconnect checks that a response keeps being stored when the
 // client that triggered its fetch goes away.
 func TestClientDisconnect(t *testing.T) {
+	endless := make(chan struct{})
 	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/endless" {
+			// A response with no announced end, that goes on for as long
+			// as it is listened to.
+			for r.Context().Err() == nil {
+				_, _ = io.WriteString(w, "0123456789")
+				w.(http.Flusher).Flush()
+				time.Sleep(10 * time.Millisecond)
+			}
+			close(endless)
+			return
+		}
+
+		w.Header().Set("Content-Length", "20")
 		_, _ = io.WriteString(w, "0123456789")
 		w.(http.Flusher).Flush()
 		time.Sleep(400 * time.Millisecond)
@@ -936,20 +1200,25 @@ func TestClientDisconnect(t *testing.T) {
 		cache
 		reverse_proxy `+up.addr())
 
-	ctx, cancel := context.WithCancel(context.Background())
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, testURL+"/download", nil)
-	resp, err := tester.Client.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	head := make([]byte, 10)
-	if _, err := io.ReadFull(resp.Body, head); err != nil || string(head) != "0123456789" {
-		t.Fatalf("read %q, %v", head, err)
-	}
-	// The client leaves in the middle of the download.
-	cancel()
-	_ = resp.Body.Close()
+	// leave requests a URL and goes away once it got the first bytes.
+	leave := func(path string) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, testURL+path, nil)
+		resp, err := tester.Client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		head := make([]byte, 10)
+		if _, err := io.ReadFull(resp.Body, head); err != nil || string(head) != "0123456789" {
+			t.Fatalf("read %q, %v", head, err)
+		}
+	}
+
+	leave("/download")
 	time.Sleep(800 * time.Millisecond)
 
 	resp, body := get(t, tester, "/download")
@@ -957,6 +1226,18 @@ func TestClientDisconnect(t *testing.T) {
 	expectBody(t, body, "0123456789abcdefghij")
 	if n := up.hits.Load(); n != 1 {
 		t.Errorf("the upstream got %d requests, want 1", n)
+	}
+
+	// A response that does not say where it ends is not followed once
+	// nobody is listening: it could go on forever.
+	leave("/endless")
+	select {
+	case <-endless:
+	case <-time.After(5 * time.Second):
+		t.Error("an endless response is still being downloaded after its only client left")
+	}
+	if st := cacheStats(t); st.Entries != 1 {
+		t.Errorf("%d entries, want only the complete download", st.Entries)
 	}
 }
 
@@ -1176,6 +1457,43 @@ func TestLimitsAreEnforced(t *testing.T) {
 	if st := cacheStats(t); st.DiskBytes > 2<<20 {
 		t.Errorf("limits exceeded by an oversized response: %+v", st)
 	}
+}
+
+func TestMaxFileCount(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "object "+r.URL.Path)
+	})
+	dir := t.TempDir()
+	tester := startCaddy(t, dir, "max_file_count 5", `
+		cache
+		reverse_proxy `+up.addr())
+
+	for i := range 20 {
+		path := fmt.Sprintf("/object/%d", i)
+		_, body := get(t, tester, path)
+		expectBody(t, body, "object "+path)
+
+		if st := cacheStats(t); st.Entries > 5 || st.MaxFiles != 5 {
+			t.Fatalf("after %d objects: %+v", i+1, st)
+		}
+	}
+
+	files := 0
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() && len(info.Name()) == 32 {
+			files++
+		}
+		return nil
+	})
+	if files != 5 {
+		t.Errorf("%d cache files on disk, want 5", files)
+	}
+
+	// The most recent ones are those that were kept.
+	resp, _ := get(t, tester, "/object/19")
+	expectHit(t, resp, "GET-http-localhost:9080-/object/19", 120)
+	resp, _ = get(t, tester, "/object/0")
+	expectStatus(t, resp, "Caddy; fwd=uri-miss; stored; key=GET-http-localhost:9080-/object/0")
 }
 
 func TestCacheSurvivesReloadAndRestart(t *testing.T) {
@@ -1580,6 +1898,7 @@ func TestJSONConfiguration(t *testing.T) {
 				"path": %q,
 				"max_size": "64Mi",
 				"max_memory": 8388608,
+				"max_file_count": 1000,
 				"ttl": "1h"
 			},
 			"http": {
@@ -1604,7 +1923,7 @@ func TestJSONConfiguration(t *testing.T) {
 	expectHit(t, resp, "GET-http-/json", 3600)
 	expectBody(t, body, "from json")
 
-	if st := cacheStats(t); st.Path != dir || st.MaxSize != 64<<20 || st.MaxMemory != 8<<20 {
+	if st := cacheStats(t); st.Path != dir || st.MaxSize != 64<<20 || st.MaxMemory != 8<<20 || st.MaxFiles != 1000 {
 		t.Errorf("unexpected stats: %+v", st)
 	}
 }
@@ -1728,6 +2047,8 @@ func TestInvalidConfigurations(t *testing.T) {
 		"max_size lots":                    "invalid size",
 		"max_size 0":                       "max_size must be positive",
 		"max_memory 4k":                    "max_memory must be at least",
+		"max_file_count lots":              "invalid max_file_count",
+		"max_file_count 0":                 "invalid max_file_count",
 		"mode relaxed":                     "unknown cache mode",
 		"ttl":                              "wrong argument count",
 		"ttl soon":                         "invalid duration",

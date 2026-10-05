@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -114,6 +115,9 @@ func TestEvaluate(t *testing.T) {
 			"Expires": {now.Add(5 * time.Minute).UTC().Format(http.TimeFormat)},
 		}, lifetime: 5 * time.Minute},
 		{name: "age shortens", status: 200, header: http.Header{"Cache-Control": {"max-age=60"}, "Age": {"20"}}, lifetime: 40 * time.Second},
+		{name: "absurd age", status: 200, header: http.Header{"Cache-Control": {"max-age=60"}, "Age": {"13835058055"}}, reason: "EXPIRED"},
+		{name: "trailers", status: 200, header: http.Header{"Trailer": {"X-Checksum"}}, reason: "TRAILER"},
+		{name: "event stream", status: 200, header: http.Header{"Content-Type": {"text/event-stream; charset=utf-8"}}, reason: "EVENT-STREAM"},
 		{name: "no-store", status: 200, header: http.Header{"Cache-Control": {"no-store"}}, reason: "NO-STORE"},
 		{name: "private", status: 200, header: http.Header{"Cache-Control": {"private, max-age=60"}}, reason: "PRIVATE"},
 		{name: "set-cookie", status: 200, header: http.Header{"Set-Cookie": {"a=b"}}, reason: "SET-COOKIE"},
@@ -199,12 +203,43 @@ func TestNormalizeAcceptEncoding(t *testing.T) {
 		"zstd,br ,GZIP, deflate":    "br,deflate,gzip,zstd",
 		"gzip;q=1.0, br;q=0, *;q=0": "gzip",
 		"identity":                  "",
+		"*":                         "*",
+		"gzip, *;q=0.1":             "*,gzip",
 		"gzip, gzip, x-custom":      "gzip",
 		"br; q=0.0, gzip; q=0.5":    "gzip",
 	}
 	for in, want := range tests {
 		if got := normalizeAcceptEncoding(in); got != want {
 			t.Errorf("normalizeAcceptEncoding(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestStaleUsable checks when a response past its freshness may still be
+// served.
+func TestStaleUsable(t *testing.T) {
+	now := time.Now()
+	stale := &record{fresh: now.Add(-time.Second).UnixMilli(), swr: 60}
+	fresh := &record{fresh: now.Add(time.Minute).UnixMilli(), swr: 60}
+
+	plain := &exchange{}
+	if !plain.staleUsable(stale, now, stale.swr) {
+		t.Error("a stale response within its window was refused")
+	}
+	if plain.staleUsable(stale, now, 0) {
+		t.Error("a stale response was accepted without a window")
+	}
+	if plain.staleUsable(&record{fresh: stale.fresh, swr: 60, flags: flagMustRevalidate}, now, 60) {
+		t.Error("a must-revalidate response was accepted stale")
+	}
+
+	// In strict mode a request that sets its own terms gets nothing less.
+	for _, directive := range []string{"no-cache", "max-age=0", "min-fresh=600"} {
+		strict := &exchange{reqCC: parseDirectives([]string{directive})}
+		for name, rec := range map[string]*record{"stale": stale, "fresh": fresh} {
+			if strict.staleUsable(rec, now, rec.swr) {
+				t.Errorf("a %s response was served in place of an update to a request with %s", name, directive)
+			}
 		}
 	}
 }
@@ -254,7 +289,8 @@ func TestBuildKey(t *testing.T) {
 		{KeyOptions{SortQuery: true}, "GET-http-example.com-/a/b?a=2&z=1"},
 		{KeyOptions{DisableQuery: true}, "GET-http-example.com-/a/b"},
 		{KeyOptions{DisableHost: true, DisableScheme: true, DisableMethod: true, DisableQuery: true}, "/a/b"},
-		{KeyOptions{Headers: []string{"x-tenant"}}, "GET-http-example.com-/a/b?z=1&a=2-blue"},
+		{KeyOptions{Headers: []string{"x-tenant"}}, `GET-http-example.com-/a/b?z=1&a=2-X-Tenant="blue"`},
+		{KeyOptions{Headers: []string{"x-tenant", "x-missing"}}, `GET-http-example.com-/a/b?z=1&a=2-X-Tenant="blue"-X-Missing=""`},
 	}
 	for _, tt := range tests {
 		c, err := Options{Key: &tt.key}.resolve()
@@ -263,6 +299,44 @@ func TestBuildKey(t *testing.T) {
 		}
 		if got := c.buildKey(r, http.MethodGet); got != tt.want {
 			t.Errorf("%+v: key %q, want %q", tt.key, got, tt.want)
+		}
+	}
+}
+
+// TestKeysCannotBeForged checks that a request cannot be given the key of
+// another one by moving text between its URL and a header that is part of
+// the key.
+func TestKeysCannotBeForged(t *testing.T) {
+	c, err := Options{Key: &KeyOptions{Headers: []string{"Accept-Language", "X-Tenant"}}}.resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := func(target string, headers ...string) string {
+		r := httptest.NewRequest(http.MethodGet, target, nil)
+		for i := 0; i < len(headers); i += 2 {
+			r.Header.Set(headers[i], headers[i+1])
+		}
+		return c.buildKey(r, http.MethodGet)
+	}
+
+	keys := map[string]string{}
+	for name, key := range map[string]string{
+		"plain":             request("http://example.com/page?q=1", "Accept-Language", "en-US"),
+		"moved to the url":  request("http://example.com/page?q=1-en", "Accept-Language", "US"),
+		"quoted in the url": request(`http://example.com/page?q=1-Accept-Language="en-US"`, "Accept-Language", ""),
+		"moved to a header": request("http://example.com/page?q=1", "Accept-Language", `en-US"-X-Tenant="a`),
+		"other header":      request("http://example.com/page?q=1", "Accept-Language", "en-US", "X-Tenant", "a"),
+		"encoded slash":     request("http://example.com/page%2Fq", "Accept-Language", "en-US"),
+		"slash":             request("http://example.com/page/q", "Accept-Language", "en-US"),
+		"encoded nul":       request("http://example.com/page%00", "Accept-Language", "en-US"),
+	} {
+		if other, dup := keys[key]; dup {
+			t.Errorf("%q and %q share the key %s", name, other, key)
+		}
+		keys[key] = name
+		if strings.IndexByte(key, 0) >= 0 {
+			t.Errorf("%q: the key contains a NUL", name)
 		}
 	}
 }

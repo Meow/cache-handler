@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
+	"math"
 	"net/http"
 	"slices"
 	"strconv"
@@ -17,7 +19,7 @@ import (
 
 // clientGoneGrace is how long a fetch whose client left may go without
 // receiving anything from the upstream before it is given up.
-const clientGoneGrace = 30 * time.Second
+var clientGoneGrace = 30 * time.Second
 
 var (
 	errFetchAborted = errors.New("cache: fetch aborted")
@@ -32,11 +34,9 @@ const (
 	modeUndecided fetchMode = iota
 	// modePass: relayed to the client, not stored.
 	modePass
-	// modeStream: relayed to the client and stored at the same time.
-	modeStream
-	// modeRange: stored whole, while the client is relayed the one range it
-	// asked for as it comes by.
-	modeRange
+	// modeRelay: stored, while the client is sent the response, or the one
+	// range of it that it asked for, from what is stored so far.
+	modeRelay
 	// modeSilent: stored only. The client sent a precondition or asked for
 	// something else than one plain range, which is answered from the stored
 	// response afterwards.
@@ -54,6 +54,11 @@ const (
 // fetchWriter is the ResponseWriter given to the upstream handlers when the
 // cache fetches a response. It decides what to do with the response when its
 // headers arrive, then streams the body accordingly without ever holding it.
+//
+// A response that is stored goes from the upstream to the file only. The
+// client is served from the file by a separate goroutine, the pump, like the
+// other requests reading the response while it downloads: a client that
+// reads slowly holds up neither the download nor the others.
 type fetchWriter struct {
 	x  *exchange
 	id ID
@@ -83,12 +88,21 @@ type fetchWriter struct {
 	reason   string
 	w        *Writer
 	declared int64
-	// pos is how much of the body went by. first and last bound the range
-	// relayed in modeRange.
+	// pos is how much of the body went by. first and last bound what the
+	// client is sent of it in modeRelay.
 	pos, first, last int64
-	gone             bool
-	finished         bool
-	idle             *time.Timer
+	// pump is closed when the goroutine serving the client from the file is
+	// done, and pumpErr is why it stopped early, if it did. While the pump
+	// runs, nothing else writes to the client.
+	pump    chan struct{}
+	pumpErr error
+	tail    *Tail
+	// selfAborted tells that the cache itself cut the fetch short, which is
+	// not a failure of the upstream.
+	selfAborted bool
+	gone        bool
+	finished    bool
+	idle        *time.Timer
 }
 
 func newFetchWriter(x *exchange, id ID, stale *Hit) *fetchWriter {
@@ -99,7 +113,7 @@ func newFetchWriter(x *exchange, id ID, stale *Hit) *fetchWriter {
 		base:     x.w.Header(),
 		hdr:      x.w.Header().Clone(),
 		stale:    stale,
-		plain:    x.r.Method == http.MethodGet && x.r.Header.Get("Range") == "" && !conditional(x.r),
+		plain:    plainRequest(x.r),
 		forward:  "fwd=uri-miss",
 		reason:   "UPSTREAM-ERROR",
 		declared: -1,
@@ -112,6 +126,12 @@ func newFetchWriter(x *exchange, id ID, stale *Hit) *fetchWriter {
 	}
 
 	return fw
+}
+
+// plainRequest tells whether the request asks for a whole response without
+// condition, which is what the upstream is asked for.
+func plainRequest(r *http.Request) bool {
+	return r.Method == http.MethodGet && r.Header.Get("Range") == "" && !conditional(r)
 }
 
 // prepareRequest turns the client request into one for the whole response:
@@ -177,7 +197,7 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 
 	x := fw.x
 	c := x.c
-	s := x.h.store
+	s := x.store
 	now := time.Now()
 
 	if code == http.StatusNotModified && fw.revalidating {
@@ -198,6 +218,9 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 	}
 
 	v := c.evaluate(x.r, code, own, now)
+	// uncacheable tells that the response itself cannot be stored, as
+	// opposed to this one attempt at storing it.
+	uncacheable := !v.store
 
 	// The size the response announces is known not to fit before any of it
 	// is written.
@@ -208,8 +231,14 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 	if n, err := strconv.ParseInt(fw.hdr.Get("Content-Length"), 10, 64); err == nil && n >= 0 {
 		fw.declared = n
 		if v.store && n > limit {
-			v = reject("TOO-LARGE")
+			v, uncacheable = reject("TOO-LARGE"), true
 		}
+	}
+
+	// Nobody is waiting for the response anymore. It is only worth storing
+	// for later if it is known to end.
+	if v.store && fw.gone && fw.declared < 0 {
+		v = reject("CLIENT-GONE")
 	}
 
 	if v.store {
@@ -237,9 +266,11 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 			v = reject("STORAGE-ERROR")
 		} else {
 			fw.w = w
-			// From now on the requests waiting for this one are served
-			// from the response as it arrives.
-			if x.flight != nil {
+			// From now on the requests waiting for this one are served from
+			// the response as it arrives. That is only offered for a
+			// response of known length: one that may turn out too large to
+			// store would be cut short for them when it does.
+			if x.flight != nil && fw.declared >= 0 {
 				s.ShareFlight(x.flightID, x.flight, w)
 			}
 		}
@@ -247,13 +278,13 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 
 	if !v.store {
 		fw.reason = v.reason
-		if v.reason != "STORAGE-ERROR" {
+		if uncacheable {
 			s.SetUncacheable(fw.id, true)
-		}
-		// The upstream no longer gives a response to keep, so the one it
-		// gave before is not to be served anymore either.
-		if fw.stale != nil && code < 500 {
-			fw.stale.Discard()
+			// The upstream no longer gives a response to keep, so the one
+			// it gave before is not to be served anymore either.
+			if fw.stale != nil && code < 500 {
+				fw.stale.Discard()
+			}
 		}
 		// Nothing will come of this fetch for the requests waiting on it.
 		x.endFlight(false)
@@ -261,20 +292,28 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 
 	switch {
 	case v.store && fw.plain:
-		fw.mode = modeStream
-		fw.sendHeaderLocked(http.StatusOK, fw.forward+"; stored")
+		fw.mode = modeRelay
+		fw.first, fw.last = 0, math.MaxInt64-1
+		fw.mergeHeaderLocked()
+		fw.base.Add("Cache-Status", x.status(fw.forward+"; stored"))
+		fw.rw.WriteHeader(code)
+		fw.startPumpLocked(-1)
 	case v.store && fw.relayRangeLocked():
-		fw.mode = modeRange
+		fw.mode = modeRelay
+		fw.startPumpLocked(fw.last - fw.first + 1)
 	case v.store:
 		fw.mode = modeSilent
 	case fw.plain:
 		fw.mode = modePass
-		fw.sendHeaderLocked(code, fw.forward+"; detail="+v.reason)
+		fw.mergeHeaderLocked()
+		fw.base.Add("Cache-Status", x.status(fw.forward+"; detail="+v.reason))
+		fw.rw.WriteHeader(code)
 		if fw.gone {
 			fw.cancel()
 		}
 	default:
 		fw.mode = modeAbort
+		fw.selfAborted = true
 		fw.cancel()
 	}
 }
@@ -354,13 +393,58 @@ func (fw *fetchWriter) mergeHeaderLocked() {
 	}
 }
 
-// sendHeaderLocked starts the client response with what the upstream
-// handlers produced.
-func (fw *fetchWriter) sendHeaderLocked(code int, params string) {
-	fw.mergeHeaderLocked()
-	fw.base.Add("Cache-Status", fw.x.status(params))
+// startPumpLocked starts serving the client from the file the response is
+// being written to: count bytes from fw.first, or everything if negative.
+func (fw *fetchWriter) startPumpLocked(count int64) {
+	tail, err := fw.w.Tail(fw.x.r.Context())
+	if err == nil && fw.first > 0 {
+		_, err = tail.Seek(fw.first, io.SeekStart)
+	}
+	if err != nil {
+		// What is written cannot be read back: relay without storing.
+		if tail != nil {
+			tail.Close()
+		}
+		fw.dropStoreLocked(err)
+		return
+	}
 
-	fw.rw.WriteHeader(code)
+	// When the client has caught up with the download it is given what it
+	// has so far.
+	tail.flush = func() { _ = http.NewResponseController(fw.rw).Flush() }
+
+	done := make(chan struct{})
+	fw.tail, fw.pump = tail, done
+
+	go func() {
+		defer close(done)
+		defer tail.Close()
+
+		buf := make([]byte, 64<<10)
+		for count != 0 {
+			want := int64(len(buf))
+			if count > 0 && count < want {
+				want = count
+			}
+
+			n, rerr := tail.Read(buf[:want])
+			if n > 0 {
+				if _, werr := fw.rw.Write(buf[:n]); werr != nil {
+					fw.pumpErr = werr
+					return
+				}
+				if count > 0 {
+					count -= int64(n)
+				}
+			}
+			if rerr != nil {
+				if rerr != io.EOF {
+					fw.pumpErr = rerr
+				}
+				return
+			}
+		}
+	}()
 }
 
 // Write implements http.ResponseWriter.
@@ -374,61 +458,52 @@ func (fw *fetchWriter) Write(p []byte) (int, error) {
 	case modePass:
 		return fw.rw.Write(p)
 
-	case modeStream:
-		if fw.w != nil {
-			if _, err := fw.w.Write(p); err != nil {
-				fw.dropStoreLocked(err)
-			}
-		}
-		if !fw.gone {
-			if _, err := fw.rw.Write(p); err != nil {
-				fw.gone = true
-			}
-		}
-		if fw.gone {
-			// Only the cache is still interested in the response.
-			if fw.w == nil {
-				fw.cancel()
-				return 0, errClientGone
-			}
-			fw.armIdleLocked()
-		}
-
-		return len(p), nil
-
-	case modeRange:
+	case modeRelay:
+		size := len(p)
 		start := fw.pos
-		fw.pos += int64(len(p))
+		fw.pos += int64(size)
 
 		if fw.w != nil {
-			if _, err := fw.w.Write(p); err != nil {
-				fw.dropStoreLocked(err)
+			_, err := fw.w.Write(p)
+			if err == nil {
+				if fw.gone {
+					fw.armIdleLocked()
+				}
+				return size, nil
 			}
+
+			// The response cannot be stored after all. The client was sent
+			// what the file holds; the rest goes to it directly.
+			stored := fw.w.n - start
+			fw.dropStoreLocked(err)
+			p, start = p[stored:], start+stored
 		}
-		// The part of p that falls within the range goes to the client.
-		if from, to := max(start, fw.first), min(fw.pos, fw.last+1); from < to && !fw.gone {
+
+		if fw.gone {
+			fw.cancel()
+			return 0, errClientGone
+		}
+		if from, to := max(start, fw.first), min(fw.pos, fw.last+1); from < to {
 			if _, err := fw.rw.Write(p[from-start : to-start]); err != nil {
 				fw.gone = true
+				fw.cancel()
+				return 0, err
 			}
 		}
-		if fw.gone || fw.pos > fw.last {
-			// The client has all it will get; only the cache may still
-			// want the rest.
-			if fw.w == nil {
-				fw.cancel()
-				return 0, errClientGone
-			}
-			if fw.gone {
-				fw.armIdleLocked()
-			}
+		if fw.pos > fw.last {
+			// The client has the range it asked for and nothing is stored:
+			// the rest is of no use.
+			fw.cancel()
+			return 0, errClientGone
 		}
 
-		return len(p), nil
+		return size, nil
 
 	case modeSilent:
 		if _, err := fw.w.Write(p); err != nil {
 			fw.dropStoreLocked(err)
 			fw.mode = modeAbort
+			fw.selfAborted = true
 			fw.cancel()
 
 			return 0, errFetchAborted
@@ -453,17 +528,32 @@ func (fw *fetchWriter) Flush() {
 	fw.mu.Lock()
 	defer fw.mu.Unlock()
 
-	if (fw.mode == modePass || fw.mode == modeStream || fw.mode == modeRange) && !fw.gone {
+	// The pump flushes for itself.
+	if fw.pump == nil && (fw.mode == modePass || fw.mode == modeRelay) && !fw.gone {
 		_ = http.NewResponseController(fw.rw).Flush()
 	}
 }
 
-// dropStoreLocked gives up storing the response.
+// dropStoreLocked gives up storing the response. If the client was being
+// served from the file, it returns once the client has received all that
+// the file holds, after which the client can be written to directly.
 func (fw *fetchWriter) dropStoreLocked(err error) {
-	s := fw.x.h.store
+	s := fw.x.store
 
+	if fw.tail != nil {
+		// Let the pump finish with what was written before the file goes.
+		fw.tail.finishAt(fw.w.n)
+	}
 	fw.w.Abort()
 	fw.w = nil
+
+	if fw.pump != nil {
+		<-fw.pump
+		fw.pump, fw.tail = nil, nil
+		if fw.pumpErr != nil {
+			fw.gone = true
+		}
+	}
 
 	if errors.Is(err, errTooLarge) {
 		fw.reason = "TOO-LARGE"
@@ -488,8 +578,10 @@ func (fw *fetchWriter) clientGone() {
 	switch fw.mode {
 	case modePass, modeAbort:
 		fw.cancel()
-	case modeStream, modeRange, modeSilent:
-		if fw.w == nil {
+	case modeRelay, modeSilent:
+		// The download goes on for the requests to come, provided it is
+		// known to end.
+		if fw.w == nil || fw.declared < 0 {
 			fw.cancel()
 			return
 		}
@@ -512,8 +604,8 @@ func (fw *fetchWriter) armIdleLocked() {
 }
 
 // finish is called when the upstream handlers returned. ok tells that they
-// did so without error, in which case a response they never started is the
-// empty 200 the server would send for them.
+// ran to their end without error, in which case a response they never
+// started is the empty 200 the server would send for them.
 func (fw *fetchWriter) finish(ok bool) {
 	fw.mu.Lock()
 	defer fw.mu.Unlock()
@@ -524,6 +616,23 @@ func (fw *fetchWriter) finish(ok bool) {
 	fw.finished = true
 	if fw.idle != nil {
 		fw.idle.Stop()
+	}
+}
+
+// copyTrailers gives the client response the trailers the upstream handlers
+// set once the body was written. Nothing else may be writing to the client.
+func (fw *fetchWriter) copyTrailers() {
+	var announced []string
+	for _, line := range fw.base.Values("Trailer") {
+		for name := range strings.SplitSeq(line, ",") {
+			announced = append(announced, http.CanonicalHeaderKey(strings.TrimSpace(name)))
+		}
+	}
+
+	for name, values := range fw.hdr {
+		if strings.HasPrefix(name, http.TrailerPrefix) || slices.Contains(announced, name) {
+			fw.base[name] = values
+		}
 	}
 }
 
@@ -545,14 +654,20 @@ func (fw *fetchWriter) commit() bool {
 		return false
 	}
 
+	// The body is whole: the client gets all of it even if it cannot be
+	// kept.
+	if fw.tail != nil {
+		fw.tail.finishAt(w.n)
+	}
+
 	return w.Commit() == nil
 }
 
-// close releases what the fetch still holds.
-func (fw *fetchWriter) close() {
+// close releases what the fetch still holds and waits for the pump, so that
+// nothing writes to the client once the handler has returned. It returns
+// the reason the client did not get all it was to be sent, if so.
+func (fw *fetchWriter) close() error {
 	fw.mu.Lock()
-	defer fw.mu.Unlock()
-
 	fw.finished = true
 	if fw.idle != nil {
 		fw.idle.Stop()
@@ -561,4 +676,13 @@ func (fw *fetchWriter) close() {
 		fw.w.Abort()
 		fw.w = nil
 	}
+	pump := fw.pump
+	fw.mu.Unlock()
+
+	if pump == nil {
+		return nil
+	}
+	<-pump
+
+	return fw.pumpErr
 }

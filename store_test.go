@@ -277,6 +277,67 @@ func TestStoreServesWhatWasDeletedBehindItsBack(t *testing.T) {
 	}
 }
 
+// TestStoreKeepsWhatItCannotOpen checks that an entry is only forgotten when
+// its file is gone or damaged, not when opening it fails for another reason,
+// as it does when the process is out of file descriptors.
+func TestStoreKeepsWhatItCannotOpen(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("file permissions do not apply to root")
+	}
+
+	s := openTestStore(t, t.TempDir(), Limits{})
+	if err := storePut(t, s, "key", nil, nil, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	path := s.path(makeID("key"))
+
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, hit := storeGet(t, s, "key", nil); hit != nil {
+		t.Fatal("read a file that cannot be opened")
+	}
+	if n := s.Stats().Entries; n != 1 {
+		t.Fatalf("the entry was forgotten: %d entries", n)
+	}
+
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := storeGet(t, s, "key", nil); string(got) != "body" {
+		t.Error("the response is gone")
+	}
+}
+
+// TestStoreRecoversItsDirectories checks that the cache keeps working when
+// its directory is emptied by hand.
+func TestStoreRecoversItsDirectories(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir, Limits{})
+	if err := storePut(t, s, "before", nil, nil, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if e.Name() != lockName {
+			if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if _, hit := storeGet(t, s, "before", nil); hit != nil {
+		t.Error("served a response whose file was removed")
+	}
+	if err := storePut(t, s, "after", nil, nil, []byte("body")); err != nil {
+		t.Fatalf("storing after the directory was emptied: %v", err)
+	}
+	if got, _ := storeGet(t, s, "after", nil); string(got) != "body" {
+		t.Error("the response stored after the directory was emptied is not found")
+	}
+}
+
 func TestStoreMaxSize(t *testing.T) {
 	const maxSize = 1 << 20
 
@@ -337,6 +398,141 @@ func TestStoreMaxSize(t *testing.T) {
 	}
 }
 
+func TestStoreMaxFiles(t *testing.T) {
+	const maxFiles = 10
+
+	dir := t.TempDir()
+	s := openTestStore(t, dir, Limits{MaxFiles: maxFiles})
+
+	countFiles := func() int {
+		files := 0
+		_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			if err == nil && !info.IsDir() && path != filepath.Join(dir, lockName) && path != filepath.Join(dir, cacheDirTag) {
+				files++
+			}
+			return nil
+		})
+		return files
+	}
+
+	for i := range 40 {
+		key := fmt.Sprintf("key-%d", i)
+		if err := storePut(t, s, key, nil, nil, bodyFor(key, 100)); err != nil {
+			t.Fatal(err)
+		}
+		// Keep the first response in use: it must outlive the others.
+		if _, hit := storeGet(t, s, "key-0", nil); hit == nil {
+			t.Fatalf("the response in use was evicted after %d stores", i)
+		}
+		if n := s.Stats().Entries; n > maxFiles {
+			t.Fatalf("%d entries, over the limit of %d", n, maxFiles)
+		}
+		if n := countFiles(); n > maxFiles {
+			t.Fatalf("%d files on disk, over the limit of %d", n, maxFiles)
+		}
+	}
+	if n := s.Stats().Entries; n != maxFiles {
+		t.Errorf("%d entries, want the cache full at %d", n, maxFiles)
+	}
+	if _, hit := storeGet(t, s, "key-1", nil); hit != nil {
+		t.Error("the least recently used response was not evicted")
+	}
+	if _, hit := storeGet(t, s, "key-39", nil); hit == nil {
+		t.Error("the most recent response was evicted")
+	}
+
+	// The file that says what a response varies on is a file too.
+	s.PurgeAll()
+	for i := range 20 {
+		key := fmt.Sprintf("varied-%d", i)
+		if err := storePut(t, s, key, []string{"accept-language"}, http.Header{"Accept-Language": {"fr"}}, []byte("bonjour")); err != nil {
+			t.Fatal(err)
+		}
+		if n := countFiles(); n > maxFiles {
+			t.Fatalf("%d files on disk with varied responses, over the limit of %d", n, maxFiles)
+		}
+	}
+	if got, _ := storeGet(t, s, "varied-19", http.Header{"Accept-Language": {"fr"}}); string(got) != "bonjour" {
+		t.Error("the most recent varied response is gone")
+	}
+
+	// Downloads in progress count: when they take every slot there is no
+	// room for another, and room again once one ends.
+	s.PurgeAll()
+	create := func(i int) (*Writer, error) {
+		now := time.Now()
+		rec := &record{stored: now.UnixMilli(), fresh: now.Add(time.Hour).UnixMilli(), status: http.StatusOK}
+		return s.Create(fmt.Sprintf("download-%d", i), nil, nil, rec, 0, -1)
+	}
+	var writers []*Writer
+	for i := range maxFiles {
+		w, err := create(i)
+		if err != nil {
+			t.Fatalf("download %d refused: %v", i, err)
+		}
+		writers = append(writers, w)
+	}
+	if w, err := create(maxFiles); err == nil {
+		w.Abort()
+		t.Error("a download was accepted over the limit")
+	}
+	if n := countFiles(); n > maxFiles {
+		t.Errorf("%d files on disk during downloads, over the limit of %d", n, maxFiles)
+	}
+	writers[0].Abort()
+	if err := writers[1].Commit(); err != nil {
+		t.Fatal(err)
+	}
+	w, err := create(maxFiles)
+	if err != nil {
+		t.Fatalf("no room after a download ended: %v", err)
+	}
+	w.Abort()
+	for _, w := range writers[2:] {
+		w.Abort()
+	}
+	if n := s.tempFiles.Load(); n != 0 {
+		t.Errorf("%d downloads still counted", n)
+	}
+
+	// Lowering the limit evicts down to it; lifting it stops limiting.
+	for i := range maxFiles {
+		_ = storePut(t, s, fmt.Sprintf("key-%d", i), nil, nil, []byte("x"))
+	}
+	s.SetLimits(Limits{MaxSize: 64 << 20, MaxFiles: 3})
+	if n := s.Stats().Entries; n != 3 || countFiles() != 3 {
+		t.Errorf("%d entries and %d files after lowering the limit to 3", n, countFiles())
+	}
+	s.SetLimits(Limits{MaxSize: 64 << 20})
+	for i := range 30 {
+		_ = storePut(t, s, fmt.Sprintf("key-%d", i), nil, nil, []byte("x"))
+	}
+	if n := s.Stats().Entries; n != 30 {
+		t.Errorf("%d entries without a limit, want 30", n)
+	}
+}
+
+// TestStoreKeepsWhatFits checks that storing a response evicts no more than
+// the room it needs.
+func TestStoreKeepsWhatFits(t *testing.T) {
+	s := openTestStore(t, t.TempDir(), Limits{MaxSize: 1 << 20})
+
+	for i := range 10 {
+		key := fmt.Sprintf("small-%d", i)
+		if err := storePut(t, s, key, nil, nil, bodyFor(key, 50_000)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 10 × 50kB and one of 400kB fit together in 1MiB.
+	if err := storePut(t, s, "large", nil, nil, bodyFor("large", 400_000)); err != nil {
+		t.Fatal(err)
+	}
+
+	if st := s.Stats(); st.Evicted != 0 || st.Entries != 11 {
+		t.Errorf("%d evictions and %d entries, want everything kept", st.Evicted, st.Entries)
+	}
+}
+
 func TestStoreMemoryTier(t *testing.T) {
 	const maxMemory = 2 << 20
 
@@ -386,13 +582,17 @@ func TestStoreMemoryTier(t *testing.T) {
 
 	// Lowering the limit frees the memory; turning it off frees it all.
 	s.SetLimits(Limits{MaxSize: 64 << 20, MaxMemory: 1 << 20})
-	if st := s.Stats(); st.MemoryBytes > 1<<20 {
-		t.Errorf("%d bytes of memory in use after lowering the limit to 1MiB", st.MemoryBytes)
+	if st := s.Stats(); st.HotBytes+st.IndexBytes > 1<<20 {
+		t.Errorf("%d bytes of memory in use after lowering the limit to 1MiB", st.HotBytes+st.IndexBytes)
 	}
+	// What is no longer used goes back to the system shortly after.
+	waitFor(t, "the memory to be given back", func() bool { return s.Stats().MemoryBytes <= 1<<20 })
+
 	s.SetLimits(Limits{MaxSize: 64 << 20})
 	if st := s.Stats(); st.HotEntries != 0 || st.HotBytes != 0 {
 		t.Errorf("memory still in use with the memory tier off: %+v", st)
 	}
+	waitFor(t, "all the memory to be given back", func() bool { return s.arena.residentBytes() == 0 })
 	if got, _ := storeGet(t, s, "key-0", nil); !bytes.Equal(got, bodyFor("key-0", size)) {
 		t.Error("the response is gone with its in-memory copy")
 	}
@@ -662,6 +862,23 @@ func TestStoreTail(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the reader of an aborted response was left waiting")
+	}
+
+	// A reader told where to stop gets what was written up to there even
+	// though the response is given up.
+	w = create("drained", -1)
+	if _, err := w.Write(body[:5000]); err != nil {
+		t.Fatal(err)
+	}
+	drained, err := w.Tail(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer drained.Close()
+	drained.finishAt(5000)
+	w.Abort()
+	if got, err := io.ReadAll(drained); err != nil || !bytes.Equal(got, body[:5000]) {
+		t.Errorf("read %d bytes (%v) of a response dropped after 5000", len(got), err)
 	}
 
 	// A reader whose client left stops waiting.

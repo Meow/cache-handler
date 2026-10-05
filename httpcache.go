@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -35,7 +36,7 @@ type Handler struct {
 	Options
 
 	cfg    *config
-	store  *Store
+	app    *App
 	logger *zap.Logger
 }
 
@@ -47,8 +48,8 @@ func (*Handler) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Provision resolves the options against the global ones and opens the
-// store, or joins the one already open on the same directory.
+// Provision resolves the options against the global ones and registers the
+// cache directory with the app, which opens it when the configuration starts.
 func (h *Handler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger()
 
@@ -56,40 +57,13 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if err != nil {
 		return err
 	}
-	app := appModule.(*App)
+	h.app = appModule.(*App)
 
-	cfg, err := h.Options.inherit(app.Options).resolve()
-	if err != nil {
-		return err
-	}
-	if err := app.claim(cfg.path, cfg.limits); err != nil {
+	if h.cfg, err = h.Options.inherit(h.app.Options).resolve(); err != nil {
 		return err
 	}
 
-	store, _, err := stores.LoadOrNew(cfg.path, func() (caddy.Destructor, error) {
-		return OpenStore(cfg.path, cfg.limits, h.logger)
-	})
-	if err != nil {
-		return err
-	}
-
-	h.cfg = cfg
-	h.store = store.(*Store)
-	// A store inherited from the previous configuration gets its new limits
-	// when this one starts.
-	app.use(h.store, cfg.path, cfg.limits)
-
-	return nil
-}
-
-// Cleanup releases the store, which is closed once no configuration uses it.
-func (h *Handler) Cleanup() error {
-	if h.store == nil {
-		return nil
-	}
-	_, err := stores.Delete(h.cfg.path)
-
-	return err
+	return h.app.claim(h.cfg.path, h.cfg.limits)
 }
 
 // UnmarshalCaddyfile sets up the handler from the cache directive.
@@ -108,6 +82,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	c := h.cfg
 	x := &exchange{h: h, c: c, w: w, r: r, next: next, start: time.Now()}
 
+	if x.store = h.app.store(r.Context(), c.path); x.store == nil {
+		return x.bypass("UNAVAILABLE")
+	}
+
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return x.serveUncached()
 	}
@@ -116,9 +94,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	x.key = c.buildKey(r, http.MethodGet)
-	if len(x.key) > maxKeyLen/2 {
+	// A NUL separates a key from what selects a variant of it, and only a
+	// key template can produce one.
+	if len(x.key) > maxKeyLen/2 || strings.IndexByte(x.key, 0) >= 0 {
 		x.key = ""
-		return x.bypass("KEY-TOO-LONG")
+		return x.bypass("INVALID-KEY")
 	}
 
 	if c.strict {
@@ -138,6 +118,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 type exchange struct {
 	h     *Handler
 	c     *config
+	store *Store
 	w     http.ResponseWriter
 	r     *http.Request
 	next  caddyhttp.Handler
@@ -195,7 +176,7 @@ func (x *exchange) serveUncached() error {
 	sw := &statusWriter{ResponseWriterWrapper: &caddyhttp.ResponseWriterWrapper{ResponseWriter: x.w}}
 	err := x.next.ServeHTTP(sw, r)
 	if err == nil && sw.status < http.StatusBadRequest {
-		x.h.store.Purge(key)
+		x.store.Purge(key)
 	}
 
 	return err
@@ -217,7 +198,7 @@ func (w *statusWriter) WriteHeader(code int) {
 // serve answers a GET or HEAD request from the cache, fetching the response
 // first when it is missing or stale.
 func (x *exchange) serve() error {
-	s := x.h.store
+	s := x.store
 
 	var (
 		joined   *flight
@@ -256,6 +237,13 @@ func (x *exchange) serve() error {
 		// Responses known not to be cacheable are not worth waiting for
 		// each other.
 		if s.Uncacheable(id) {
+			// Only a request for the whole response can tell whether that
+			// is still so; any other is the upstream's to answer.
+			if !plainRequest(x.r) {
+				hit.Close()
+				return x.pass("UNCACHEABLE")
+			}
+
 			return x.fetch(id, nil, hit)
 		}
 
@@ -397,7 +385,8 @@ func (x *exchange) usable(rec *record, now time.Time, joined *flight) bool {
 // staleUsable tells whether a stale response may still be served, window
 // being the seconds it is allowed to after its freshness ended.
 func (x *exchange) staleUsable(rec *record, now time.Time, window uint32) bool {
-	if rec.flags&flagMustRevalidate != 0 || x.reqCC.has("no-cache") {
+	// A request that sets its own terms is not given less than it asked.
+	if rec.flags&flagMustRevalidate != 0 || x.reqCC.has("no-cache") || x.reqCC.has("max-age") || x.reqCC.has("min-fresh") {
 		return false
 	}
 
@@ -470,7 +459,7 @@ func (x *exchange) serveHit(hit *Hit, now time.Time, params string) error {
 // endFlight releases the requests waiting for this exchange, once.
 func (x *exchange) endFlight(stored bool) {
 	if x.flight != nil && x.flightEnded.CompareAndSwap(false, true) {
-		x.h.store.EndFlight(x.flightID, x.flight, stored)
+		x.store.EndFlight(x.flightID, x.flight, stored)
 	}
 }
 
@@ -481,13 +470,13 @@ func (x *exchange) endFlight(stored bool) {
 func (x *exchange) fetch(id ID, fl *flight, stale *Hit) error {
 	defer stale.Close()
 
-	s, r := x.h.store, x.r
+	s, r := x.store, x.r
 	x.flightID, x.flight = id, fl
 
 	fw := newFetchWriter(x, id, stale)
 	// Whatever happens below, the waiters are released and an unfinished
 	// file is removed.
-	defer fw.close()
+	defer func() { _ = fw.close() }()
 	defer x.endFlight(false)
 
 	// The fetch does not stop with the client: a response worth storing is
@@ -501,10 +490,15 @@ func (x *exchange) fetch(id ID, fl *flight, stale *Hit) error {
 	err, aborted := callNext(x.next, fw, r.WithContext(ctx))
 	restore()
 	stop()
-	fw.finish(err == nil && !aborted)
+
+	// A fetch the cache canceled did not run to its end, even when the
+	// handlers return as if it had: a reverse proxy whose request is
+	// canceled before the upstream answers returns without a response.
+	canceled := ctx.Err() != nil
+	failed := err != nil || aborted || canceled
+	fw.finish(!failed)
 
 	now := time.Now()
-	failed := err != nil || aborted
 
 	switch fw.mode {
 	case modeRevalidated:
@@ -518,12 +512,21 @@ func (x *exchange) fetch(id ID, fl *flight, stale *Hit) error {
 
 		return x.serveHit(stale, now, fmt.Sprintf("fwd=stale; fwd-status=%d; detail=STALE", fw.status))
 
-	case modeStream, modeRange:
+	case modeRelay:
 		committed := !failed && fw.commit()
 		if committed {
 			s.SetUncacheable(id, false)
 		}
 		x.endFlight(committed)
+
+		// The client may still be receiving what was stored. It is cut
+		// short if the response is not whole.
+		if perr := fw.close(); perr != nil || aborted {
+			panic(http.ErrAbortHandler)
+		}
+		fw.copyTrailers()
+
+		return err
 
 	case modeSilent:
 		if !failed && fw.commit() {
@@ -539,11 +542,17 @@ func (x *exchange) fetch(id ID, fl *flight, stale *Hit) error {
 	case modeAbort:
 		return x.fallback(fw, stale, now, failed)
 
+	case modePass:
+		fw.copyTrailers()
+
 	case modeUndecided:
 		// The upstream failed before answering.
 		x.endFlight(false)
 		if stale != nil && x.staleUsable(stale.rec, now, stale.rec.sie) {
 			return x.serveHit(stale, now, "fwd=stale; detail=STALE")
+		}
+		if err == nil && !aborted {
+			return r.Context().Err()
 		}
 	}
 
@@ -562,7 +571,9 @@ func (x *exchange) fallback(fw *fetchWriter, stale *Hit, now time.Time, failed b
 	if err := x.r.Context().Err(); err != nil {
 		return err
 	}
-	if failed && stale != nil && x.staleUsable(stale.rec, now, stale.rec.sie) {
+	// The stale response stands in for an upstream that failed, not for a
+	// fetch the cache gave up by itself.
+	if failed && !fw.selfAborted && stale != nil && x.staleUsable(stale.rec, now, stale.rec.sie) {
 		return x.serveHit(stale, now, "fwd=stale; detail=STALE")
 	}
 
@@ -629,10 +640,10 @@ func (x *exchange) refresh(stale *Hit, fw *fetchWriter, now time.Time) *Hit {
 		rec.flags |= flagMustRevalidate
 	}
 
-	if err := x.h.store.Rewrite(stale, rec); err != nil {
+	if err := x.store.Rewrite(stale, rec); err != nil {
 		return stale
 	}
-	if _, hit := x.h.store.Lookup(x.key, x.r.Header); hit != nil {
+	if _, hit := x.store.Lookup(x.key, x.r.Header); hit != nil {
 		return hit
 	}
 
@@ -645,7 +656,6 @@ func seconds(d time.Duration) uint32 {
 
 // Interface guards
 var (
-	_ caddy.CleanerUpper          = (*Handler)(nil)
 	_ caddy.Provisioner           = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 	_ caddyfile.Unmarshaler       = (*Handler)(nil)
