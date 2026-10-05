@@ -55,7 +55,10 @@ if [ "${1:-}" != inside ]; then
 	command -v docker >/dev/null || { echo "compare: docker not found" >&2; exit 1; }
 
 	echo "Building the image $IMAGE..." >&2
-	docker build -q -t "$IMAGE" -f - "$repo" >&2 <<'EOF'
+	# The output of the build is only of interest when it fails.
+	buildlog=$(mktemp)
+	trap 'rm -f "$buildlog"' EXIT
+	docker build --progress=plain -t "$IMAGE" -f - "$repo" >"$buildlog" 2>&1 <<'EOF' || { cat "$buildlog" >&2; exit 1; }
 FROM golang:1.27-alpine3.24 AS ours
 WORKDIR /src
 COPY go.mod go.sum ./
