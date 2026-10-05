@@ -12,12 +12,17 @@
 # What it does:
 #
 #   1. Builds an image with a Caddy built from the working tree, a Caddy
-#      with caddyserver/cache-handler, and Alpine's nginx, Varnish and ab.
+#      with caddyserver/cache-handler, and Alpine's nginx, Varnish, hitch
+#      and ab.
 #   2. For each number of cores in CORES, puts every cache in front of the
 #      same upstream, a Caddy without a cache answering a text of 13 bytes
 #      and fixtures/test.png, and measures hits with ab. The no cache rows
 #      are what the same server does without its cache: by itself, then as
-#      a mere proxy of the upstream.
+#      a mere proxy of the upstream. Everything is measured twice: in plain
+#      HTTP, and over TLS with sendfile off, as a server that terminates TLS
+#      does without help from the kernel. Varnish has no TLS of its own and
+#      gets it from hitch, the TLS proxy of the Varnish project, on the same
+#      cores.
 #   3. Runs bench.sh, the benchmark of this module alone, in the same image:
 #      once as it is, once with GOMAXPROCS=1.
 #
@@ -93,7 +98,7 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 # bash is what these scripts are written for, and util-linux-misc has the
 # taskset whose output they read.
 FROM alpine:3.24
-RUN apk add --no-cache nginx varnish apache2-utils curl bash util-linux-misc
+RUN apk add --no-cache nginx varnish hitch openssl apache2-utils curl bash util-linux-misc
 COPY --from=ours /caddy-ours /usr/local/bin/caddy-ours
 COPY --from=souin /caddy-souin /usr/local/bin/caddy-souin
 COPY --from=souin /souin-versions.txt /souin-versions.txt
@@ -134,10 +139,26 @@ RUNS=${RUNS:-3}
 CONCURRENCY=${CONCURRENCY:-64}
 TIMELIMIT=${TIMELIMIT:-10}
 
-base=http://127.0.0.1:9180
+schemes="http https"
 conf=/tmp/conf
 work=$(mktemp -d)
 mkdir -p $conf
+
+# base <scheme> is where the server under test listens for that scheme.
+base() {
+	case $1 in
+	http) echo http://127.0.0.1:9180 ;;
+	https) echo https://127.0.0.1:9443 ;;
+	esac
+}
+
+# The certificate every server presents: a self-signed one, which ab and
+# curl are told not to check.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
+	-subj /CN=127.0.0.1 -addext subjectAltName=IP:127.0.0.1 \
+	-keyout $conf/key.pem -out $conf/cert.pem 2>/dev/null
+# hitch wants the key and the certificate in one file.
+cat $conf/key.pem $conf/cert.pem >$conf/hitch.pem
 
 # One CPU per physical core among those the container may use, so that no
 # two of the pinned processes are the two threads of one core.
@@ -177,19 +198,21 @@ http://:9181 {
 }
 EOF
 
-# Caddy with this module.
+# Caddy with this module. The same routes are served in plain HTTP and over
+# TLS; the scheme is part of the cache key, so the two do not share entries.
 cat >$conf/ours.Caddyfile <<'EOF'
 {
 	admin off
 	persist_config off
 	default_bind 127.0.0.1
+	auto_https disable_redirects
 	cache {
 		path /tmp/ours/default
 		ttl 1h
 	}
 }
 
-http://127.0.0.1:9180 {
+(routes) {
 	route /direct/plain {
 		respond "Hello, world!"
 	}
@@ -216,6 +239,15 @@ http://127.0.0.1:9180 {
 		reverse_proxy 127.0.0.1:9181
 	}
 }
+
+http://127.0.0.1:9180 {
+	import routes
+}
+
+https://127.0.0.1:9443 {
+	tls /tmp/conf/cert.pem /tmp/conf/key.pem
+	import routes
+}
 EOF
 
 # Caddy with caddyserver/cache-handler. Its storage is a global option: there
@@ -225,18 +257,28 @@ cat >$conf/souin.Caddyfile <<'EOF'
 	admin off
 	persist_config off
 	default_bind 127.0.0.1
+	auto_https disable_redirects
 	cache {
 		ttl 1h
 		import /tmp/conf/souin-storage
 	}
 }
 
-http://127.0.0.1:9180 {
+(routes) {
 	route /cache/* {
 		cache
 		uri strip_prefix /cache
 		reverse_proxy 127.0.0.1:9181
 	}
+}
+
+http://127.0.0.1:9180 {
+	import routes
+}
+
+https://127.0.0.1:9443 {
+	tls /tmp/conf/cert.pem /tmp/conf/key.pem
+	import routes
 }
 EOF
 
@@ -266,30 +308,43 @@ http {
 
 	server {
 		listen 127.0.0.1:9180 reuseport;
-
-		location = /direct/plain {
-			default_type text/plain;
-			return 200 "Hello, world!";
-		}
-		location /direct/ {
-			alias /fixtures/;
-		}
-
-		location /proxy/ {
-			proxy_pass http://origin/;
-			proxy_http_version 1.1;
-			proxy_set_header Connection "";
-		}
-
-		location /cache/ {
-			proxy_pass http://origin/;
-			proxy_http_version 1.1;
-			proxy_set_header Connection "";
-			proxy_cache bench;
-			proxy_cache_valid 200 1h;
-			add_header X-Cache-Status $upstream_cache_status;
-		}
+		include /tmp/conf/nginx-locations.conf;
 	}
+
+	server {
+		listen 127.0.0.1:9443 ssl reuseport;
+		ssl_certificate /tmp/conf/cert.pem;
+		ssl_certificate_key /tmp/conf/key.pem;
+		# nginx cannot use sendfile on a TLS connection anyway, short of
+		# kernel TLS, which this does not set up.
+		sendfile off;
+		include /tmp/conf/nginx-locations.conf;
+	}
+}
+EOF
+
+cat >$conf/nginx-locations.conf <<'EOF'
+location = /direct/plain {
+	default_type text/plain;
+	return 200 "Hello, world!";
+}
+location /direct/ {
+	alias /fixtures/;
+}
+
+location /proxy/ {
+	proxy_pass http://origin/;
+	proxy_http_version 1.1;
+	proxy_set_header Connection "";
+}
+
+location /cache/ {
+	proxy_pass http://origin/;
+	proxy_http_version 1.1;
+	proxy_set_header Connection "";
+	proxy_cache bench;
+	proxy_cache_valid 200 1h;
+	add_header X-Cache-Status $upstream_cache_status;
 }
 EOF
 
@@ -319,38 +374,48 @@ sub vcl_deliver {
 EOF
 
 pids=()
-server_pid=
+servers=()
 trap 'kill "${pids[@]}" 2>/dev/null || true' EXIT
 
-# start <cpus> <command...> runs a server in the background on those CPUs.
+# start <cpus> <command...> runs a process of the server under test in the
+# background on those CPUs; stop ends all of them.
 start() {
 	local on=$1
 	shift
-	taskset -c "$on" "$@" >"$work/server.log" 2>&1 &
-	server_pid=$!
-	pids+=("$server_pid")
+	taskset -c "$on" "$@" >>"$work/server.log" 2>&1 &
+	pids+=("$!")
+	servers+=("$!")
 }
 
-# ready <url> waits for a server to answer.
+# ready <path> waits for the server under test to answer it for every scheme.
 ready() {
-	local tries=0
-	until curl -sf -o /dev/null "$1"; do
-		tries=$((tries + 1))
-		if [ "$tries" -ge 300 ]; then
-			echo "compare: no answer from $1, the log of the server:" >&2
-			cat "$work/server.log" >&2
-			exit 1
-		fi
-		sleep 0.1
+	local scheme tries
+	for scheme in $schemes; do
+		tries=0
+		until curl -skf -o /dev/null "$(base "$scheme")$1"; do
+			tries=$((tries + 1))
+			if [ "$tries" -ge 300 ]; then
+				echo "compare: no answer from $(base "$scheme")$1, the log of the server:" >&2
+				cat "$work/server.log" >&2
+				exit 1
+			fi
+			sleep 0.1
+		done
 	done
 }
 
-# stop ends the server under test. nginx and Varnish answer from processes
-# of their own, which take a moment to follow: the next server needs the port.
+# stop ends the server under test. nginx, Varnish and hitch answer from
+# processes of their own, which take a moment to follow: the next server
+# needs the ports.
 stop() {
-	kill "$server_pid" 2>/dev/null || true
-	wait "$server_pid" 2>/dev/null || true
-	while curl -s -o /dev/null -m 1 "$base/"; do sleep 0.2; done
+	local scheme
+	kill "${servers[@]}" 2>/dev/null || true
+	wait "${servers[@]}" 2>/dev/null || true
+	servers=()
+	for scheme in $schemes; do
+		while curl -sk -o /dev/null -m 1 "$(base "$scheme")/"; do sleep 0.2; done
+	done
+	: >"$work/server.log"
 }
 
 # field <label> <n> prints the n-th word after the label of a line of the
@@ -362,18 +427,18 @@ field() {
 format="%-44s %9s %8s %8s %8s %7s  %s\n"
 failures=0
 
-# bench <name> <path> measures <path>/plain and <path>/test.png, and adds a
-# row to the table of each.
+# bench <name> <path> [<name over TLS>] measures <path>/plain and
+# <path>/test.png for every scheme, and adds a row to the table of each.
 bench() {
-	local name=$1 path=$2 file url status run rps failed non2xx reopened rate length
-	for file in plain test.png; do
-		url=$base$path/$file
+	local name=$1 path=$2 tlsname=${3:-$1} scheme file url status run rps failed non2xx reopened rate length row
+	for scheme in $schemes; do for file in plain test.png; do
+		url=$(base "$scheme")$path/$file
 
 		# Warm up, and ask the cache what it says of the response: every
 		# server has its header for that.
 		ab -q -k -c "$CONCURRENCY" -n $((CONCURRENCY * 20)) "$url" >/dev/null 2>&1
 		sleep 0.5
-		status=$(curl -s -o /dev/null -D - "$url" | tr -d '\r' | awk '
+		status=$(curl -sk -o /dev/null -D - "$url" | tr -d '\r' | awk '
 			tolower($1) ~ /^(cache-status|x-cache-status|x-cache):$/ {
 				sub(/^[^ ]* /, ""); sub(/ttl=[0-9-]*; /, ""); sub(/key=[^;]*(; |$)/, ""); sub(/; $/, ""); print
 			}')
@@ -399,21 +464,24 @@ bench() {
 		[ "$reopened" -gt 0 ] && status="$status (connections reopened: $reopened)"
 		case $file:$length in plain:13 | test.png:43366) ;; *) status="$status (WRONG LENGTH: $length)" ;; esac
 
+		row=$name
+		[ "$scheme" = https ] && row=$tlsname
 		# shellcheck disable=SC2059
-		printf "$format" "$name" "$(printf '%.0f' "$rps")" \
+		printf "$format" "$row" "$(printf '%.0f' "$rps")" \
 			"$(awk -F, '$1 == 50 { printf "%.2f", $2 }' "$work/percentiles.$run.csv")" \
 			"$(awk -F, '$1 == 99 { printf "%.2f", $2 }' "$work/percentiles.$run.csv")" \
 			"$(awk -v rate="$rate" 'BEGIN { printf "%.1f", rate / 1024 }')" \
-			"$failed" "${status:--}" >>"$work/table.$file"
-		echo "  $name, $file: $(printf '%.0f' "$rps") req/s" >&2
-	done
+			"$failed" "${status:--}" >>"$work/table.$scheme.$file"
+		echo "  $row, $scheme, $file: $(printf '%.0f' "$rps") req/s" >&2
+	done; done
 }
 
-start "$upstream_cpus" caddy-ours run --config $conf/upstream.Caddyfile --adapter caddyfile
-ready http://127.0.0.1:9181/plain
+taskset -c "$upstream_cpus" caddy-ours run --config $conf/upstream.Caddyfile --adapter caddyfile >"$work/upstream.log" 2>&1 &
+pids+=("$!")
+until curl -sf -o /dev/null http://127.0.0.1:9181/plain; do sleep 0.1; done
 
 start "$server_cpus" caddy-ours run --config $conf/ours.Caddyfile --adapter caddyfile
-ready $base/direct/plain
+ready /direct/plain
 bench "Caddy, no cache: respond / file_server" /direct
 bench "Caddy, no cache: reverse_proxy" /proxy
 bench "this module" /cache
@@ -427,38 +495,46 @@ for storage in default otter simplefs; do
 	simplefs) printf 'simplefs {\n\tconfiguration {\n\t\tsize 100000\n\t\tpath /tmp/souin-simplefs\n\t}\n}\n' >$conf/souin-storage ;;
 	esac
 	start "$server_cpus" caddy-souin run --config $conf/souin.Caddyfile --adapter caddyfile
-	ready $base/cache/plain
+	ready /cache/plain
 	bench "caddyserver/cache-handler, $storage storage" /cache
 	stop
 done
 
 mkdir -p /tmp/nginx-cache
 start "$server_cpus" nginx -c $conf/nginx.conf -g "worker_processes $CORES; daemon off;"
-ready $base/direct/plain
+ready /direct/plain
 bench "nginx, no cache: return / static file" /direct
 bench "nginx, no cache: proxy_pass" /proxy
 bench "nginx, proxy_cache" /cache
 stop
 
 start "$server_cpus" varnishd -F -n /tmp/varnish -a 127.0.0.1:9180 -f $conf/varnish.vcl -s malloc,256m -t 3600
-ready $base/cache/plain
-bench "Varnish, pass (no cache)" /pass
-bench "Varnish, malloc storage" /cache
+start "$server_cpus" hitch --daemon=off --user=hitch --group=hitch --workers="$CORES" \
+	--frontend='[127.0.0.1]:9443' --backend='[127.0.0.1]:9180' $conf/hitch.pem
+ready /cache/plain
+bench "Varnish, pass (no cache)" /pass "Varnish behind hitch, pass (no cache)"
+bench "Varnish, malloc storage" /cache "Varnish behind hitch, malloc storage"
 stop
 
 model=$(sed -n 's/^model name[^:]*: *//p' /proc/cpuinfo | head -n 1)
 echo "${model:+$model, }$(uname -m), ${#cpus[@]} cores: server on CPU $server_cpus, ab on CPU $ab_cpus, upstream on CPU $upstream_cpus"
-echo "Caddy $(caddy-ours version | cut -d' ' -f1), caddyserver/cache-handler $(awk '/cache-handler/ { print $2 }' /souin-versions.txt) (Souin $(awk '/souin/ { print $2 }' /souin-versions.txt)), $(nginx -v 2>&1 | sed 's/.*: //'), $(varnishd -V 2>&1 | sed -n '1s/.*(\(varnish-[0-9.]*\).*/\1/p')"
+echo "Caddy $(caddy-ours version | cut -d' ' -f1), caddyserver/cache-handler $(awk '/cache-handler/ { print $2 }' /souin-versions.txt) (Souin $(awk '/souin/ { print $2 }' /souin-versions.txt)), $(nginx -v 2>&1 | sed 's/.*: //'), $(varnishd -V 2>&1 | sed -n '1s/.*(\(varnish-[0-9.]*\).*/\1/p'), $(hitch --version 2>&1 | head -n 1)"
 echo "median of $RUNS runs of $REQUESTS requests or $TIMELIMIT seconds, $CONCURRENCY keep-alive connections"
 echo
 # shellcheck disable=SC2059
 printf "$format" "" "req/s" "p50 ms" "p99 ms" "MiB/s" "failed" "the cache says"
 echo
 echo "Text, 13 bytes"
-cat "$work/table.plain"
+cat "$work/table.http.plain"
 echo
 echo "fixtures/test.png, 42KiB"
-cat "$work/table.test.png"
+cat "$work/table.http.test.png"
+echo
+echo "Text, 13 bytes, over TLS, sendfile off"
+cat "$work/table.https.plain"
+echo
+echo "fixtures/test.png, 42KiB, over TLS, sendfile off"
+cat "$work/table.https.test.png"
 
 if [ "$failures" -gt 0 ]; then
 	echo >&2
