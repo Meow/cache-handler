@@ -74,6 +74,8 @@ xcaddy build --with github.com/Meow/cache-handler
 
 No other module is needed: the storage is part of this one.
 
+Caddy 2.11.7 or later is required, which takes Go 1.26 or later to build. `xcaddy` builds with the latest release of Caddy unless told otherwise.
+
 ## Minimal configuration
 
 ```caddy
@@ -219,7 +221,17 @@ Not everything is stored in slices:
 
 * A response that fits in its first slice is stored whole, exactly as it is without `slice`. The many small files of a site cost nothing more than a `Range` header in the request made for them.
 * So is the response of an upstream that ignores `Range` and sends everything, and any response that is not a `206`: an error, a redirect.
-* So is a response that something between the cache and the upstream transforms, the way `encode` compresses it: the ranges of what the upstream sent are not ranges of what the client gets. The cache notices when the first slice arrives without its length, and asks again for the whole response: the first request for such a response costs the upstream two. The variant of the response that is left uncompressed, for the clients that do not accept compression, is stored in slices beside it.
+* So is a response that something between the cache and the upstream transforms, by compressing it for instance: the ranges of what the upstream sent are not ranges of what the client gets. The cache notices when the first slice arrives without its length, and asks again for the whole response: the first request for such a response costs the upstream two. The variant of the response that is left as it is, for the clients that do not accept compression, is stored in slices beside it.
+
+Caddy's own `encode` is not such a handler: it leaves the response to a `Range` request alone, and with `slice` that is every response of an upstream that supports them. Placed after the cache, which is where it goes unless a `route` block says otherwise, it compresses nothing of what such an upstream sends: the responses are stored in slices, and served, as the upstream sent them. To have them compressed, put `encode` in front of the cache. It then compresses what the cache serves, each time it is served, and leaves alone the ranges the clients ask for:
+
+```caddy
+route {
+    encode zstd gzip
+    cache
+    reverse_proxy your-app:8080
+}
+```
 
 The slices of a response have to be parts of the same thing. They are compared by `ETag`, `Last-Modified` and total size with the first one sent to the client. When a file changes on the upstream while the cache holds slices of it, a response that would be made of both versions is cut short instead, and every slice stored for the URL is discarded, so that the next request gets the new version. Give the responses an `ETag` or a `Last-Modified`: without them, two versions of the same size cannot be told apart.
 

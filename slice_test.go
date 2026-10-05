@@ -16,7 +16,51 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
+
+func init() {
+	caddy.RegisterModule(new(panicHandler))
+	httpcaddyfile.RegisterHandlerDirective("test_panic", func(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
+		handler := new(panicHandler)
+
+		return handler, handler.UnmarshalCaddyfile(h.Dispenser)
+	})
+}
+
+// panicHandler is a handler with a bug: it panics when it is asked for a
+// given range. It exists for the tests only, as the test_panic directive.
+type panicHandler struct {
+	Range string `json:"range,omitempty"`
+}
+
+func (*panicHandler) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "http.handlers.test_panic",
+		New: func() caddy.Module { return new(panicHandler) },
+	}
+}
+
+func (h *panicHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	d.Next()
+	if !d.AllArgs(&h.Range) {
+		return d.ArgErr()
+	}
+
+	return nil
+}
+
+func (h *panicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	if r.Header.Get("Range") == h.Range {
+		panic("test_panic: asked for " + h.Range)
+	}
+
+	return next.ServeHTTP(w, r)
+}
 
 // sliceContent returns a body in which no two places look alike, unlike the
 // one of bodyFor, which repeats every 32 bytes: a slice put at the place of
@@ -602,46 +646,75 @@ func TestSlicesOfAVaryingResponse(t *testing.T) {
 	}
 }
 
-// TestSlicesAndCompression covers the response a handler between the cache
-// and the upstream transforms: its ranges are not those of what the client
+// gunzip inflates the body of a response that was compressed.
+func gunzip(t *testing.T, body string) string {
+	t.Helper()
+
+	zr, err := gzip.NewReader(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("not gzip: %v", err)
+	}
+	plain, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("inflating: %v", err)
+	}
+
+	return string(plain)
+}
+
+// compressibleText returns a body that compression makes much smaller.
+func compressibleText(size int) string {
+	var text strings.Builder
+	for i := 0; text.Len() < size; i++ {
+		fmt.Fprintf(&text, "line %d of a text that compresses well\n", i)
+	}
+
+	return text.String()
+}
+
+// TestSlicesAndCompression covers the response that is transformed between
+// the upstream and the cache: its ranges are not those of what the client
 // gets, so it is stored whole, beside the slices of the variant that is
 // left as it is.
 func TestSlicesAndCompression(t *testing.T) {
-	var text strings.Builder
-	for i := 0; text.Len() < 40_000; i++ {
-		fmt.Fprintf(&text, "line %d of a text that compresses well\n", i)
-	}
-	content := text.String()
+	content := compressibleText(40_000)
 
+	// What a handler that compresses on the way does to the response to a
+	// request for a range, when it does not know better: the body is no
+	// longer the range the headers say, and its length is not told.
 	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.Header().Set("Etag", `"text"`)
-		http.ServeContent(w, r, "", time.Time{}, strings.NewReader(content))
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			http.ServeContent(w, r, "", time.Time{}, strings.NewReader(content))
+			return
+		}
+
+		plain := httptest.NewRecorder()
+		http.ServeContent(plain, r, "", time.Time{}, strings.NewReader(content))
+		for name, values := range plain.Header() {
+			if name != "Content-Length" {
+				w.Header()[name] = values
+			}
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Vary", "Accept-Encoding")
+		w.WriteHeader(plain.Code)
+
+		zw := gzip.NewWriter(w)
+		_, _ = zw.Write(plain.Body.Bytes())
+		_ = zw.Close()
 	})
 	tester := startCaddy(t, t.TempDir(), "ttl 1h\nslice 4Ki", `
 		cache
-		encode gzip
 		reverse_proxy `+up.addr())
-
-	inflate := func(body string) string {
-		zr, err := gzip.NewReader(strings.NewReader(body))
-		if err != nil {
-			t.Fatalf("not gzip: %v", err)
-		}
-		plain, err := io.ReadAll(zr)
-		if err != nil {
-			t.Fatalf("inflating: %v", err)
-		}
-
-		return string(plain)
-	}
 
 	for i := range 2 {
 		resp, body := get(t, tester, "/text", "Accept-Encoding: gzip")
 		if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Encoding") != "gzip" {
 			t.Fatalf("status %d, headers %v", resp.StatusCode, resp.Header)
 		}
-		expectBody(t, inflate(body), content)
+		expectBody(t, gunzip(t, body), content)
 		if hit := strings.Contains(resp.Header.Get("Cache-Status"), "; hit; "); hit != (i == 1) {
 			t.Errorf("request %d: Cache-Status: %s", i, resp.Header.Get("Cache-Status"))
 		}
@@ -661,6 +734,64 @@ func TestSlicesAndCompression(t *testing.T) {
 	// it, and one for the slice.
 	if n := up.hits.Load(); n != 3 {
 		t.Errorf("the upstream got %d requests, want 3", n)
+	}
+}
+
+// TestSlicesAndEncode covers the encode directive on either side of the
+// cache. It leaves the response to a request for a range alone, which is
+// all it sees of an upstream that is asked for slices: placed after the
+// cache it compresses nothing, and the response is stored in slices as the
+// upstream sent it. Placed in front, it compresses what the cache serves.
+func TestSlicesAndEncode(t *testing.T) {
+	content := compressibleText(40_000)
+
+	for _, test := range []struct {
+		name, site string
+		compressed bool
+	}{
+		{"after the cache", "cache\nencode gzip\nreverse_proxy %s", false},
+		{"in front of the cache", "route {\nencode gzip\ncache\nreverse_proxy %s\n}", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Range") == "" {
+					t.Errorf("the upstream was asked for the whole response")
+				}
+				w.Header().Set("Content-Type", "text/plain")
+				w.Header().Set("Etag", `"text"`)
+				http.ServeContent(w, r, "", time.Time{}, strings.NewReader(content))
+			})
+			tester := startCaddy(t, t.TempDir(), "ttl 1h\nslice 4Ki", fmt.Sprintf(test.site, up.addr()))
+
+			for i := range 2 {
+				resp, body := get(t, tester, "/text", "Accept-Encoding: gzip")
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("status %d, headers %v", resp.StatusCode, resp.Header)
+				}
+				if compressed := resp.Header.Get("Content-Encoding") == "gzip"; compressed != test.compressed {
+					t.Errorf("Content-Encoding: %q, want compressed: %v", resp.Header.Get("Content-Encoding"), test.compressed)
+				} else if compressed {
+					body = gunzip(t, body)
+				}
+				expectBody(t, body, content)
+				if hit := strings.Contains(resp.Header.Get("Cache-Status"), "; hit; "); hit != (i == 1) {
+					t.Errorf("request %d: Cache-Status: %s", i, resp.Header.Get("Cache-Status"))
+				}
+
+				// A range is one of the response as the upstream has it,
+				// whoever asks.
+				resp, body = get(t, tester, "/text", "Accept-Encoding: gzip", "Range: bytes=30000-30099")
+				if resp.StatusCode != http.StatusPartialContent || resp.Header.Get("Content-Encoding") != "" {
+					t.Errorf("status %d, headers %v", resp.StatusCode, resp.Header)
+				}
+				expectBody(t, body, content[30000:30100])
+			}
+
+			// The ten slices of the response, once each.
+			if n := up.hits.Load(); n != 10 {
+				t.Errorf("the upstream got %d requests, want 10", n)
+			}
+		})
 	}
 }
 
@@ -834,6 +965,43 @@ func TestSeveralRangesAndAClientThatLeaves(t *testing.T) {
 // TestResponseThatOutgrowsItsSlice covers the response that was stored
 // whole and is now too large for that, where it varies: the slices are then
 // stored beside what was there, which is not to be found before them.
+// TestPanicWhileFetchingASlice covers a handler after the cache that panics
+// while a slice is fetched for a request for several ranges, whose body
+// http.ServeContent reads from a goroutine of its own. The panic is that of
+// the request, as it is without a cache: the client is cut short and the
+// server carries on, where a panic in that goroutine would end the process.
+func TestPanicWhileFetchingASlice(t *testing.T) {
+	up := newOrigin(t, 40_000)
+	content := up.content("v1")
+	tester := startCaddy(t, t.TempDir(), "ttl 1h\nslice 4Ki", `
+		route {
+			cache
+			test_panic bytes=8192-12287
+			reverse_proxy `+up.addr()+`
+		}`)
+
+	req, err := http.NewRequest(http.MethodGet, testURL+"/file", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Range", "bytes=0-9,9000-9009")
+	resp, err := tester.Client.Do(req)
+	if err == nil {
+		_, err = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+	}
+	if err == nil {
+		t.Error("a response whose second range could not be fetched was not cut short")
+	}
+
+	// The slices that can be fetched still are.
+	resp, body := get(t, tester, "/file", "Range: bytes=20000-20009")
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Errorf("status %d", resp.StatusCode)
+	}
+	expectBody(t, body, string(content[20000:20010]))
+}
+
 func TestResponseThatOutgrowsItsSlice(t *testing.T) {
 	up := newOrigin(t, 1000)
 	up.header.Set("Vary", "X-Kind")

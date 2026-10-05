@@ -5,6 +5,7 @@ package httpcache
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"path/filepath"
 	"regexp"
@@ -501,8 +502,15 @@ func parseOptions(d *caddyfile.Dispenser, o *Options) error {
 	}
 
 	// Report mistakes where they are written rather than when the
-	// configuration is loaded.
-	if _, err := o.resolve(); err != nil {
+	// configuration is loaded. Only those that can be told from here: a
+	// slice is checked against the size of the cache, which may be set where
+	// this block inherits from, or where it is inherited. That is left to
+	// when the handler is provisioned, and knows both.
+	check := *o
+	if check.MaxSize == 0 {
+		check.MaxSize = math.MaxInt64
+	}
+	if _, err := check.resolve(); err != nil {
 		return d.Err(err.Error())
 	}
 

@@ -403,6 +403,9 @@ type sliceReader struct {
 	// pending is the fetch started last, which is waited for before the
 	// next one and before the request ends.
 	pending *sliceFetch
+	// panicked is what a fetch panicked with, for the request to raise
+	// again when it ends, see wait.
+	panicked any
 	// flushing tells that the client is sent what there is while more is
 	// awaited. Not when it asked for several ranges: the one waiting is then
 	// not the one writing to it.
@@ -518,11 +521,17 @@ func (sr *sliceReader) answered(err error) error {
 }
 
 // close releases the slice being read and waits for the fetch in progress,
-// which is not to outlive the request it works on.
+// which is not to outlive the request it works on. It is called by the
+// request itself, which is where the panic of a fetch belongs.
 func (sr *sliceReader) close() {
 	_ = sr.shut()
 	sr.closePart()
 	sr.wait()
+
+	if sr.panicked != nil {
+		// As if the handlers had been called from here.
+		panic(sr.panicked)
+	}
 }
 
 func (sr *sliceReader) closePart() {
@@ -532,7 +541,10 @@ func (sr *sliceReader) closePart() {
 	}
 }
 
-// wait returns once no fetch is running for the request.
+// wait returns once no fetch is running for the request. A fetch that
+// panicked is not made to do so again from here: the body may be read from
+// a goroutine of http.ServeContent, where a panic is not that of a request
+// anymore but the end of the server. It is kept for close to raise.
 func (sr *sliceReader) wait() {
 	sf := sr.pending
 	if sf == nil {
@@ -541,9 +553,8 @@ func (sr *sliceReader) wait() {
 	sr.pending = nil
 
 	<-sf.done
-	if sf.panicked != nil {
-		// As if the handlers had been called from here.
-		panic(sf.panicked)
+	if sf.panicked != nil && sr.panicked == nil {
+		sr.panicked = sf.panicked
 	}
 }
 
@@ -757,6 +768,9 @@ func (sr *sliceReader) acquire(n int64) (*slicePart, error) {
 	// on the request itself, and on what its context carries. The one for
 	// the slice read before this one is over, or about to be.
 	sr.wait()
+	if sr.panicked != nil {
+		return nil, errSliceLost
+	}
 
 	// From here on the request is one for this slice, to the cache and to
 	// those it shares a fetch with.
@@ -875,6 +889,9 @@ func (sr *sliceReader) acquire(n int64) (*slicePart, error) {
 			sr.wait()
 
 			switch {
+			case sf.panicked != nil:
+				// The request raises it when it ends, see close.
+				return nil, errSliceLost
 			case sf.hit != nil:
 				part := sr.newPart(n, sf.hit.rec, sf.hit.rec.bodyLen)
 				if part == nil {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
 func TestParseSize(t *testing.T) {
@@ -48,6 +49,31 @@ func TestParseSize(t *testing.T) {
 	}
 	if got := Size(8 << 30).String(); got != "8GiB" {
 		t.Errorf("String() = %q", got)
+	}
+}
+
+// TestSliceIsCheckedAgainstTheInheritedSize covers a slice and the size of
+// the cache it has to fit in being set at different levels: where it is
+// written, a block cannot tell what it inherits.
+func TestSliceIsCheckedAgainstTheInheritedSize(t *testing.T) {
+	var local, global Options
+	if err := parseOptions(caddyfile.NewTestDispenser("cache {\n slice 6Gi\n}"), &local); err != nil {
+		t.Fatalf("a slice that fits in the max_size set globally was refused: %v", err)
+	}
+	if err := parseOptions(caddyfile.NewTestDispenser("cache {\n max_size 100Gi\n}"), &global); err != nil {
+		t.Fatal(err)
+	}
+
+	if c, err := local.inherit(global).resolve(); err != nil || c.slice != 6<<30 {
+		t.Errorf("resolved to %+v, %v", c, err)
+	}
+	// Without it, the default size applies.
+	if _, err := local.inherit(Options{}).resolve(); err == nil || !strings.Contains(err.Error(), "half of max_size") {
+		t.Errorf("a slice larger than half of the default max_size was accepted: %v", err)
+	}
+	// What a block can tell by itself, it still does.
+	if err := parseOptions(caddyfile.NewTestDispenser("cache {\n slice 1k\n}"), new(Options)); err == nil {
+		t.Error("a slice below the minimum was accepted")
 	}
 }
 
