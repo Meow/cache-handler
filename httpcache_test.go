@@ -765,6 +765,9 @@ func TestRequestsJoinADownloadInProgress(t *testing.T) {
 	if n := up.hits.Load(); n != 1 {
 		t.Errorf("the upstream got %d requests, want 1", n)
 	}
+	// Those reading the download have the end of it before the cache is
+	// done storing it.
+	waitFor(t, "the response to be stored", func() bool { return cacheStats(t).Stored == 1 })
 	hit, body := get(t, tester, "/video")
 	expectHit(t, hit, key, 120)
 	expectBody(t, body, first+second)
@@ -1002,7 +1005,9 @@ func TestSlowClientDoesNotHoldUpTheOthers(t *testing.T) {
 		}
 	}
 
-	// The download itself completed.
+	// The download itself completed. Those reading it have the end of it
+	// before the cache is done storing it.
+	waitFor(t, "the response to be stored", func() bool { return cacheStats(t).Stored == 1 })
 	resp, _ := get(t, tester, "/large", "Range: bytes=0-9")
 	if !strings.Contains(resp.Header.Get("Cache-Status"), "; hit; ") {
 		t.Errorf("Cache-Status: %s", resp.Header.Get("Cache-Status"))
