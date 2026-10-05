@@ -664,9 +664,12 @@ type Writer struct {
 	wake chan struct{}
 	// readers lists the Tails reading from mem, which are to be given the
 	// file if the response moves to one. uses counts the requests served
-	// from the response while it was received in memory.
+	// from the response while it was received in memory. sealed tells that
+	// the count was taken, for the entry the response is becoming: no
+	// request is to start reading it from here anymore.
 	readers []*Tail
 	uses    int
+	sealed  bool
 }
 
 type writerState int
@@ -1294,12 +1297,14 @@ type Tail struct {
 }
 
 // Tail opens the response for reading. It fails once the response is
-// committed, from when it is found in the cache like any other.
+// committed, from when it is found in the cache like any other. For a
+// response received in memory that is as soon as Commit is at work: the
+// request would not count among those the response waits for otherwise.
 func (w *Writer) Tail(ctx context.Context) (*Tail, error) {
 	t := &Tail{w: w, ctx: ctx, limit: -1}
 
 	w.pmu.Lock()
-	if w.mem != nil && w.state == writerActive {
+	if w.mem != nil && w.state == writerActive && !w.sealed {
 		// The writer holds the memory for as long as it is in this state,
 		// which makes it safe to take a hold on it too.
 		w.mem.acquire()
@@ -1523,8 +1528,13 @@ func (s *Store) installMem(w *Writer) ([]ID, error) {
 		e.hot = &hotData{rec: &rec, body: w.mem, cost: rec.memCost() + int64(len(w.mem.ids))*28}
 	}
 
+	// The requests that come from here on find the response in the cache,
+	// which counts them. One that started reading it from the writer after
+	// its count was taken would be missed, and the response left waiting for
+	// a request more than it needs to be written to disk.
 	w.pmu.Lock()
 	uses := w.uses
+	w.sealed = true
 	w.pmu.Unlock()
 
 	stripe := &s.stripes[e.id[0]]

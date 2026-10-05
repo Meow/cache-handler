@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -1248,6 +1249,57 @@ func TestStoreMinUsesCounts(t *testing.T) {
 	}
 	if n := cacheFiles(dir); n != files-1 {
 		t.Errorf("%d files, want the one of the replaced response gone from %d", n, files)
+	}
+}
+
+// TestStoreMinUsesCountsLateReaders checks that a request that comes while a
+// response received in memory is being committed counts once among those the
+// response waits for, whether it still gets to read it from the writer or
+// has to find it in the cache: a request that was not counted would leave the
+// response in memory for one more than min_uses asks.
+func TestStoreMinUsesCountsLateReaders(t *testing.T) {
+	s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 4 << 20})
+	body := bodyFor("key", 1000)
+
+	rounds := 3000
+	if testing.Short() {
+		rounds = 300
+	}
+	for i := range rounds {
+		key := fmt.Sprintf("key-%d", i)
+		now := time.Now()
+		rec := &record{stored: now.UnixMilli(), fresh: now.Add(time.Hour).UnixMilli(), status: http.StatusOK}
+		w, err := s.Create(key, nil, nil, rec, 0, int64(len(body)), 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write(body); err != nil {
+			t.Fatal(err)
+		}
+
+		committed := make(chan error, 1)
+		go func() { committed <- w.Commit() }()
+		// The request comes at about any point of the commit.
+		for range i % 50 {
+			runtime.Gosched()
+		}
+		tail, _ := w.Tail(context.Background())
+		if err := <-committed; err != nil {
+			t.Fatal(err)
+		}
+		if tail != nil {
+			tail.Close()
+		} else if _, hit := storeGet(t, s, key, nil); hit == nil {
+			t.Fatal("a committed response was not found")
+		}
+
+		s.mu.Lock()
+		left := s.index[makeID(key)].left
+		s.mu.Unlock()
+		if left != 2 {
+			t.Fatalf("%d requests left after the first (read from the writer: %t), want 2", left, tail != nil)
+		}
+		s.Purge(key)
 	}
 }
 

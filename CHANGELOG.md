@@ -15,6 +15,7 @@
 
 * Requests for a response that varies are served from its first download while it is in progress, like those for any other response, instead of each starting a download of their own.
 * The `rewrite` and `handle` directives placed after the cache were not applied when the cache sent a request to the upstream a second time, which it does for a range or a conditional request whose response turns out not to be cacheable.
+* With `min_uses`, a request that joined the download of a response at the very moment it completed was not counted, and the response was written to disk one request later than it should have been.
 
 ## 1.0.0
 

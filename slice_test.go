@@ -871,9 +871,11 @@ func TestSlicesWithMinUses(t *testing.T) {
 		cache
 		reverse_proxy `+up.addr())
 
-	// Requested once, the slices are in memory only.
+	// Requested once, the slices are in memory only. The client has the last
+	// one before the cache is done storing it.
 	_, body := get(t, tester, "/video")
 	expectBody(t, body, content)
+	waitFor(t, "the last slice to be stored", func() bool { return cacheStats(t).Stored == 10 })
 	if st := cacheStats(t); st.TransientEntries != 11 || st.DiskBytes != 0 {
 		t.Errorf("unexpected stats after one request: %+v", st)
 	}
