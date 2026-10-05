@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -1701,6 +1704,10 @@ func TestStoreFlights(t *testing.T) {
 	s := openTestStore(t, t.TempDir(), Limits{})
 	id := makeID("key")
 
+	if s.SharedFlight(id) != nil {
+		t.Error("a response is being stored before any fetch began")
+	}
+
 	leaderFlight, leader := s.BeginFlight(id)
 	if !leader {
 		t.Fatal("the first request should lead")
@@ -2057,5 +2064,1476 @@ func TestBlobReader(t *testing.T) {
 	}
 	if size, _ := r.Seek(0, io.SeekEnd); size != int64(len(body)) {
 		t.Errorf("size %d, want %d", size, len(body))
+	}
+	if off, err := r.Seek(-10, io.SeekCurrent); err != nil || off != int64(len(body))-10 {
+		t.Errorf("seeked back to %d, %v", off, err)
+	}
+	if _, err := r.Seek(-1, io.SeekStart); err == nil {
+		t.Error("seeked before the beginning")
+	}
+}
+
+// errInjected is the failure the tests make up.
+var errInjected = errors.New("injected failure")
+
+// failingWriter refuses whatever it is given.
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errInjected }
+
+// testRecord describes a response that is fresh for an hour.
+func testRecord() *record {
+	now := time.Now()
+
+	return &record{stored: now.UnixMilli(), fresh: now.Add(time.Hour).UnixMilli(), status: http.StatusOK}
+}
+
+// tempFiles counts the files of the downloads in progress.
+func tempFiles(s *Store) int {
+	files, _ := os.ReadDir(filepath.Join(s.dir, tmpDirName))
+
+	return len(files)
+}
+
+// freshKey returns a key whose file goes to a directory that does not exist
+// yet, and that directory.
+func freshKey(t *testing.T, s *Store, prefix string) (key, shard string) {
+	t.Helper()
+
+	for i := range 10_000 {
+		key = fmt.Sprintf("%s-%d", prefix, i)
+		shard = filepath.Dir(s.path(makeID(key)))
+		if _, err := os.Stat(shard); os.IsNotExist(err) {
+			return key, shard
+		}
+	}
+	t.Fatal("every directory of the cache exists")
+
+	return "", ""
+}
+
+// variantOf returns the key under which the one variant of key is stored.
+func variantOf(t *testing.T, s *Store, key string) string {
+	t.Helper()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, e := range s.index {
+		if !e.marker && e.key != key && primaryKey(e.key) == key {
+			return e.key
+		}
+	}
+	t.Fatalf("no variant of %s is stored", key)
+
+	return ""
+}
+
+// arenaBlock is the size of the blocks the bodies in memory are made of.
+func arenaBlock() int64 {
+	return int64(newArena().blockSize)
+}
+
+func TestOpenStoreFailures(t *testing.T) {
+	// A file is in the way of the directory.
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := OpenStore(filepath.Join(file, "cache"), Limits{MaxSize: 1 << 20}, nil); err == nil {
+		_ = s.Close()
+		t.Error("opened a cache under a file")
+	}
+
+	// A relative path means nothing once the working directory is gone.
+	gone := filepath.Join(t.TempDir(), "gone")
+	if err := os.Mkdir(gone, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(gone)
+	// Some systems know the path of a directory for as long as it is open,
+	// which a directory that cannot be read is not.
+	if err := os.Chmod(gone, 0o300); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(gone); err != nil {
+		t.Skipf("the working directory cannot be removed here: %v", err)
+	}
+	if _, err := os.Getwd(); err == nil {
+		t.Skip("a working directory that was removed is still known here")
+	}
+
+	if s, err := OpenStore("cache", Limits{MaxSize: 1 << 20}, nil); err == nil {
+		_ = s.Close()
+		t.Error("opened a cache in a directory that is gone")
+	}
+	if c, err := (Options{Path: "cache"}).resolve(); err == nil {
+		t.Errorf("a path in a directory that is gone resolved to %s", c.path)
+	}
+}
+
+// TestStoreLookupMismatches covers what is found under an ID without being
+// what was looked for.
+func TestStoreLookupMismatches(t *testing.T) {
+	s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 1 << 20})
+	fr, de := http.Header{"Accept-Language": {"fr"}}, http.Header{"Accept-Language": {"de"}}
+
+	// A marker leads to responses, not to another marker.
+	if err := storePut(t, s, "page", []string{"accept-language"}, fr, []byte("bonjour")); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	spec := s.index[makeID("page")].vary
+	s.mu.Unlock()
+	w, err := s.newWriter(&record{key: variantKey("page", spec, de), flags: flagMarker, vary: "salt\x00accept"}, 0, -1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, hit := storeGet(t, s, "page", de); hit != nil {
+		t.Error("a marker found through a marker was followed")
+	}
+	if got, _ := storeGet(t, s, "page", fr); string(got) != "bonjour" {
+		t.Errorf("the other variant reads %q", got)
+	}
+
+	// The file of another response, put where the one of this response was.
+	for _, key := range []string{"mine", "other"} {
+		if err := storePut(t, s, key, nil, nil, []byte(key)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := os.ReadFile(s.path(makeID("other")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.path(makeID("mine")), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, hit := storeGet(t, s, "mine", nil); hit != nil {
+		t.Errorf("the file of another response was served: %q", got)
+	}
+	if _, err := os.Stat(s.path(makeID("mine"))); !os.IsNotExist(err) {
+		t.Error("a file that is not the one of its name was kept")
+	}
+	if got, _ := storeGet(t, s, "other", nil); string(got) != "other" {
+		t.Errorf("the response the file belongs to reads %q", got)
+	}
+
+	// Two keys with the same ID. An ID is 128 bits of a hash, so the index
+	// is made to believe that it happened, to a response held in memory.
+	if err := storePutUses(t, s, "held", nil, nil, []byte("in memory"), 2); err != nil {
+		t.Fatal(err)
+	}
+	alias := makeID("alias")
+	s.mu.Lock()
+	s.index[alias] = s.index[makeID("held")]
+	s.mu.Unlock()
+	if got, hit := storeGet(t, s, "alias", nil); hit != nil {
+		t.Errorf("the response of another key was served: %q", got)
+	}
+	s.mu.Lock()
+	delete(s.index, alias)
+	s.mu.Unlock()
+	if got, _ := storeGet(t, s, "held", nil); string(got) != "in memory" {
+		t.Errorf("the response the ID belongs to reads %q", got)
+	}
+
+	// A file that can no longer be told about.
+	f, err := os.Open(s.path(makeID("other")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if rec, err := statRecord(f); err == nil {
+		t.Errorf("read %+v from a closed file", rec)
+	}
+}
+
+// TestStoreClosedWhileStoring covers the responses on their way in when the
+// store is closed: none of them makes it, and none is left behind.
+func TestStoreClosedWhileStoring(t *testing.T) {
+	bs := arenaBlock()
+	s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
+
+	if err := storePut(t, s, "kept", nil, nil, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	_, hit := s.Lookup("kept", nil)
+	if hit == nil {
+		t.Fatal("not found")
+	}
+	defer hit.Close()
+	if err := storePutUses(t, s, "page", []string{"accept-language"}, http.Header{"Accept-Language": {"fr"}}, []byte("bonjour"), 2); err != nil {
+		t.Fatal(err)
+	}
+	variant := variantOf(t, s, "page")
+
+	create := func(key string, minUses int) *Writer {
+		w, err := s.Create(key, nil, nil, testRecord(), 0, -1, minUses)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte("0123456789")); err != nil {
+			t.Fatal(err)
+		}
+
+		return w
+	}
+	onDisk, inMemory, growing := create("disk", 1), create("memory", 2), create("growing", 2)
+	if onDisk.mem != nil || inMemory.mem == nil || growing.mem == nil {
+		t.Fatal("the responses are not received where they were meant to be")
+	}
+
+	_ = s.Close()
+
+	if err := onDisk.Commit(); !errors.Is(err, errStoreClosed) {
+		t.Errorf("committing a file: %v", err)
+	}
+	if err := inMemory.Commit(); !errors.Is(err, errStoreClosed) {
+		t.Errorf("committing a response held in memory: %v", err)
+	}
+	// More memory is not to be had, nor a file to go on in.
+	if _, err := growing.Write(make([]byte, bs)); !errors.Is(err, errStoreClosed) {
+		t.Errorf("writing more than a block: %v", err)
+	}
+	growing.Abort()
+	if n := tempFiles(s); n != 0 {
+		t.Errorf("%d temporary files left", n)
+	}
+
+	if _, err := s.Create("new", []string{"accept-language"}, nil, testRecord(), 0, -1, 1); !errors.Is(err, errStoreClosed) {
+		t.Errorf("creating a response that varies: %v", err)
+	}
+	if s.saveMarker(variant) {
+		t.Error("a marker was written to disk")
+	}
+	if err := s.Rewrite(hit, &record{key: "kept", status: http.StatusOK}, 1); !errors.Is(err, errStoreClosed) {
+		t.Errorf("rewriting a response: %v", err)
+	}
+}
+
+// TestStoreWriterIsDoneOnce checks that a writer that was committed or
+// aborted does nothing more.
+func TestStoreWriterIsDoneOnce(t *testing.T) {
+	s := openTestStore(t, t.TempDir(), Limits{})
+
+	w, err := s.Create("committed", nil, nil, testRecord(), 0, -1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("more")); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("writing after the commit: %v", err)
+	}
+	if err := w.Commit(); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("committing twice: %v", err)
+	}
+	w.Abort()
+	if _, hit := storeGet(t, s, "committed", nil); hit == nil {
+		t.Error("aborting a writer that was committed removed its response")
+	}
+
+	if w, err = s.Create("aborted", nil, nil, testRecord(), 0, -1, 1); err != nil {
+		t.Fatal(err)
+	}
+	w.Abort()
+	w.Abort()
+	if err := w.Commit(); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("committing after the abort: %v", err)
+	}
+	if st := s.Stats(); st.Entries != 1 || s.tempFiles.Load() != 0 || s.tempBytes.Load() != 0 {
+		t.Errorf("unexpected state: %+v, %d temporary files, %d bytes", st, s.tempFiles.Load(), s.tempBytes.Load())
+	}
+
+	// A key the files have no room for.
+	if _, err := s.Create("", nil, nil, testRecord(), 0, -1, 1); err == nil {
+		t.Error("a response without a key was accepted")
+	}
+}
+
+// TestStoreFileFailures covers the files and directories that cannot be
+// created, written or moved. Nothing is to be left of a response that could
+// not be stored, and the next one is to find the store as it should be.
+func TestStoreFileFailures(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir, Limits{})
+	waitLoaded(t, s)
+
+	clean := func(what string) {
+		t.Helper()
+
+		if tempFiles(s) != 0 || s.tempFiles.Load() != 0 || s.tempBytes.Load() != 0 {
+			t.Errorf("%s: %d temporary files left, %d counted, for %d bytes", what, tempFiles(s), s.tempFiles.Load(), s.tempBytes.Load())
+		}
+	}
+	put := func(key string) error {
+		return storePut(t, s, key, nil, nil, []byte(key))
+	}
+	expect := func(key string, found bool) {
+		t.Helper()
+
+		if got, hit := storeGet(t, s, key, nil); (hit != nil) != found || (found && string(got) != key) {
+			t.Errorf("%s: found %v (%q), want %v", key, hit != nil, got, found)
+		}
+	}
+
+	// A file where the temporary files go.
+	tmp := filepath.Join(dir, tmpDirName)
+	if err := os.RemoveAll(tmp); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmp, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := put("no-tmp"); err == nil {
+		t.Error("stored without a place for temporary files")
+	}
+	if err := os.Remove(tmp); err != nil {
+		t.Fatal(err)
+	}
+	clean("no directory")
+
+	// A temporary file that cannot be told about.
+	statFile = func(*os.File) (os.FileInfo, error) { return nil, errInjected }
+	err := put("no-stat")
+	statFile = (*os.File).Stat
+	if !errors.Is(err, errInjected) {
+		t.Errorf("storing a file that cannot be described: %v", err)
+	}
+	clean("no description")
+
+	// A temporary file that was closed under its writer.
+	w, err := s.Create("closed", nil, nil, testRecord(), 0, -1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = w.f.Close()
+	if err := w.Commit(); err == nil {
+		t.Error("committed a file that could not be sealed")
+	}
+	clean("closed file")
+	expect("closed", false)
+
+	// A file where the directory of the response goes.
+	blocked, shard := freshKey(t, s, "blocked")
+	if err := os.WriteFile(shard, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := put(blocked); err == nil {
+		t.Error("stored without a directory")
+	}
+	clean("blocked directory")
+	expect(blocked, false)
+	if err := os.Remove(shard); err != nil {
+		t.Fatal(err)
+	}
+	if err := put(blocked); err != nil {
+		t.Errorf("storing once the directory can be made: %v", err)
+	}
+	expect(blocked, true)
+
+	// A directory removed after it was made: it is found missing once, and
+	// made again.
+	gone, shard := freshKey(t, s, "gone")
+	if err := put(gone); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(shard); err != nil {
+		t.Fatal(err)
+	}
+	if err := put(gone); err == nil {
+		t.Error("stored in a directory that is gone")
+	}
+	clean("directory gone")
+	if err := put(gone); err != nil {
+		t.Errorf("storing after the directory was found missing: %v", err)
+	}
+	expect(gone, true)
+}
+
+func TestStoreWithoutSpace(t *testing.T) {
+	// Not even room for what describes a response.
+	s := openTestStore(t, t.TempDir(), Limits{MaxSize: 16})
+	if err := storePut(t, s, "key", nil, nil, []byte("body")); !errors.Is(err, errNoSpace) {
+		t.Errorf("storing in a cache of 16 bytes: %v", err)
+	}
+	if tempFiles(s) != 0 || s.tempFiles.Load() != 0 || s.tempBytes.Load() != 0 {
+		t.Errorf("%d temporary files left, %d counted, for %d bytes", tempFiles(s), s.tempFiles.Load(), s.tempBytes.Load())
+	}
+}
+
+// TestStoreTailFailures covers the readers of a response in progress whose
+// file is not, or no longer, what they expect.
+func TestStoreTailFailures(t *testing.T) {
+	s := openTestStore(t, t.TempDir(), Limits{})
+	ctx := context.Background()
+
+	create := func(key string, declared int64) *Writer {
+		w, err := s.Create(key, nil, nil, testRecord(), 0, declared, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return w
+	}
+
+	// The name of the temporary file went to another download.
+	w := create("renamed", -1)
+	if err := os.Remove(w.tmp); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(w.tmp, []byte("another download"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if tail, err := w.Tail(ctx); err == nil {
+		tail.Close()
+		t.Error("opened the file of another download")
+	}
+	w.Abort()
+
+	// The file was cut short behind the back of the store.
+	w = create("cut", -1)
+	if _, err := w.Write(bodyFor("cut", 1000)); err != nil {
+		t.Fatal(err)
+	}
+	tail, err := w.Tail(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(w.tmp, 0); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := tail.Read(make([]byte, 100)); n != 0 || err == nil || tail.err == nil {
+		t.Errorf("read %d bytes of a file that holds none: %v, %v", n, err, tail.err)
+	}
+	tail.Close()
+	w.Abort()
+
+	// Seeking takes a body of known length.
+	w = create("sized", 10)
+	if tail, err = w.Tail(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, seek := range []struct {
+		offset int64
+		whence int
+		want   int64
+	}{{4, io.SeekStart, 4}, {3, io.SeekCurrent, 7}, {-1, io.SeekEnd, 9}, {-9, io.SeekCurrent, 0}} {
+		if got, err := tail.Seek(seek.offset, seek.whence); err != nil || got != seek.want {
+			t.Errorf("Seek(%d, %d) = %d, %v; want %d", seek.offset, seek.whence, got, err, seek.want)
+		}
+	}
+	if _, err := tail.Seek(-1, io.SeekCurrent); err == nil {
+		t.Error("seeked before the beginning")
+	}
+	tail.Close()
+	w.Abort()
+
+	w = create("unsized", -1)
+	if tail, err = w.Tail(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tail.Seek(0, io.SeekStart); err == nil {
+		t.Error("seeked in a body of unknown length")
+	}
+	tail.Close()
+	w.Abort()
+
+	// The request is over before the rest of the body came.
+	w = create("awaited", 10)
+	canceled, cancel := context.WithCancel(ctx)
+	if tail, err = w.Tail(canceled); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if n, err := tail.Read(make([]byte, 10)); n != 0 || !errors.Is(err, context.Canceled) || tail.err == nil {
+		t.Errorf("read %d bytes for a request that is over: %v", n, err)
+	}
+	tail.Close()
+	w.Abort()
+
+	// A reader that waits for more is first given the chance to pass on
+	// what it has, and is not left waiting when it is told where to stop.
+	w = create("stopped", -1)
+	if _, err := w.Write([]byte("0123456789")); err != nil {
+		t.Fatal(err)
+	}
+	if tail, err = w.Tail(ctx); err != nil {
+		t.Fatal(err)
+	}
+	flushed := make(chan struct{})
+	tail.flush = func() { close(flushed) }
+	read := make(chan string)
+	go func() {
+		got, err := io.ReadAll(tail)
+		if err != nil {
+			t.Errorf("reading up to where the reader was told to stop: %v", err)
+		}
+		read <- string(got)
+	}()
+	<-flushed
+	waitFor(t, "the reader to wait for more", func() bool {
+		w.pmu.Lock()
+		defer w.pmu.Unlock()
+
+		return w.wake != nil
+	})
+	tail.finishAt(10)
+	if got := <-read; got != "0123456789" {
+		t.Errorf("read %q", got)
+	}
+	tail.Close()
+	w.Abort()
+
+	// A response that is committed is read from the cache, not as a
+	// download.
+	w = create("committed", -1)
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if tail, err := w.Tail(ctx); err == nil {
+		tail.Close()
+		t.Error("opened a download that is over")
+	}
+
+	// A body larger than its writer was told to take.
+	if w, err = s.Create("limited", nil, nil, testRecord(), 10, -1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(make([]byte, 11)); !errors.Is(err, errTooLarge) {
+		t.Errorf("writing more than the limit: %v", err)
+	}
+	w.Abort()
+}
+
+// TestStoreHotEntry covers the copy in memory of a response on disk, made
+// here without waiting for the response to be requested enough.
+func TestStoreHotEntry(t *testing.T) {
+	s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * arenaBlock()})
+	body := bodyFor("key", 3*diskBlock)
+	if err := storePut(t, s, "key", nil, nil, body); err != nil {
+		t.Fatal(err)
+	}
+
+	s.mu.Lock()
+	e := s.index[makeID("key")]
+	s.mu.Unlock()
+	s.promote(e)
+	// Once is enough.
+	s.promote(e)
+	if st := s.Stats(); st.HotEntries != 1 || st.Promoted != 1 {
+		t.Fatalf("unexpected state: %+v", st)
+	}
+
+	_, hit := s.Lookup("key", nil)
+	if hit == nil || !hit.InMemory() {
+		t.Fatal("not served from memory")
+	}
+	rs := hit.Body()
+	if _, err := rs.Seek(-50, io.SeekEnd); err != nil {
+		t.Fatal(err)
+	}
+	if end, _ := io.ReadAll(rs); !bytes.Equal(end, body[len(body)-50:]) {
+		t.Error("the end of the body differs")
+	}
+
+	// Closing the store takes the copy away, but not from who reads it.
+	_ = s.Close()
+	var buf bytes.Buffer
+	if err := hit.WriteBody(&buf); err != nil || !bytes.Equal(buf.Bytes(), body) {
+		t.Errorf("read %d bytes after the store was closed: %v", buf.Len(), err)
+	}
+	if s.arena.segs == nil {
+		t.Error("the memory was unmapped while a response was read from it")
+	}
+	hit.Close()
+	if s.arena.segs != nil || s.arena.inUse.Load() != 0 {
+		t.Errorf("%d blocks in use once the response is read", s.arena.inUse.Load())
+	}
+}
+
+// TestStoreLoadsWhatBelongs covers the files the loader finds and is not to
+// index.
+func TestStoreLoadsWhatBelongs(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir, Limits{})
+	if err := storePut(t, s, "key", nil, nil, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	id := makeID("key")
+	_ = s.Close()
+
+	// The file of a response under the name of another.
+	data, err := os.ReadFile(s.path(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	misnamed := s.path(makeID("other"))
+	if err := os.MkdirAll(filepath.Dir(misnamed), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(misnamed, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s = openTestStore(t, dir, Limits{})
+	waitLoaded(t, s)
+	if n := s.Stats().Entries; n != 1 || cacheFiles(dir) != 1 {
+		t.Errorf("%d entries and %d files, want the one response", n, cacheFiles(dir))
+	}
+
+	// What a loader read before the cache was emptied is not indexed after.
+	s.mu.Lock()
+	gen := s.gen
+	s.removeLocked(s.index[id])
+	s.mu.Unlock()
+	s.loadFile(id, gen+1, true)
+	if n := s.Stats().Entries; n != 0 {
+		t.Errorf("%d entries indexed by a loader that is out of date", n)
+	}
+	s.loadFile(id, gen, true)
+	if got, _ := storeGet(t, s, "key", nil); string(got) != "body" {
+		t.Errorf("the response read %q once indexed", got)
+	}
+}
+
+// TestStoreSpillFailure covers the response received in memory that cannot
+// go on in a file: the requests reading it are left with what they have.
+func TestStoreSpillFailure(t *testing.T) {
+	bs := arenaBlock()
+	s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
+	waitLoaded(t, s)
+
+	w, err := s.Create("key", nil, nil, testRecord(), 0, -1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tails [3]*Tail
+	for i := range tails {
+		if tails[i], err = w.Tail(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		defer tails[i].Close()
+	}
+	if _, err := w.Write(bodyFor("key", 100)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The file is written, but not all the readers get to open it.
+	opened := 0
+	openFile = func(name string) (*os.File, error) {
+		if opened++; opened == 2 {
+			return nil, errInjected
+		}
+
+		return os.Open(name)
+	}
+	// More than memory holds of one response.
+	_, err = w.Write(make([]byte, 8*bs))
+	openFile = os.Open
+	if !errors.Is(err, errInjected) {
+		t.Fatalf("writing a response that outgrew memory: %v", err)
+	}
+
+	w.pmu.Lock()
+	for _, tail := range tails {
+		if tail.f != nil {
+			t.Error("a reader was left with a file the response is not in")
+		}
+	}
+	w.pmu.Unlock()
+	if tempFiles(s) != 0 || s.tempFiles.Load() != 0 || s.tempBytes.Load() != 0 {
+		t.Errorf("%d temporary files left, %d counted, for %d bytes", tempFiles(s), s.tempFiles.Load(), s.tempBytes.Load())
+	}
+
+	w.Abort()
+	if _, err := io.ReadAll(tails[0]); !errors.Is(err, errTailAborted) {
+		t.Errorf("reading a response that was given up: %v", err)
+	}
+	for _, tail := range tails {
+		tail.Close()
+	}
+	if n := s.arena.inUse.Load(); n != 0 {
+		t.Errorf("%d blocks of memory still in use", n)
+	}
+}
+
+// TestStoreMemoryPressure covers the responses that memory has no room for.
+func TestStoreMemoryPressure(t *testing.T) {
+	bs := arenaBlock()
+
+	hotLimit := func(s *Store) int {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		return s.hotLimitLocked()
+	}
+
+	t.Run("responses being received take it all", func(t *testing.T) {
+		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
+
+		// Each announces the most that memory holds of one response, and
+		// four of them make the share of those that are in memory only.
+		var writers []*Writer
+		for i := range 5 {
+			w, err := s.Create(fmt.Sprintf("key-%d", i), nil, nil, testRecord(), 0, 8*bs, 2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer w.Abort()
+			writers = append(writers, w)
+		}
+		for i, w := range writers {
+			if inMemory := w.mem != nil; inMemory != (i < 4) {
+				t.Errorf("response %d received in memory: %v", i, inMemory)
+			}
+		}
+		if writers[4].f == nil {
+			t.Error("the response memory had no room for has no file")
+		}
+
+		for _, w := range writers {
+			w.Abort()
+		}
+		s.mu.Lock()
+		blocks := s.transBlocks
+		s.mu.Unlock()
+		if blocks != 0 || s.arena.inUse.Load() != 0 {
+			t.Errorf("%d blocks still counted, %d in use", blocks, s.arena.inUse.Load())
+		}
+	})
+
+	t.Run("the limit is lowered during a download", func(t *testing.T) {
+		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
+		body := bodyFor("key", int(4*bs))
+
+		w, err := s.Create("key", nil, nil, testRecord(), 0, -1, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write(body[:10]); err != nil {
+			t.Fatal(err)
+		}
+		s.SetLimits(Limits{MaxSize: 64 << 20, MaxMemory: 2 * bs})
+		if _, err := w.Write(body[10:]); err != nil {
+			t.Fatal(err)
+		}
+		if w.mem != nil || w.f == nil {
+			t.Error("the response is still received in memory")
+		}
+		if err := w.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := storeGet(t, s, "key", nil); !bytes.Equal(got, body) {
+			t.Error("the body differs")
+		}
+		if st := s.Stats(); st.TransientEntries != 0 || cacheFiles(s.dir) != 1 {
+			t.Errorf("unexpected state: %+v, %d files", st, cacheFiles(s.dir))
+		}
+	})
+
+	t.Run("the index takes it all", func(t *testing.T) {
+		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 << 10})
+
+		// A response with no body takes no block, which leaves it in memory
+		// until the index itself has to shrink.
+		if err := storePutUses(t, s, "empty", nil, nil, nil, 2); err != nil {
+			t.Fatal(err)
+		}
+		long := strings.Repeat("k", 2000)
+		for i := 0; s.Stats().Dropped == 0; i++ {
+			if i == 100 {
+				t.Fatal("the response in memory outlived an index larger than memory")
+			}
+			if st := s.Stats(); st.TransientEntries != 1 || st.Evicted != 0 {
+				t.Fatalf("unexpected state after %d files: %+v", i, st)
+			}
+			if err := storePut(t, s, fmt.Sprintf("%s-%d", long, i), nil, nil, []byte("body")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, hit := storeGet(t, s, "empty", nil); hit != nil {
+			t.Error("the response that was dropped is still served")
+		}
+		if st := s.Stats(); st.IndexBytes > st.MaxMemory {
+			t.Errorf("the index takes %d bytes of %d", st.IndexBytes, st.MaxMemory)
+		}
+	})
+
+	t.Run("the index leaves no block", func(t *testing.T) {
+		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 16 * bs})
+
+		long := strings.Repeat("k", 1000)
+		var keys []string
+		for hotLimit(s) > 0 {
+			key := fmt.Sprintf("%s-%d", long, len(keys))
+			if err := storePut(t, s, key, nil, nil, []byte("body")); err != nil {
+				t.Fatal(err)
+			}
+			keys = append(keys, key)
+		}
+		if st := s.Stats(); st.Evicted != 0 {
+			t.Fatalf("the index outgrew memory: %+v", st)
+		}
+
+		// However requested, a response is not copied to memory.
+		for range 2 * promoteAfter {
+			if _, hit := storeGet(t, s, keys[0], nil); hit == nil || hit.InMemory() {
+				t.Fatal("not served from disk")
+			}
+		}
+		s.mu.Lock()
+		e := s.index[makeID(keys[0])]
+		queued := e.promoting || len(s.promoteCh) > 0
+		s.mu.Unlock()
+		if queued {
+			t.Error("a response was to be copied to memory that has no room for it")
+		}
+		s.promote(e)
+		if st := s.Stats(); st.HotEntries != 0 || st.Promoted != 0 {
+			t.Errorf("unexpected state: %+v", st)
+		}
+	})
+
+	t.Run("the system has none", func(t *testing.T) {
+		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
+		s.arena.mu.Lock()
+		s.arena.segBlocks = math.MaxInt / int(bs)
+		s.arena.mu.Unlock()
+
+		// The response goes to a file as soon as it has a body.
+		w, err := s.Create("key", nil, nil, testRecord(), 0, -1, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w.mem == nil {
+			t.Fatal("the response is not received in memory")
+		}
+		if _, err := w.Write([]byte("body")); err != nil {
+			t.Fatal(err)
+		}
+		if w.mem != nil || w.f == nil {
+			t.Error("the response is still received in memory")
+		}
+		if err := w.Commit(); err != nil {
+			t.Fatal(err)
+		}
+
+		s.mu.Lock()
+		blocks := s.transBlocks
+		s.mu.Unlock()
+		if got, _ := storeGet(t, s, "key", nil); string(got) != "body" || blocks != 0 {
+			t.Errorf("read %q, %d blocks counted", got, blocks)
+		}
+	})
+
+	t.Run("copies of what is on disk take it", func(t *testing.T) {
+		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
+
+		// copyToMemory stores a response of eight blocks and has it copied
+		// to memory, whatever it is requested.
+		copyToMemory := func(key string) {
+			t.Helper()
+
+			if err := storePut(t, s, key, nil, nil, bodyFor(key, int(8*bs))); err != nil {
+				t.Fatal(err)
+			}
+			s.mu.Lock()
+			e := s.index[makeID(key)]
+			s.mu.Unlock()
+			s.promote(e)
+		}
+		for i := range 7 {
+			copyToMemory(fmt.Sprintf("key-%d", i))
+		}
+		if st := s.Stats(); st.HotEntries != 7 {
+			t.Fatalf("%d responses in memory, want 7", st.HotEntries)
+		}
+
+		// One more does not fit, and is not requested more than those that
+		// are there.
+		copyToMemory("late")
+		if st := s.Stats(); st.HotEntries != 7 || st.Promoted != 7 {
+			t.Errorf("unexpected state: %+v", st)
+		}
+		if _, hit := storeGet(t, s, "late", nil); hit == nil || hit.InMemory() {
+			t.Error("the response that did not fit is not served from disk")
+		}
+
+		// A response that is in memory only has nowhere else to be: a copy
+		// makes way for it.
+		w, err := s.Create("held", nil, nil, testRecord(), 0, 8*bs, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer w.Abort()
+		if st := s.Stats(); w.mem == nil || st.HotEntries != 6 {
+			t.Errorf("received in memory: %v, with %d copies left there", w.mem != nil, st.HotEntries)
+		}
+	})
+
+	t.Run("the response is purged while it is copied", func(t *testing.T) {
+		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
+		// The loader ends by applying the limits, those of the memory too.
+		waitLoaded(t, s)
+		if err := storePut(t, s, "key", nil, nil, bodyFor("key", 3*diskBlock)); err != nil {
+			t.Fatal(err)
+		}
+		s.mu.Lock()
+		e := s.index[makeID("key")]
+		e.epoch = 0
+		s.mu.Unlock()
+
+		// The copy is held up where it obtains its memory, which is after
+		// it was found worth making. That shows: the count of the requests
+		// the entry got is brought up to date for it.
+		s.arena.mu.Lock()
+		held := true
+		defer func() {
+			if held {
+				s.arena.mu.Unlock()
+			}
+		}()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.promote(e)
+		}()
+		waitFor(t, "the copy to be found worth making", func() bool {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+
+			return e.epoch != 0
+		})
+
+		purged := s.Purge("key")
+		s.arena.mu.Unlock()
+		held = false
+		<-done
+		if st := s.Stats(); !purged || st.Entries != 0 || st.HotEntries != 0 || st.Promoted != 0 || s.arena.inUse.Load() != 0 {
+			t.Errorf("purged: %v, state: %+v, %d blocks in use", purged, st, s.arena.inUse.Load())
+		}
+	})
+
+	t.Run("the file cannot be copied", func(t *testing.T) {
+		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
+		waitLoaded(t, s)
+
+		entry := func(key string) *entry {
+			if err := storePut(t, s, key, nil, nil, bodyFor(key, 3*diskBlock)); err != nil {
+				t.Fatal(err)
+			}
+			s.mu.Lock()
+			defer s.mu.Unlock()
+
+			return s.index[makeID(key)]
+		}
+
+		// Gone.
+		gone := entry("gone")
+		if err := os.Remove(s.path(gone.id)); err != nil {
+			t.Fatal(err)
+		}
+		s.promote(gone)
+
+		// Not a cache file anymore.
+		garbled := entry("garbled")
+		if err := os.WriteFile(s.path(garbled.id), []byte("not a cache file"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s.promote(garbled)
+
+		// Memory the system does not have.
+		unmapped := entry("unmapped")
+		s.arena.mu.Lock()
+		segBlocks := s.arena.segBlocks
+		s.arena.segBlocks = math.MaxInt / int(bs)
+		s.arena.mu.Unlock()
+		s.promote(unmapped)
+		s.arena.mu.Lock()
+		s.arena.segBlocks = segBlocks
+		s.arena.mu.Unlock()
+
+		// Cut short once it was found to be whole.
+		cut := entry("cut")
+		statFile = func(f *os.File) (os.FileInfo, error) {
+			info, err := f.Stat()
+			if terr := os.Truncate(f.Name(), diskBlock); terr != nil {
+				t.Error(terr)
+			}
+
+			return info, err
+		}
+		s.promote(cut)
+		statFile = (*os.File).Stat
+
+		if st := s.Stats(); st.HotEntries != 0 || st.Promoted != 0 || s.arena.inUse.Load() != 0 {
+			t.Errorf("unexpected state: %+v, %d blocks in use", st, s.arena.inUse.Load())
+		}
+	})
+}
+
+// TestStoreHitsDecay checks that the count of the requests an entry got is
+// halved with each period that goes by, and forgotten after many.
+func TestStoreHitsDecay(t *testing.T) {
+	s := new(Store)
+	e := &entry{hits: 40, epoch: 10}
+
+	for _, step := range []struct {
+		epoch int64
+		hits  uint16
+	}{{10, 40}, {11, 20}, {13, 5}, {40, 0}} {
+		s.decayLocked(e, step.epoch*decaySeconds)
+		if e.hits != step.hits || int64(e.epoch) != step.epoch {
+			t.Errorf("%d hits at period %d, want %d at %d", e.hits, e.epoch, step.hits, step.epoch)
+		}
+		if step.epoch == 13 {
+			e.hits = math.MaxUint16
+		}
+	}
+}
+
+// TestStorePersistFailures covers the responses held in memory that cannot
+// be written to disk when their time has come: they stay where they are,
+// and are written when asked again.
+func TestStorePersistFailures(t *testing.T) {
+	bs := arenaBlock()
+
+	// request asks for the response, which is due on disk from the first
+	// request on, and returns how many responses were written so far.
+	request := func(t *testing.T, s *Store, key string) int64 {
+		t.Helper()
+
+		if got, hit := storeGet(t, s, key, nil); hit == nil || !bytes.Equal(got, bodyFor(key, 20_000)) {
+			t.Fatalf("%s is not served", key)
+		}
+		waitPersisted(t, s)
+
+		return s.persisted.Load()
+	}
+	hold := func(t *testing.T, s *Store, key string) {
+		t.Helper()
+
+		if err := storePutUses(t, s, key, nil, nil, bodyFor(key, 20_000), 2); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("no directory", func(t *testing.T) {
+		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
+
+		key, shard := freshKey(t, s, "held")
+		hold(t, s, key)
+		if err := os.WriteFile(shard, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if n := request(t, s, key); n != 0 || tempFiles(s) != 0 {
+			t.Errorf("%d responses written, %d temporary files left", n, tempFiles(s))
+		}
+
+		if err := os.Remove(shard); err != nil {
+			t.Fatal(err)
+		}
+		if n := request(t, s, key); n != 1 || s.Stats().TransientEntries != 0 {
+			t.Errorf("%d responses written once the directory can be made", n)
+		}
+	})
+
+	t.Run("no temporary file", func(t *testing.T) {
+		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
+		hold(t, s, "held")
+
+		tmp := filepath.Join(s.dir, tmpDirName)
+		if err := os.RemoveAll(tmp); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(tmp, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if n := request(t, s, "held"); n != 0 {
+			t.Errorf("%d responses written without a temporary file", n)
+		}
+
+		if err := os.Remove(tmp); err != nil {
+			t.Fatal(err)
+		}
+		if n := request(t, s, "held"); n != 1 {
+			t.Errorf("%d responses written once there is a place for temporary files", n)
+		}
+	})
+
+	t.Run("no space", func(t *testing.T) {
+		s := openTestStore(t, t.TempDir(), Limits{MaxSize: 100_000, MaxMemory: 64 * bs})
+		hold(t, s, "held")
+
+		// Two downloads in progress take the disk.
+		var downloads []*Writer
+		for _, key := range []string{"first", "second"} {
+			w, err := s.Create(key, nil, nil, testRecord(), 0, -1, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer w.Abort()
+			if _, err := w.Write(bodyFor(key, 45_000)); err != nil {
+				t.Fatal(err)
+			}
+			downloads = append(downloads, w)
+		}
+		if n := request(t, s, "held"); n != 0 || tempFiles(s) != 2 {
+			t.Errorf("%d responses written, %d temporary files", n, tempFiles(s))
+		}
+
+		for _, w := range downloads {
+			w.Abort()
+		}
+		if n := request(t, s, "held"); n != 1 {
+			t.Errorf("%d responses written once there is room", n)
+		}
+	})
+
+	t.Run("being fetched again", func(t *testing.T) {
+		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
+		hold(t, s, "held")
+
+		id, hit := s.Lookup("held", nil)
+		if hit == nil {
+			t.Fatal("not found")
+		}
+		fl, leader := s.BeginFlight(id)
+		if !leader {
+			t.Fatal("a fetch is already in progress")
+		}
+		hit.Close()
+		waitPersisted(t, s)
+		if n := s.persisted.Load(); n != 0 {
+			t.Errorf("%d responses written while a new version was being fetched", n)
+		}
+
+		s.EndFlight(id, fl, false)
+		if n := request(t, s, "held"); n != 1 {
+			t.Errorf("%d responses written after the fetch", n)
+		}
+	})
+
+	t.Run("asked twice", func(t *testing.T) {
+		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
+		hold(t, s, "held")
+
+		// Two requests are served the response at the same time, and each
+		// finds it due on disk.
+		var hits [2]*Hit
+		for i := range hits {
+			if _, hits[i] = s.Lookup("held", nil); hits[i] == nil || !hits[i].persist {
+				t.Fatal("the response is not due on disk")
+			}
+		}
+		for _, hit := range hits {
+			hit.Close()
+		}
+		waitPersisted(t, s)
+		if st := s.Stats(); st.Persisted != 1 || cacheFiles(s.dir) != 1 || tempFiles(s) != 0 {
+			t.Errorf("unexpected state: %+v, %d files, %d temporary files", st, cacheFiles(s.dir), tempFiles(s))
+		}
+	})
+
+	t.Run("purged meanwhile", func(t *testing.T) {
+		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
+		waitLoaded(t, s)
+		hold(t, s, "held")
+		s.mu.Lock()
+		e := s.index[makeID("held")]
+		s.mu.Unlock()
+
+		// As its file is created, which leaves a file nothing is to be
+		// made of.
+		statFile = func(f *os.File) (os.FileInfo, error) {
+			if !s.Purge("held") {
+				t.Error("nothing to purge")
+			}
+
+			return f.Stat()
+		}
+		s.persist(e)
+		statFile = (*os.File).Stat
+		// Or before that, which leaves nothing to write.
+		s.persist(e)
+
+		if st := s.Stats(); st.Persisted != 0 || st.Entries != 0 || cacheFiles(s.dir) != 0 || tempFiles(s) != 0 || s.arena.inUse.Load() != 0 {
+			t.Errorf("unexpected state: %+v, %d files, %d temporary files, %d blocks in use", st, cacheFiles(s.dir), tempFiles(s), s.arena.inUse.Load())
+		}
+	})
+
+	t.Run("dropped meanwhile", func(t *testing.T) {
+		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
+		waitLoaded(t, s)
+		hold(t, s, "held")
+
+		// Memory is turned off as the file is put in place, which drops
+		// what was only there.
+		renameFile = func(from, to string) error {
+			err := os.Rename(from, to)
+			s.SetLimits(Limits{MaxSize: 64 << 20})
+
+			return err
+		}
+		defer func() { renameFile = os.Rename }()
+
+		if _, hit := storeGet(t, s, "held", nil); hit == nil {
+			t.Fatal("not found")
+		}
+		waitPersisted(t, s)
+		if st := s.Stats(); st.Persisted != 0 || st.Entries != 0 || cacheFiles(s.dir) != 0 || tempFiles(s) != 0 {
+			t.Errorf("unexpected state: %+v, %d files, %d temporary files", st, cacheFiles(s.dir), tempFiles(s))
+		}
+	})
+
+	t.Run("marker", func(t *testing.T) {
+		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
+
+		// The directory of the marker is made, then removed, before the
+		// marker has a file to put there.
+		key, shard := freshKey(t, s, "page")
+		if err := storePut(t, s, key, nil, nil, []byte("body")); err != nil {
+			t.Fatal(err)
+		}
+		if !s.Purge(key) {
+			t.Fatal("nothing to purge")
+		}
+		if err := os.RemoveAll(shard); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := storePutUses(t, s, key, []string{"accept-language"}, http.Header{"Accept-Language": {"fr"}}, []byte("bonjour"), 2); err != nil {
+			t.Fatal(err)
+		}
+		variant := variantOf(t, s, key)
+		if s.saveMarker(variant) {
+			t.Error("a marker was written to a directory that is gone")
+		}
+		if tempFiles(s) != 0 {
+			t.Errorf("%d temporary files left", tempFiles(s))
+		}
+		if !s.saveMarker(variant) || cacheFiles(s.dir) != 1 {
+			t.Errorf("the marker was not written once its directory was found missing: %d files", cacheFiles(s.dir))
+		}
+		// It is only written once.
+		if !s.saveMarker(variant) || cacheFiles(s.dir) != 1 {
+			t.Errorf("%d files after the marker was written again", cacheFiles(s.dir))
+		}
+	})
+}
+
+func TestStoreRewriteFailure(t *testing.T) {
+	s := openTestStore(t, t.TempDir(), Limits{})
+	if err := storePut(t, s, "key", nil, nil, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The response to copy cannot be read anymore.
+	_, hit := s.Lookup("key", nil)
+	if hit == nil {
+		t.Fatal("not found")
+	}
+	hit.Close()
+	if err := hit.WriteBody(io.Discard); err == nil {
+		t.Error("read a response that was closed")
+	}
+	if err := s.Rewrite(hit, &record{key: "key", status: http.StatusNoContent}, 1); err == nil {
+		t.Error("rewrote a response that cannot be read")
+	}
+
+	if got, hit := storeGet(t, s, "key", nil); string(got) != "body" || hit.rec.status != http.StatusOK {
+		t.Errorf("the response that could not be rewritten reads %q", got)
+	}
+	if tempFiles(s) != 0 {
+		t.Errorf("%d temporary files left", tempFiles(s))
+	}
+}
+
+func TestStorePurgeAllInMemory(t *testing.T) {
+	s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 1 << 20})
+
+	if err := storePut(t, s, "file", nil, nil, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	// A marker and a response that have no file.
+	if err := storePutUses(t, s, "page", []string{"accept-language"}, http.Header{"Accept-Language": {"fr"}}, []byte("bonjour"), 2); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := s.PurgeAll(); n != 3 {
+		t.Errorf("purged %d entries, want 3", n)
+	}
+	if st := s.Stats(); st.Entries != 0 || st.TransientEntries != 0 || st.HotBytes != 0 || cacheFiles(s.dir) != 0 {
+		t.Errorf("the cache is not empty: %+v, %d files", st, cacheFiles(s.dir))
+	}
+}
+
+func TestStoreUncacheableMemo(t *testing.T) {
+	s := openTestStore(t, t.TempDir(), Limits{})
+
+	// What is remembered is forgotten after a while.
+	id := makeID("key")
+	s.SetUncacheable(id, true)
+	s.fmu.Lock()
+	s.passMemo[id] = time.Now().Add(-2 * time.Second).Unix()
+	s.fmu.Unlock()
+	if s.Uncacheable(id) {
+		t.Error("still uncacheable after the time it is remembered for")
+	}
+	s.fmu.Lock()
+	remembered := len(s.passMemo)
+	s.fmu.Unlock()
+	if remembered != 0 {
+		t.Errorf("%d responses remembered, want none", remembered)
+	}
+
+	// And all at once when there is too much to remember.
+	for i := range maxPassMemo + 1 {
+		binary.LittleEndian.PutUint32(id[:], uint32(i))
+		s.SetUncacheable(id, true)
+	}
+	s.fmu.Lock()
+	remembered = len(s.passMemo)
+	s.fmu.Unlock()
+	if remembered != 1 || !s.Uncacheable(id) {
+		t.Errorf("%d responses remembered, want the last one", remembered)
+	}
+}
+
+// TestStoreJanitor checks that the responses nobody requests leave by
+// themselves.
+func TestStoreJanitor(t *testing.T) {
+	period := janitorPeriod
+	janitorPeriod = 5 * time.Millisecond
+	defer func() { janitorPeriod = period }()
+
+	s := openTestStore(t, t.TempDir(), Limits{Inactive: time.Hour})
+	// The janitor is stopped before its period is put back.
+	defer func() { _ = s.Close() }()
+
+	for _, key := range []string{"idle", "busy"} {
+		if err := storePut(t, s, key, nil, nil, []byte(key)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.mu.Lock()
+	s.index[makeID("idle")].atime -= 2 * 3600
+	s.mu.Unlock()
+
+	waitFor(t, "the idle response to be removed", func() bool { return s.Stats().Entries == 1 })
+	if _, hit := storeGet(t, s, "busy", nil); hit == nil {
+		t.Error("the response in use was removed")
+	}
+}
+
+func TestArenaFailures(t *testing.T) {
+	a := newArena()
+	bs := int64(a.blockSize)
+	a.setLimit(1000)
+
+	// A body that cannot be read, or written, to its end.
+	b := a.alloc(200 * bs)
+	if b == nil {
+		t.Fatal("allocation within the limit failed")
+	}
+	if err := b.fill(bytes.NewReader(make([]byte, 100)), 0); err == nil {
+		t.Error("filled a blob from a file shorter than it")
+	}
+	if err := b.writeTo(failingWriter{}, b.size); !errors.Is(err, errInjected) {
+		t.Errorf("writing to what refuses it: %v", err)
+	}
+
+	// A limit lowered by a lot is caught up with in steps.
+	b.release()
+	a.setLimit(0)
+	if !a.excess() || a.residentBytes() == 0 {
+		t.Errorf("%d bytes resident right after the limit was lowered", a.residentBytes())
+	}
+	a.trim()
+	if a.excess() || a.residentBytes() != 0 {
+		t.Errorf("%d bytes resident after the trim", a.residentBytes())
+	}
+	a.retire()
+
+	// Memory the system does not have.
+	a = newArena()
+	a.setLimit(10)
+	a.segBlocks = math.MaxInt / a.blockSize
+	if a.alloc(1) != nil || a.inUse.Load() != 0 {
+		t.Errorf("allocated memory that cannot be had, %d blocks in use", a.inUse.Load())
+	}
+}
+
+// TestStoreMinUsesAcrossVersions checks that a response held in memory that
+// is replaced by a new version does not start over: the requests the
+// previous version got count.
+func TestStoreMinUsesAcrossVersions(t *testing.T) {
+	s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 1 << 20})
+
+	left := func() uint16 {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		return s.index[makeID("key")].left
+	}
+
+	// The request it is fetched for is the first of four.
+	if err := storePutUses(t, s, "key", nil, nil, []byte("first"), 4); err != nil {
+		t.Fatal(err)
+	}
+	if n := left(); n != 3 {
+		t.Fatalf("%d more requests needed, want 3", n)
+	}
+	// The second finds it, say stale, and fetches the next version.
+	if _, hit := storeGet(t, s, "key", nil); hit == nil {
+		t.Fatal("not found")
+	}
+	if err := storePutUses(t, s, "key", nil, nil, []byte("second"), 4); err != nil {
+		t.Fatal(err)
+	}
+	if n := left(); n != 2 {
+		t.Errorf("%d more requests needed after two, want 2", n)
+	}
+	if got, _ := storeGet(t, s, "key", nil); string(got) != "second" {
+		t.Errorf("read %q", got)
+	}
+	if st := s.Stats(); st.TransientEntries != 1 || st.Persisted != 0 {
+		t.Errorf("unexpected state: %+v", st)
+	}
+}
+
+// TestStorePurgeMatchKeepsWhatIsNew checks that a response stored while the
+// keys are being matched is not purged for the one it replaces.
+func TestStorePurgeMatchKeepsWhatIsNew(t *testing.T) {
+	s := openTestStore(t, t.TempDir(), Limits{})
+	for _, key := range []string{"replaced", "other"} {
+		if err := storePut(t, s, key, nil, nil, []byte("old")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	purged := s.PurgeMatch(func(key string) bool {
+		if key == "replaced" {
+			if err := storePut(t, s, key, nil, nil, []byte("new")); err != nil {
+				t.Error(err)
+			}
+		}
+
+		return true
+	})
+	if purged != 1 {
+		t.Errorf("purged %d responses, want 1", purged)
+	}
+	if got, _ := storeGet(t, s, "replaced", nil); string(got) != "new" {
+		t.Errorf("the response stored meanwhile reads %q", got)
+	}
+	if _, hit := storeGet(t, s, "other", nil); hit != nil {
+		t.Error("the other response was kept")
 	}
 }

@@ -52,6 +52,21 @@ const (
 	cacheDirTag = "CACHEDIR.TAG"
 )
 
+// What follows is variable for the tests.
+var (
+	// openFile and statFile are os.Open and (*os.File).Stat where nothing
+	// but replacing them makes them fail: a file that was just created or
+	// written is there, and can be told about. renameFile is os.Rename where
+	// what counts is what happens meanwhile.
+	openFile   = os.Open
+	statFile   = (*os.File).Stat
+	renameFile = os.Rename
+
+	// janitorPeriod is how often the responses nobody requested for the
+	// inactive period are looked for.
+	janitorPeriod = 10 * time.Second
+)
+
 var (
 	errStoreClosed = errors.New("cache store is closed")
 	errTooLarge    = errors.New("response too large to cache")
@@ -521,7 +536,7 @@ func (s *Store) open(e *entry, key string) (*Hit, error) {
 }
 
 func statRecord(f *os.File) (*record, error) {
-	fi, err := f.Stat()
+	fi, err := statFile(f)
 	if err != nil {
 		return nil, err
 	}
@@ -754,9 +769,8 @@ func (s *Store) ensureMarker(key, names string, minUses int) (string, error) {
 	// unreachable, which is how replacing or purging a marker invalidates
 	// all of them at once.
 	var salt [8]byte
-	if _, err := rand.Read(salt[:]); err != nil {
-		return "", err
-	}
+	// Reading random bytes never fails.
+	_, _ = rand.Read(salt[:])
 	spec := hex.EncodeToString(salt[:]) + "\x00" + names
 
 	w, err := s.newWriter(&record{key: key, flags: flagMarker, vary: spec, stored: time.Now().UnixMilli()}, 0, -1, minUses)
@@ -966,7 +980,7 @@ func (w *Writer) createFile() (*os.File, os.FileInfo, error) {
 		return nil, nil, err
 	}
 
-	info, err := f.Stat()
+	info, err := statFile(f)
 	if err != nil {
 		_ = f.Close()
 		_ = os.Remove(f.Name())
@@ -1048,7 +1062,7 @@ func (w *Writer) spill() error {
 		// left reading memory would not find there what comes next.
 		w.pmu.Lock()
 		for _, t := range w.readers {
-			if t.f, err = os.Open(tmp); err != nil {
+			if t.f, err = openFile(tmp); err != nil {
 				break
 			}
 		}
@@ -1321,7 +1335,7 @@ func (w *Writer) Tail(ctx context.Context) (*Tail, error) {
 	if tmp == "" {
 		return nil, os.ErrNotExist
 	}
-	f, err := os.Open(tmp)
+	f, err := openFile(tmp)
 	if err != nil {
 		return nil, err
 	}
@@ -1601,7 +1615,7 @@ func (s *Store) adopt(w *Writer, e *entry, size int64) ([]ID, error) {
 		return nil, errGone
 	}
 
-	if err := os.Rename(w.tmp, s.path(e.id)); err != nil {
+	if err := renameFile(w.tmp, s.path(e.id)); err != nil {
 		s.dirMade[e.id[0]].Store(false)
 		return nil, err
 	}
@@ -2222,7 +2236,7 @@ func (s *Store) loadFile(id ID, gen uint64, front bool) {
 func (s *Store) janitor(ctx context.Context) {
 	defer s.wg.Done()
 
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(janitorPeriod)
 	defer ticker.Stop()
 
 	for {

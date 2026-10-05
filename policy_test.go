@@ -2,6 +2,9 @@ package httpcache
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"math/rand/v2"
 	"net/http"
@@ -35,7 +38,7 @@ func TestParseSize(t *testing.T) {
 		}
 	}
 
-	for _, in := range []string{"", "Gi", "-1", "12 parsecs", "1e3", "99999999999999Ti"} {
+	for _, in := range []string{"", "Gi", "-1", "12 parsecs", "1e3", "1.2.3", "99999999999999Ti"} {
 		if got, err := ParseSize(in); err == nil {
 			t.Errorf("ParseSize(%q) = %d, want an error", in, got)
 		}
@@ -47,8 +50,16 @@ func TestParseSize(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"A": 1024, "B": "8Gi"}`), &decoded); err != nil || decoded.A != 1024 || decoded.B != 8<<30 {
 		t.Errorf("decoded %+v, %v", decoded, err)
 	}
-	if got := Size(8 << 30).String(); got != "8GiB" {
-		t.Errorf("String() = %q", got)
+	for _, in := range []string{`true`, `"lots"`, `1.5`} {
+		if err := json.Unmarshal([]byte(in), &decoded.A); err == nil {
+			t.Errorf("%s decoded to %d, want an error", in, decoded.A)
+		}
+	}
+
+	for size, want := range map[Size]string{8 << 30: "8GiB", 3 << 19: "1.5MiB", 512: "512B", 0: "0B", SizeOff: "off"} {
+		if got := size.String(); got != want {
+			t.Errorf("Size(%d).String() = %q, want %q", int64(size), got, want)
+		}
 	}
 }
 
@@ -77,6 +88,177 @@ func TestSliceIsCheckedAgainstTheInheritedSize(t *testing.T) {
 	}
 }
 
+// TestParseOptions covers the block of the directive and of the global
+// option as a whole. What Caddy makes of it is left to the tests that start
+// one.
+func TestParseOptions(t *testing.T) {
+	var got Options
+	err := parseOptions(caddyfile.NewTestDispenser(`cache {
+		path /var/cache/caddy
+		max_size 1Gi
+		max_memory 0
+		max_file_count 1000
+		min_uses 1
+		slice 0
+		max_cacheable_body_bytes 10Mi
+		inactive 24h
+		ttl 1h
+		stale 30s
+		lock_timeout 2s
+		mode bypass_response
+		cache_name Edge
+		default_cache_control public, max-age=60
+		allowed_additional_status_codes 404 410
+		key {
+			disable_host
+			disable_method
+			disable_query
+			disable_scheme
+			disable_vary
+			sort_query
+			hide
+			headers Accept-Language X-Tenant
+			template {http.request.uri.path}
+		}
+		regex {
+			exclude ^/private/
+		}
+	}`), &got)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := Options{
+		Path:                         "/var/cache/caddy",
+		MaxSize:                      1 << 30,
+		MaxMemory:                    SizeOff,
+		MaxFileCount:                 1000,
+		MinUses:                      1,
+		Slice:                        SizeOff,
+		MaxBodyBytes:                 10 << 20,
+		Inactive:                     caddy.Duration(24 * time.Hour),
+		TTL:                          caddy.Duration(time.Hour),
+		Stale:                        caddy.Duration(30 * time.Second),
+		LockTimeout:                  caddy.Duration(2 * time.Second),
+		Mode:                         "bypass_response",
+		CacheName:                    "Edge",
+		DefaultCacheControl:          "public, max-age=60",
+		AllowedAdditionalStatusCodes: []int{404, 410},
+		Key: &KeyOptions{
+			DisableHost:   true,
+			DisableMethod: true,
+			DisableQuery:  true,
+			DisableScheme: true,
+			DisableVary:   true,
+			SortQuery:     true,
+			Hide:          true,
+			Headers:       []string{"Accept-Language", "X-Tenant"},
+			Template:      "{http.request.uri.path}",
+		},
+		Regex: &RegexOptions{Exclude: "^/private/"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("parsed %+v\nwant   %+v", got, want)
+	}
+
+	const count = "wrong argument count"
+	for options, want := range map[string]string{
+		"redis {\n url 127.0.0.1:6379\n }":       "storage backends were removed",
+		"surprise":                               "unsupported cache option",
+		"max_size 0":                             "max_size must be positive",
+		"max_memory 4k":                          "max_memory must be at least",
+		"max_file_count lots":                    "invalid max_file_count",
+		"min_uses 0":                             "invalid min_uses",
+		"min_uses 5000":                          "min_uses must be between",
+		"min_uses 2\n max_memory off":            "max_memory off does not allow",
+		"slice lots":                             "invalid size",
+		"ttl soon":                               "invalid duration",
+		"mode relaxed":                           "unknown cache mode",
+		"regex {\n exclude ( \n }":               "regex exclude",
+		"ttl":                                    count,
+		"path":                                   count,
+		"path /a /b":                             count,
+		"max_size":                               count,
+		"max_memory lots":                        "invalid size",
+		"max_file_count":                         count,
+		"min_uses":                               count,
+		"max_cacheable_body_bytes lots":          "invalid size",
+		"max_cacheable_body_bytes off":           "max_cacheable_body_bytes must be positive",
+		"inactive soon":                          "invalid duration",
+		"stale soon":                             "invalid duration",
+		"stale -1s":                              "cannot be negative",
+		"lock_timeout soon":                      "invalid duration",
+		"mode":                                   count,
+		"cache_name":                             count,
+		"default_cache_control":                  count,
+		"allowed_additional_status_codes":        count,
+		"allowed_additional_status_codes teapot": "invalid status code",
+		"allowed_additional_status_codes 206":    "status code 206 cannot be cached",
+		"key {\n headers\n }":                    count,
+		"key {\n template\n }":                   count,
+		"key {\n surprise\n }":                   "unsupported key option",
+		"regex {\n exclude\n }":                  count,
+		"regex {\n surprise\n }":                 "unsupported regex option",
+	} {
+		err := parseOptions(caddyfile.NewTestDispenser("cache {\n"+options+"\n}"), new(Options))
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q refused with %v, want an error about %q", options, err, want)
+		}
+	}
+
+	// The directive itself takes no argument, as a directive or as a global
+	// option.
+	if err := parseOptions(caddyfile.NewTestDispenser("cache /api/*"), new(Options)); err == nil {
+		t.Error("an argument to the directive was accepted")
+	}
+	if app, err := parseCaddyfileGlobalOption(caddyfile.NewTestDispenser("cache {\n surprise\n}"), nil); err == nil {
+		t.Errorf("an unknown global option was accepted: %+v", app)
+	}
+
+	// A block that sets nothing inherits everything, and one that sets
+	// everything nothing but the status codes, which add up.
+	if inherited := (Options{}).inherit(want); !reflect.DeepEqual(inherited, want) {
+		t.Errorf("inherited %+v\nwant      %+v", inherited, want)
+	}
+	parent := Options{Path: "/elsewhere", Slice: 1 << 20, Mode: "strict", AllowedAdditionalStatusCodes: []int{418}}
+	want.AllowedAdditionalStatusCodes = []int{418, 404, 410}
+	if inherited := got.inherit(parent); !reflect.DeepEqual(inherited, want) {
+		t.Errorf("inherited %+v\nwant      %+v", inherited, want)
+	}
+}
+
+// TestModeOption checks what each mode makes of the Cache-Control directives.
+func TestModeOption(t *testing.T) {
+	for mode, want := range map[string][2]bool{
+		"":                {false, false},
+		"bypass_request":  {false, false},
+		"strict":          {true, false},
+		"bypass":          {false, true},
+		"bypass_response": {false, true},
+	} {
+		c, err := Options{Mode: mode}.resolve()
+		if err != nil || c.strict != want[0] || c.ignoreResponse != want[1] {
+			t.Errorf("mode %q: requests honoured %v, responses ignored %v, %v", mode, c.strict, c.ignoreResponse, err)
+		}
+	}
+}
+
+// TestInvalidOptions covers what a JSON configuration can ask for that the
+// Caddyfile has no way to spell.
+func TestInvalidOptions(t *testing.T) {
+	for want, o := range map[string]Options{
+		"max_size must be positive":         {MaxSize: -1},
+		"max_file_count must be positive":   {MaxFileCount: -1},
+		"cannot be negative":                {TTL: caddy.Duration(-time.Second)},
+		"status code 304 cannot be cached":  {AllowedAdditionalStatusCodes: []int{304}},
+		"status code 1000 cannot be cached": {AllowedAdditionalStatusCodes: []int{1000}},
+	} {
+		if c, err := o.resolve(); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%+v resolved to %+v, %v; want an error about %q", o, c, err, want)
+		}
+	}
+}
+
 func TestParseDirectives(t *testing.T) {
 	d := parseDirectives([]string{`Public, max-age=60, no-cache="Set-Cookie, X-Other"`, `s-maxage = "30" , stale-if-error=bogus`})
 
@@ -95,6 +277,16 @@ func TestParseDirectives(t *testing.T) {
 	}
 	if _, ok := d.seconds("min-fresh"); ok {
 		t.Error("min-fresh reported present")
+	}
+
+	// A quoted value may hold a quote, and a list empty members.
+	d = parseDirectives([]string{`, ext="a \" b, no-store" ,, max-age=99999999999,`})
+	if len(d) != 2 || !d.has("ext") || d.has("no-store") {
+		t.Errorf("unexpected directives %v", d)
+	}
+	// No lifetime is longer than the longest one.
+	if v, ok := d.seconds("max-age"); !ok || v != maxLifetime {
+		t.Errorf("max-age = %v, %v", v, ok)
 	}
 }
 
@@ -270,6 +462,54 @@ func TestStaleUsable(t *testing.T) {
 	}
 }
 
+// TestUsable checks when a stored response answers a request as it is.
+func TestUsable(t *testing.T) {
+	now := time.Now()
+	fresh := &record{stored: now.Add(-10 * time.Second).UnixMilli(), fresh: now.Add(time.Minute).UnixMilli()}
+	stale := &record{stored: now.Add(-time.Minute).UnixMilli(), fresh: now.Add(-10 * time.Second).UnixMilli()}
+	strictly := &record{stored: stale.stored, fresh: stale.fresh, flags: flagMustRevalidate}
+
+	tests := []struct {
+		directives string
+		rec        *record
+		want       bool
+	}{
+		{"", fresh, true},
+		{"", stale, false},
+		{"no-cache", fresh, false},
+		{"max-age=5", fresh, false},
+		{"max-age=60", fresh, true},
+		{"min-fresh=120", fresh, false},
+		{"min-fresh=30", fresh, true},
+		{"max-stale", stale, true},
+		{"max-stale=60", stale, true},
+		{"max-stale=5", stale, false},
+		{"max-stale", strictly, false},
+		{"max-stale=60, max-age=30", stale, false},
+	}
+	for _, tt := range tests {
+		x := &exchange{c: &config{strict: true}, reqCC: parseDirectives([]string{tt.directives})}
+		if got := x.usable(tt.rec, now, nil); got != tt.want {
+			t.Errorf("a request with %q was told %v of a response fresh for %ds",
+				tt.directives, got, (tt.rec.fresh-now.UnixMilli())/1000)
+		}
+	}
+
+	// What another request fetched while this one waited for it is as
+	// current as it gets, however long it is fresh.
+	x := &exchange{c: new(config), start: now.Add(-2 * time.Minute)}
+	if !x.usable(stale, now, &flight{stored: true}) {
+		t.Error("the response a request waited for was refused")
+	}
+	if x.usable(stale, now, &flight{}) {
+		t.Error("a stale response was accepted after a fetch that stored nothing")
+	}
+	x.start = now.Add(-30 * time.Second)
+	if x.usable(stale, now, &flight{stored: true}) {
+		t.Error("a stale response older than the request was taken for the one it waited for")
+	}
+}
+
 func TestSingleRange(t *testing.T) {
 	tests := []struct {
 		header      string
@@ -327,6 +567,41 @@ func TestBuildKey(t *testing.T) {
 		if got := c.buildKey(r, http.MethodGet); got != tt.want {
 			t.Errorf("%+v: key %q, want %q", tt.key, got, tt.want)
 		}
+	}
+
+	// A query that cannot be parsed is kept as it is.
+	c, err := Options{Key: &KeyOptions{SortQuery: true}}.resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	odd := httptest.NewRequest(http.MethodGet, "http://example.com/a?z=%zz&a=2", nil)
+	if got, want := c.buildKey(odd, http.MethodGet), "GET-http-example.com-/a?z=%zz&a=2"; got != want {
+		t.Errorf("key %q, want %q", got, want)
+	}
+
+	secure := httptest.NewRequest(http.MethodGet, "https://example.com/a", nil)
+	secure.TLS = new(tls.ConnectionState)
+	if got, want := c.buildKey(secure, http.MethodGet), "GET-https-example.com-/a"; got != want {
+		t.Errorf("key %q, want %q", got, want)
+	}
+
+	// A template is filled in by Caddy.
+	if c, err = (Options{Key: &KeyOptions{Template: "{tenant}{missing}/page"}}).resolve(); err != nil {
+		t.Fatal(err)
+	}
+	repl := caddy.NewReplacer()
+	repl.Set("tenant", "blue")
+	templated := r.WithContext(context.WithValue(r.Context(), caddy.ReplacerCtxKey, repl))
+	if got, want := c.buildKey(templated, http.MethodGet), "blue/page"; got != want {
+		t.Errorf("key %q, want %q", got, want)
+	}
+
+	// Without Caddy's replacer, a template is the key.
+	if c, err = (Options{Key: &KeyOptions{Template: "{http.request.uri.path}"}}).resolve(); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := c.buildKey(r, http.MethodGet), "{http.request.uri.path}"; got != want {
+		t.Errorf("key %q, want %q", got, want)
 	}
 }
 
@@ -496,6 +771,89 @@ func TestRecordRoundTrip(t *testing.T) {
 	finalizeHead(head, 0)
 	if got, err := readRecord(bytes.NewReader(head), int64(len(head))); err != nil || got.header.Get("X-Large") != rec.header.Get("X-Large") {
 		t.Errorf("large head: %v", err)
+	}
+}
+
+// TestReadRecordRejects covers the files whose checksum is right and whose
+// content is not, which no damage done at random gets to, and the ones that
+// cannot be read at all.
+func TestReadRecordRejects(t *testing.T) {
+	// file returns the head of a cache file with the given meta block.
+	file := func(meta []byte) []byte {
+		head := make([]byte, headerSize, headerSize+1+len(meta))
+		copy(head, fileMagic)
+		binary.LittleEndian.PutUint32(head[36:], 1)
+		binary.LittleEndian.PutUint32(head[40:], uint32(len(meta)))
+		head = append(append(head, 'k'), meta...)
+		finalizeHead(head, 0)
+
+		return head
+	}
+	read := func(file []byte) (*record, error) {
+		return readRecord(bytes.NewReader(file), int64(len(file)))
+	}
+
+	// A status, no vary specification and one header with one value.
+	valid := appendString(appendString([]byte{200, 1, 0, 1}, "A"), "")
+	valid = appendString(append(valid[:len(valid)-1], 1), "b")
+	if rec, err := read(file(valid)); err != nil || rec.status != 200 || rec.header.Get("A") != "b" {
+		t.Fatalf("read %+v, %v", rec, err)
+	}
+
+	for name, meta := range map[string][]byte{
+		"empty":                    nil,
+		"unfinished number":        {0x80},
+		"string longer than meta":  {200, 1, 5, 'a'},
+		"missing header":           append(bytes.Clone(valid[:3]), 2, 1, 'A', 0),
+		"missing value":            valid[:len(valid)-2],
+		"more than it says":        append(bytes.Clone(valid), 0),
+		"number that never ends":   bytes.Repeat([]byte{0xff}, 12),
+		"values without a header":  {200, 1, 0, 1},
+		"vary longer than a block": append([]byte{200, 1}, bytes.Repeat([]byte{0xff}, 9)...),
+	} {
+		if rec, err := read(file(meta)); err != errCorrupt {
+			t.Errorf("%s: read %+v, %v; want it found corrupt", name, rec, err)
+		}
+	}
+
+	// A file shorter than it was said to be, in its first block and after.
+	large := &record{key: "k", status: 200, header: http.Header{"X-Large": {string(bodyFor("large", 10_000))}}}
+	head, err := encodeHead(large)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalizeHead(head, 0)
+	for _, length := range []int{100, 5000} {
+		if rec, err := readRecord(bytes.NewReader(head[:length]), int64(len(head))); err == nil {
+			t.Errorf("read %+v from the first %d bytes of a file", rec, length)
+		}
+	}
+}
+
+func TestEncodeHeadLimits(t *testing.T) {
+	for name, rec := range map[string]*record{
+		"no key":        {status: 200},
+		"long key":      {key: strings.Repeat("k", maxKeyLen+1), status: 200},
+		"large headers": {key: "k", status: 200, header: http.Header{"X-Large": {strings.Repeat("v", maxMetaLen)}}},
+	} {
+		if _, err := encodeHead(rec); err == nil {
+			t.Errorf("%s: encoded", name)
+		}
+	}
+	if _, err := encodeHead(&record{key: strings.Repeat("k", maxKeyLen), status: 200}); err != nil {
+		t.Errorf("the longest key was refused: %v", err)
+	}
+}
+
+func TestParseID(t *testing.T) {
+	id := makeID("key")
+	if got, ok := parseID(id.String()); !ok || got != id {
+		t.Errorf("parseID(%s) = %s, %v", id, got, ok)
+	}
+	for _, name := range []string{"", "w-123456", id.String()[1:], id.String() + "00", strings.Repeat("zz", len(id))} {
+		if _, ok := parseID(name); ok {
+			t.Errorf("%q passed for the name of a cache file", name)
+		}
 	}
 }
 

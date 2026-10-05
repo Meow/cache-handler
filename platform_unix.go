@@ -35,7 +35,7 @@ func lockDir(path string) (*os.File, error) {
 	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		_ = f.Close()
 		if errors.Is(err, unix.EWOULDBLOCK) {
-			return nil, errors.New("the cache directory is in use by another process")
+			err = errors.New("the cache directory is in use by another process")
 		}
 
 		return nil, err
