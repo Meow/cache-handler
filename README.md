@@ -338,46 +338,96 @@ With several caches, add `path=<directory>` to purge one of them only.
 
 ## Performance
 
-Serving a response from the cache takes about what Caddy takes to produce a trivial one itself, and much less than asking an upstream for it. [`bench/bench.sh`](bench/bench.sh) measures this with `ab` (ApacheBench): it builds Caddy from the working tree and requests one URL over 64 keep-alive connections on the loopback interface, without the cache and with it in several configurations. The scenarios are the routes of [`bench/Caddyfile`](bench/Caddyfile).
+Over TLS, which is how responses reach browsers, this module serves about three quarters of the requests per second nginx's `proxy_cache` does, as many as Varnish, and far more than the module it is forked from on anything larger than a few bytes. A cached response costs about what Caddy takes to produce a trivial one itself, and much less than asking an upstream for it.
 
-These are its results on a Ryzen 9 9900X, each the median of 3 runs of 100000 requests. The first row of each group has no cache, and is what the others are compared to.
+### Compared with other caches
+
+[`bench/compare.sh`](bench/compare.sh) puts this module, [caddyserver/cache-handler](https://github.com/caddyserver/cache-handler), nginx and Varnish in front of the same upstream, a Caddy without a cache, and measures hits with `ab` (ApacheBench) over 64 keep-alive connections. It runs in Docker, with each process pinned to cores of its own, and measures everything twice: over TLS, and in plain HTTP. Varnish has no TLS of its own and gets it from hitch, the TLS proxy of the Varnish project, on the same cores.
+
+These are the results on a Ryzen 9 9900X running Fedora 44 (Linux 7.2, Docker 29.8), with the servers on 8 cores, each the median of 3 runs of 100000 requests, in requests per second.
+
+![Requests per second over TLS, server on 8 cores](bench/comparison-tls.svg)
+
+Over TLS, with `sendfile` off:
+
+| | Text, 13 bytes | Image, 42KiB |
+|---|---:|---:|
+| **This module** | 206229 | 97028 |
+| **This module**, `max_memory off` | 191987 | 93437 |
+| caddyserver/cache-handler, default storage | 180702 | 4017 |
+| caddyserver/cache-handler, Otter | 177017 | 3931 |
+| caddyserver/cache-handler, SimpleFS | 118869 | 4182 |
+| nginx `proxy_cache` | 278986 | 127726 |
+| Varnish, malloc storage, behind hitch | 189644 | 92279 |
+| *No cache, for reference:* | | |
+| Caddy `respond` / `file_server` | 233758 | 105205 |
+| Caddy `reverse_proxy` | 111579 | 61571 |
+| nginx `return` / static file | 280558 | 126889 |
+| nginx `proxy_pass` | 204327 | 70172 |
+| Varnish `pass`, behind hitch | 104758 | 62163 |
+
+In plain HTTP, where nginx and Varnish are not slowed down by encryption:
+
+| | Text, 13 bytes | Image, 42KiB |
+|---|---:|---:|
+| **This module** | 334466 | 209666 |
+| **This module**, `max_memory off` | 270158 | 186557 |
+| caddyserver/cache-handler, default storage | 228102 | 4036 |
+| caddyserver/cache-handler, Otter | 226612 | 3993 |
+| caddyserver/cache-handler, SimpleFS | 140912 | 4236 |
+| nginx `proxy_cache` | 399966 | 280118 |
+| Varnish, malloc storage | 391076 | 287645 |
+| *No cache, for reference:* | | |
+| Caddy `respond` / `file_server` | 388255 | 133542 |
+| Caddy `reverse_proxy` | 127057 | 68329 |
+| nginx `return` / static file | 451888 | 278726 |
+| nginx `proxy_pass` | 225045 | 69764 |
+| Varnish `pass` | 129957 | 68022 |
+
+* Over TLS, encrypting the response is a large part of the work for every server, and the differences between them shrink: on the image, this module serves 76% of what nginx does, and 5% more than Varnish behind hitch. In plain HTTP, nginx and Varnish serve the image from the kernel's page cache or their own memory with less copying than a Go program can, and are 1.4 times as fast.
+* A hit from this module costs about what Caddy itself takes to answer: within 15% of `respond` on the text, and on the image within 8% of `file_server` over TLS, and well ahead of it in plain HTTP, where `file_server` copies the file in user space and the cache does not.
+* caddyserver/cache-handler keeps up on a 13-byte response and falls to about 4000 requests per second on a 42KiB one, whatever its storage.
+* `max_memory off` costs between 4% and 19%: a response read from disk is sent with `sendfile` and pays for opening its file.
+* `ab` is a single thread on one core, and with 8 cores the fastest rows run into its limit as much as the server's: nginx's `return` and `proxy_cache` come out alike on the text, about 280000 requests per second over TLS, and that ceiling is most likely ab's.
+
+### Options
+
+[`bench/bench.sh`](bench/bench.sh) measures this module alone, in plain HTTP on all cores, over the scenarios of [`bench/Caddyfile`](bench/Caddyfile): what each option costs against Caddy without a cache. On the same machine, median of 3 runs of 100000 requests:
 
 | | Requests/s | vs. no cache | p50 | p99 | Served from |
 |---|---:|---:|---:|---:|---|
 | **A text of 13 bytes, from `respond`** | | | | | |
-| No cache | 265558 | | 0.20 ms | 0.81 ms | |
-| `cache` | 253077 | 0.95x | 0.21 ms | 0.85 ms | Memory |
-| `cache`, `max_memory off` | 223184 | 0.84x | 0.23 ms | 1.08 ms | Disk |
-| `cache`, `min_uses 2` | 260393 | 0.98x | 0.21 ms | 0.83 ms | Memory |
-| `cache`, response with `Vary` | 237425 | 0.89x | 0.22 ms | 0.97 ms | Memory |
-| `cache`, `key` `template` | 253539 | 0.95x | 0.21 ms | 0.87 ms | Memory |
-| `cache`, response with `no-store` | 216463 | 0.82x | 0.22 ms | 1.22 ms | Not stored |
+| No cache | 257876 | | 0.21 ms | 0.83 ms | |
+| `cache` | 257842 | 1.00x | 0.21 ms | 0.80 ms | Memory |
+| `cache`, `max_memory off` | 223328 | 0.87x | 0.23 ms | 1.09 ms | Disk |
+| `cache`, `min_uses 2` | 260967 | 1.01x | 0.21 ms | 0.81 ms | Memory |
+| `cache`, response with `Vary` | 244905 | 0.95x | 0.22 ms | 0.89 ms | Memory |
+| `cache`, `key` `template` | 260590 | 1.01x | 0.21 ms | 0.84 ms | Memory |
+| `cache`, response with `no-store` | 214153 | 0.83x | 0.23 ms | 1.19 ms | Not stored |
 | **An image of 42KiB, from `file_server`** | | | | | |
-| No cache | 112416 | | 0.46 ms | 1.75 ms | |
-| `cache` | 108360 | 0.96x | 0.47 ms | 1.94 ms | Memory |
-| `cache`, `max_memory off` | 94029 | 0.84x | 0.50 ms | 2.48 ms | Disk |
-| `cache`, `min_uses 2` | 108438 | 0.96x | 0.46 ms | 1.89 ms | Memory |
-| `cache`, `slice 16Ki` | 96430 | 0.86x | 0.53 ms | 2.06 ms | Memory, 3 slices |
+| No cache | 113454 | | 0.46 ms | 1.75 ms | |
+| `cache` | 141432 | 1.25x | 0.41 ms | 1.07 ms | Memory |
+| `cache`, `max_memory off` | 136193 | 1.20x | 0.42 ms | 1.19 ms | Disk |
+| `cache`, `min_uses 2` | 142897 | 1.26x | 0.41 ms | 1.04 ms | Memory |
+| `cache`, `slice 16Ki` | 122402 | 1.08x | 0.46 ms | 1.38 ms | Memory, 3 slices |
 | **The same image, from `reverse_proxy` to a `file_server`** | | | | | |
-| No cache | 62630 | | 0.78 ms | 3.28 ms | |
-| `cache` | 110556 | 1.77x | 0.46 ms | 1.88 ms | Memory |
-| `cache`, `max_memory off` | 96726 | 1.54x | 0.49 ms | 2.38 ms | Disk |
+| No cache | 62760 | | 0.78 ms | 3.41 ms | |
+| `cache` | 141427 | 2.25x | 0.41 ms | 1.02 ms | Memory |
+| `cache`, `max_memory off` | 135397 | 2.16x | 0.42 ms | 1.21 ms | Disk |
 
-* A response served from memory is within 5% of the handler it stands in for, when that handler is as cheap as a handler gets: `respond` with a constant, or `file_server` with a file the system holds in memory.
-* Served from disk, it is about 15% fewer requests per second. The file was in the page cache of the system: a disk that has to be read is not what was measured.
-* A response that varies takes a second lookup, and one stored in slices is put together from several.
-* A response that cannot be stored passes through the cache at a cost: 18% fewer requests per second here, against a handler that does next to nothing, which is where it shows most.
-* In front of a reverse proxy, the cache answers 1.5 to 1.8 times the requests the upstream does, and that upstream is as fast and as close as one can be: Caddy's own `file_server`, on the same machine.
+* A response served from memory costs nothing measurable against `respond`, and is 25% faster than `file_server`.
+* `max_memory off` costs 13% on the text and 4% on the image.
+* A response that varies takes a second lookup, 5%. One stored in slices is put together from several, 14% against one stored whole.
+* A response that cannot be stored passes through the cache at a cost, 17% here against a handler that does next to nothing, which is where it shows most.
+* In front of a reverse proxy, the cache answers 2.2 times the requests the upstream does, and that upstream is as fast and as close as one can be: Caddy's own `file_server`, on the same machine.
 
-Read these numbers with care. `ab` runs on the same machine as Caddy, on a single thread: it competes with it for the processor, and in the fastest rows it may be what sets the pace. Single runs of a scenario differ by 10% or so, hence the median, and a difference of a few percent between two rows means nothing. What is measured is one response requested over and over: not the storing of new responses, not TLS, not a network.
+Read these numbers with care. `ab` runs on the same machine as the servers and competes with them for the processor. Single runs of a scenario differ by 10% or so, hence the median, and a difference of a few percent between two rows means nothing. What is measured is one response requested over and over: not the storing of new responses, and no network.
 
-To run it on your own hardware, with Go and `ab` installed:
+To run them on your own hardware, `bench.sh` needs Go and `ab`, `compare.sh` needs Docker:
 
 ```sh
 bench/bench.sh
-
-# With Caddy on a single thread, so that it is slower than ab
-GOMAXPROCS=1 bench/bench.sh
+bench/compare.sh
 ```
 
 ## Coming from nginx
