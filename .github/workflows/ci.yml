@@ -17,18 +17,18 @@ jobs:
         # The Windows build currently fail because of https://github.com/golang/go/issues/40795, and because xcaddy isn't compatible with the known workaround
         #os: [ ubuntu-latest, macos-latest, windows-latest ]
         os: [ ubuntu-latest, macos-latest ]
-        go: [ '1.24' ]
+        go: [ '1.26', '1.27' ]
 
     runs-on: ${{ matrix.os }}
 
     steps:
     - name: Install Go
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v7
       with:
         go-version: ${{ matrix.go }}
 
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Print Go version and environment
       id: vars
@@ -40,11 +40,11 @@ jobs:
         printf "\n\nSystem environment:\n\n"
         env
         # Calculate the short SHA1 hash of the git commit
-        echo "::set-output name=short_sha::$(git rev-parse --short HEAD)"
-        echo "::set-output name=go_cache::$(go env GOCACHE)"
+        echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+        echo "go_cache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
 
     - name: Cache the build cache
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ${{ steps.vars.outputs.go_cache }}
         key: ${{ runner.os }}-${{ matrix.go }}-go-ci-${{ hashFiles('**/go.sum') }}
@@ -59,7 +59,7 @@ jobs:
       env:
         CGO_ENABLED: 0
       run: |
-        xcaddy build
+        xcaddy build --with github.com/Meow/cache-handler=.
 
     - name: Run tests
       run: |
@@ -71,11 +71,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: '1.24'
+          go-version: '1.27'
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v8
+        uses: golangci/golangci-lint-action@v9
         with:
           args: --timeout 5m

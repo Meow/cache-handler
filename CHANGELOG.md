@@ -8,6 +8,7 @@
 
 ### Changed
 
+* Caddy 2.11.7 or later is required, and Go 1.26 or later to build it.
 * A response that varies on fewer request headers than the ones already stored for its URL is stored beside them, instead of replacing them all.
 
 ### Fixed
