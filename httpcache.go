@@ -1,9 +1,13 @@
+// This file has been modified from the one of caddyserver/cache-handler it
+// replaces, see the NOTICE file.
+
 package httpcache
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"sync/atomic"
@@ -238,9 +242,14 @@ func (x *exchange) serve() error {
 			return caddyhttp.Error(http.StatusGatewayTimeout, errors.New("the response is not in the cache"))
 		}
 
-		// The cache is filled by GET requests only.
+		// The cache is filled by GET requests only, but a HEAD request can
+		// be answered from a response on its way in.
 		if x.r.Method == http.MethodHead {
 			hit.Close()
+			if w := s.SharedFlight(id); w != nil && x.serveTail(w) {
+				return nil
+			}
+
 			return x.pass("HEAD")
 		}
 
@@ -265,17 +274,93 @@ func (x *exchange) serve() error {
 			deadline = x.start.Add(x.c.lockTimeout)
 		}
 		timer := time.NewTimer(time.Until(deadline))
-		select {
-		case <-fl.done:
-			timer.Stop()
-			joined = fl
-		case <-timer.C:
-			return x.pass("LOCK-TIMEOUT")
-		case <-x.r.Context().Done():
-			timer.Stop()
-			return x.r.Context().Err()
+		started := fl.started
+		for joined != fl {
+			select {
+			case <-fl.done:
+				joined = fl
+			case <-started:
+				// The response is on its way to the cache: no need to wait
+				// for all of it to start answering.
+				started = nil
+				if x.serveTail(fl.w) {
+					timer.Stop()
+					return nil
+				}
+			case <-timer.C:
+				return x.pass("LOCK-TIMEOUT")
+			case <-x.r.Context().Done():
+				timer.Stop()
+				return x.r.Context().Err()
+			}
+		}
+		timer.Stop()
+	}
+}
+
+// serveTail answers the request from a response another request is still
+// receiving from the upstream, as it arrives. It reports whether it did:
+// when the response is not the one this request selects, or cannot be
+// served before it is complete, the request has to wait.
+func (x *exchange) serveTail(w *Writer) bool {
+	rec := w.rec
+
+	expected := x.key
+	if w.varySpec != "" {
+		expected = variantKey(x.key, w.varySpec, x.r.Header)
+	}
+	if rec.key != expected {
+		return false
+	}
+
+	// Ranges and preconditions need the length of the body.
+	partial := rec.status == http.StatusOK && (x.r.Header.Get("Range") != "" || conditional(x.r))
+	if partial && w.declared < 0 {
+		return false
+	}
+
+	tail, err := w.Tail(x.r.Context())
+	if err != nil {
+		return false
+	}
+	defer tail.Close()
+
+	sw := &statusWriter{ResponseWriterWrapper: &caddyhttp.ResponseWriterWrapper{ResponseWriter: x.w}}
+	// While the rest of the body is awaited, the client gets what there is.
+	tail.flush = func() {
+		if sw.status != 0 {
+			_ = http.NewResponseController(x.w).Flush()
 		}
 	}
+
+	header := x.w.Header()
+	applyHeaders(header, rec.header)
+	header.Set("Age", strconv.FormatUint(uint64(rec.age), 10))
+	header.Add("Cache-Status", x.status("fwd=uri-miss; collapsed"))
+
+	if partial {
+		var modified time.Time
+		if t, err := http.ParseTime(header.Get("Last-Modified")); err == nil {
+			modified = t
+		}
+		http.ServeContent(sw, x.r, "", modified, tail)
+	} else {
+		if w.declared >= 0 {
+			header.Set("Content-Length", strconv.FormatInt(w.declared, 10))
+		}
+		sw.WriteHeader(rec.status)
+		if x.r.Method != http.MethodHead {
+			_, _ = io.Copy(sw, tail)
+		}
+	}
+
+	if tail.err != nil {
+		// The download failed or the client left: the response is cut
+		// short, which the client must be able to tell.
+		panic(http.ErrAbortHandler)
+	}
+
+	return true
 }
 
 // usable tells whether a stored response can answer the request as is.
@@ -433,7 +518,7 @@ func (x *exchange) fetch(id ID, fl *flight, stale *Hit) error {
 
 		return x.serveHit(stale, now, fmt.Sprintf("fwd=stale; fwd-status=%d; detail=STALE", fw.status))
 
-	case modeStream:
+	case modeStream, modeRange:
 		committed := !failed && fw.commit()
 		if committed {
 			s.SetUncacheable(id, false)

@@ -568,6 +568,210 @@ func TestConcurrentRequestsShareOneFetch(t *testing.T) {
 	}
 }
 
+// TestRequestsJoinADownloadInProgress checks that the requests arriving
+// while a response is being downloaded are served from it as it arrives,
+// rather than once it is complete.
+func TestRequestsJoinADownloadInProgress(t *testing.T) {
+	first := string(bodyFor("first", 100_000))
+	second := string(bodyFor("second", 100_000))
+	release := make(chan struct{})
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(first)+len(second)))
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = io.WriteString(w, first)
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-time.After(10 * time.Second):
+		}
+		_, _ = io.WriteString(w, second)
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache
+		reverse_proxy `+up.addr())
+	const key = "GET-http-localhost:9080-/video"
+
+	leader := make(chan string)
+	go func() {
+		_, body := get(t, tester, "/video")
+		leader <- body
+	}()
+	waitFor(t, "the download to start", func() bool { return up.hits.Load() == 1 })
+
+	// A request for the whole response gets its beginning at once.
+	resp, err := tester.Client.Get(testURL + "/video")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	expectStatus(t, resp, "Caddy; fwd=uri-miss; collapsed; key="+key)
+	if resp.Header.Get("Content-Length") != "200000" {
+		t.Errorf("Content-Length: %q", resp.Header.Get("Content-Length"))
+	}
+	head := make([]byte, len(first))
+	if _, err := io.ReadFull(resp.Body, head); err != nil || string(head) != first {
+		t.Fatalf("reading the part already downloaded: %v", err)
+	}
+
+	// A request for a range that is already there is answered in full,
+	// while the download is still going on.
+	ranged, body := get(t, tester, "/video", "Range: bytes=1000-1999")
+	if ranged.StatusCode != http.StatusPartialContent || ranged.Header.Get("Content-Range") != "bytes 1000-1999/200000" {
+		t.Errorf("status %d, Content-Range %q", ranged.StatusCode, ranged.Header.Get("Content-Range"))
+	}
+	expectBody(t, body, first[1000:2000])
+
+	// So is a HEAD request.
+	headResp, _ := fetch(t, tester, http.MethodHead, "/video")
+	if headResp.Header.Get("Content-Length") != "200000" || headResp.Header.Get("Content-Type") != "application/octet-stream" {
+		t.Errorf("HEAD during the download: %v", headResp.Header)
+	}
+
+	// A range that is still to come waits for it.
+	late := make(chan string)
+	go func() {
+		_, body := get(t, tester, "/video", "Range: bytes=150000-")
+		late <- body
+	}()
+	select {
+	case <-late:
+		t.Fatal("got a range that was not downloaded yet")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil || string(rest) != second {
+		t.Errorf("reading the rest: %d bytes, %v", len(rest), err)
+	}
+	expectBody(t, <-late, second[50_000:])
+	expectBody(t, <-leader, first+second)
+
+	if n := up.hits.Load(); n != 1 {
+		t.Errorf("the upstream got %d requests, want 1", n)
+	}
+	hit, body := get(t, tester, "/video")
+	expectHit(t, hit, key, 120)
+	expectBody(t, body, first+second)
+}
+
+// TestRangeRequestIsStreamedOnAMiss checks that the request that triggers a
+// download gets the range it asked for as it arrives, while the whole
+// response is stored.
+func TestRangeRequestIsStreamedOnAMiss(t *testing.T) {
+	first := string(bodyFor("first", 100_000))
+	second := string(bodyFor("second", 100_000))
+	release := make(chan struct{})
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "" {
+			t.Errorf("the range was forwarded: %s", r.Header.Get("Range"))
+		}
+		w.Header().Set("Content-Length", fmt.Sprint(len(first)+len(second)))
+		_, _ = io.WriteString(w, first)
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-time.After(10 * time.Second):
+		}
+		_, _ = io.WriteString(w, second)
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache
+		reverse_proxy `+up.addr())
+	const key = "GET-http-localhost:9080-/video"
+
+	req, _ := http.NewRequest(http.MethodGet, testURL+"/video", nil)
+	req.Header.Set("Range", "bytes=20000-")
+	resp, err := tester.Client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusPartialContent || resp.Header.Get("Content-Range") != "bytes 20000-199999/200000" || resp.Header.Get("Content-Length") != "180000" {
+		t.Errorf("status %d, headers %v", resp.StatusCode, resp.Header)
+	}
+	expectStatus(t, resp, "Caddy; fwd=uri-miss; stored; key="+key)
+
+	// Most of what the upstream sent so far is already here: the server
+	// may hold back a last few kilobytes until more comes.
+	head := make([]byte, 64_000)
+	if _, err := io.ReadFull(resp.Body, head); err != nil || string(head) != first[20_000:84_000] {
+		t.Fatalf("reading the range while it is downloaded: %v", err)
+	}
+
+	close(release)
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil || string(head)+string(rest) != (first + second)[20_000:] {
+		t.Errorf("reading the rest: %d bytes, %v", len(rest), err)
+	}
+
+	// The whole response was stored.
+	hit, body := get(t, tester, "/video")
+	expectHit(t, hit, key, 120)
+	expectBody(t, body, first+second)
+
+	// A range that stops before the end is relayed too.
+	ranged, body := get(t, tester, "/other", "Range: bytes=100-199")
+	if ranged.StatusCode != http.StatusPartialContent {
+		t.Errorf("status %d", ranged.StatusCode)
+	}
+	expectBody(t, body, first[100:200])
+	hit, body = get(t, tester, "/other")
+	expectHit(t, hit, "GET-http-localhost:9080-/other", 120)
+	expectBody(t, body, first+second)
+}
+
+// TestFailedDownloadFailsThoseWhoJoinedIt checks that a download cut short
+// is not mistaken for a complete response by anyone.
+func TestFailedDownloadFailsThoseWhoJoinedIt(t *testing.T) {
+	release := make(chan struct{})
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "200000")
+		_, _ = w.Write(bodyFor("first", 100_000))
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-time.After(10 * time.Second):
+		}
+		panic(http.ErrAbortHandler)
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache
+		reverse_proxy `+up.addr())
+
+	download := func() error {
+		resp, err := tester.Client.Get(testURL + "/video")
+		if err != nil {
+			return err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		_, err = io.ReadAll(resp.Body)
+		return err
+	}
+
+	results := make(chan error, 2)
+	go func() { results <- download() }()
+	waitFor(t, "the download to start", func() bool { return up.hits.Load() == 1 })
+	go func() { results <- download() }()
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+
+	for range 2 {
+		if err := <-results; err == nil {
+			t.Error("a truncated response was delivered as complete")
+		}
+	}
+	st := cacheStats(t)
+	if st.Entries != 0 {
+		t.Error("a truncated response was stored")
+	}
+	if left, _ := os.ReadDir(filepath.Join(st.Path, tmpDirName)); len(left) != 0 {
+		t.Errorf("%d temporary files left", len(left))
+	}
+}
+
 func TestUncacheableResponsesAreNotSerialized(t *testing.T) {
 	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(200 * time.Millisecond)

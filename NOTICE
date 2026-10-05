@@ -1,0 +1,27 @@
+cache-handler
+https://github.com/Meow/cache-handler
+
+This product is a modified version of caddyserver/cache-handler
+(https://github.com/caddyserver/cache-handler), which is licensed under the
+Apache License, Version 2.0, and was written by Sylvain Combraque (darkweak)
+and the contributors of that project: Kévin Dunglas, Antoine Bluchet,
+Burak Sezer, Frederic Houle, Malloc Voidstar, Matthew Holt, Po Chen and
+Sherif Metwally.
+
+Changes made to the original work, starting from its 0.17.0 release:
+
+  * The caching engine, which was provided by Souin
+    (https://github.com/darkweak/souin, MIT License), and the storage
+    backends of https://github.com/darkweak/storages were removed and
+    replaced by an engine and a storage written for this project (store.go,
+    arena.go, diskfmt.go, fetch.go, policy.go, size.go, platform_*.go).
+  * admin.go, app.go, configuration.go and httpcache.go were rewritten for
+    the new engine. cleaner.go and dispatch.go were removed.
+  * The configuration options that belonged to Souin or to its storages were
+    removed, and path, max_size, max_memory, inactive and lock_timeout were
+    added.
+  * The tests, README.md, the example configurations and go.mod were changed
+    accordingly. The Go module path is github.com/Meow/cache-handler.
+
+The modifications are distributed under the same license as the original
+work. See the LICENSE file.

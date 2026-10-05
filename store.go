@@ -504,6 +504,7 @@ func (h *Hit) Discard() {
 type Writer struct {
 	s        *Store
 	f        *os.File
+	info     os.FileInfo
 	tmp      string
 	rec      *record
 	head     []byte
@@ -511,17 +512,56 @@ type Writer struct {
 	max      int64
 	reserved int64
 	done     bool
+
+	// declared is the body length the upstream announced, or -1.
+	declared int64
+	// varySpec is the vary specification the key of the response was
+	// derived with, empty when the response does not vary.
+	varySpec string
+
+	// What follows is shared with the requests served from the response
+	// while it is still being written, see Tail.
+	pmu   sync.Mutex
+	avail int64
+	state writerState
+	// wake is closed when avail or state changes. It only exists while a
+	// reader waits.
+	wake chan struct{}
+}
+
+type writerState int
+
+const (
+	writerActive writerState = iota
+	writerCommitted
+	writerAborted
+)
+
+// progress records how far the response got and wakes the readers waiting
+// for more.
+func (w *Writer) progress(state writerState) {
+	w.pmu.Lock()
+	w.avail = w.n
+	w.state = state
+	if w.wake != nil {
+		close(w.wake)
+		w.wake = nil
+	}
+	w.pmu.Unlock()
 }
 
 // Create starts storing a response for key. vary lists the lowercase, sorted
 // names of the request headers the response depends on, whose values are
 // taken from reqHeader. rec describes the response; its key is set here.
-// A positive maxBody further limits the size of the body.
-func (s *Store) Create(key string, vary []string, reqHeader http.Header, rec *record, maxBody int64) (*Writer, error) {
+// A positive maxBody further limits the size of the body. declared is the
+// length the upstream announced for it, or -1.
+func (s *Store) Create(key string, vary []string, reqHeader http.Header, rec *record, maxBody, declared int64) (*Writer, error) {
+	var spec string
+
 	rec.key = key
 	if len(vary) > 0 {
-		spec, err := s.ensureMarker(key, strings.Join(vary, ","))
-		if err != nil {
+		var err error
+		if spec, err = s.ensureMarker(key, strings.Join(vary, ",")); err != nil {
 			return nil, err
 		}
 		rec.key = variantKey(key, spec, reqHeader)
@@ -532,7 +572,14 @@ func (s *Store) Create(key string, vary []string, reqHeader http.Header, rec *re
 		limit = maxBody
 	}
 
-	return s.newWriter(rec, limit)
+	w, err := s.newWriter(rec, limit)
+	if err != nil {
+		return nil, err
+	}
+	w.declared = declared
+	w.varySpec = spec
+
+	return w, nil
 }
 
 // ensureMarker makes the entry of key a marker listing the given header
@@ -609,8 +656,11 @@ func (s *Store) newWriter(rec *record, maxBody int64) (*Writer, error) {
 		return nil, err
 	}
 
-	w := &Writer{s: s, f: f, tmp: f.Name(), rec: rec, head: head, max: maxBody}
-	if err = w.reserve(int64(len(head))); err == nil {
+	w := &Writer{s: s, f: f, tmp: f.Name(), rec: rec, head: head, max: maxBody, declared: -1}
+	if w.info, err = f.Stat(); err == nil {
+		err = w.reserve(int64(len(head)))
+	}
+	if err == nil {
 		_, err = f.Write(head)
 	}
 	if err != nil {
@@ -659,6 +709,7 @@ func (w *Writer) Write(p []byte) (int, error) {
 
 	n, err := w.f.Write(p)
 	w.n += int64(n)
+	w.progress(writerActive)
 
 	return n, err
 }
@@ -673,6 +724,7 @@ func (w *Writer) Abort() {
 	_ = w.f.Close()
 	_ = os.Remove(w.tmp)
 	w.s.tempBytes.Add(-w.reserved)
+	w.progress(writerAborted)
 }
 
 // Commit makes the response available, replacing the one stored under the
@@ -713,9 +765,11 @@ func (w *Writer) Commit() error {
 	s.tempBytes.Add(-w.reserved)
 	if err != nil {
 		_ = os.Remove(w.tmp)
+		w.progress(writerAborted)
 		s.warn("storing a response failed", err)
 		return err
 	}
+	w.progress(writerCommitted)
 
 	s.unlink(victims)
 	if !w.rec.marker() {
@@ -723,6 +777,115 @@ func (w *Writer) Commit() error {
 	}
 
 	return nil
+}
+
+// errTailAborted is what reading a response in progress returns when the
+// response was given up.
+var errTailAborted = errors.New("cache: the response being read was not completed")
+
+// Tail reads the body of a response while it is being written, waiting for
+// the bytes that have not arrived yet. It is how the requests that come in
+// during a download are served from it rather than made to wait for its end.
+type Tail struct {
+	w   *Writer
+	f   *os.File
+	ctx context.Context
+	off int64
+	// sent counts the bytes read since the last flush.
+	sent int64
+	// flush, if set, is called before waiting for more of the body, so that
+	// what was read reaches the client meanwhile.
+	flush func()
+	// err is the reason the body could not be read to its end.
+	err error
+}
+
+// Tail opens the response for reading. It fails once the response is
+// committed, from when it is found in the cache like any other.
+func (w *Writer) Tail(ctx context.Context) (*Tail, error) {
+	f, err := os.Open(w.tmp)
+	if err != nil {
+		return nil, err
+	}
+
+	// The name could have been given to another download since.
+	if info, err := f.Stat(); err != nil || !os.SameFile(info, w.info) {
+		_ = f.Close()
+		return nil, os.ErrNotExist
+	}
+
+	return &Tail{w: w, f: f, ctx: ctx}, nil
+}
+
+// Close releases the file.
+func (t *Tail) Close() {
+	_ = t.f.Close()
+}
+
+// Read implements io.Reader. It blocks until some of the body is available
+// past the current offset, and fails if the response is given up.
+func (t *Tail) Read(p []byte) (int, error) {
+	w := t.w
+
+	for {
+		w.pmu.Lock()
+		avail, state := w.avail, w.state
+		var wake chan struct{}
+		if state == writerActive && t.off >= avail {
+			if w.wake == nil {
+				w.wake = make(chan struct{})
+			}
+			wake = w.wake
+		}
+		w.pmu.Unlock()
+
+		switch {
+		case state == writerAborted:
+			t.err = errTailAborted
+			return 0, t.err
+		case w.declared >= 0 && t.off >= w.declared:
+			return 0, io.EOF
+		case t.off < avail:
+			n, err := t.f.ReadAt(p[:min(int64(len(p)), avail-t.off)], int64(len(w.head))+t.off)
+			t.off += int64(n)
+			t.sent += int64(n)
+			if n > 0 {
+				err = nil
+			} else if err != nil {
+				t.err = err
+			}
+			return n, err
+		case state == writerCommitted:
+			return 0, io.EOF
+		}
+
+		if t.flush != nil && t.sent > 0 {
+			t.sent = 0
+			t.flush()
+		}
+		select {
+		case <-wake:
+		case <-t.ctx.Done():
+			t.err = t.ctx.Err()
+			return 0, t.err
+		}
+	}
+}
+
+// Seek implements io.Seeker, for a body whose length was announced.
+func (t *Tail) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekCurrent:
+		offset += t.off
+	case io.SeekEnd:
+		offset += t.w.declared
+	}
+	if offset < 0 || t.w.declared < 0 {
+		return 0, os.ErrInvalid
+	}
+	t.off = offset
+
+	return offset, nil
 }
 
 // install moves a finished file into place and indexes it. The caller holds
@@ -1275,6 +1438,10 @@ type flight struct {
 	done chan struct{}
 	// stored tells the waiters the response is now in the cache.
 	stored bool
+	// started is closed once the response is being stored, from when w can
+	// be read by the waiters.
+	started chan struct{}
+	w       *Writer
 }
 
 // BeginFlight registers a fetch for id. The caller that gets leader set must
@@ -1286,10 +1453,35 @@ func (s *Store) BeginFlight(id ID) (f *flight, leader bool) {
 	if f := s.flights[id]; f != nil {
 		return f, false
 	}
-	f = &flight{done: make(chan struct{})}
+	f = &flight{done: make(chan struct{}), started: make(chan struct{})}
 	s.flights[id] = f
 
 	return f, true
+}
+
+// SharedFlight returns the response being stored for id, if a fetch for it
+// got that far.
+func (s *Store) SharedFlight(id ID) *Writer {
+	s.fmu.Lock()
+	defer s.fmu.Unlock()
+
+	if f := s.flights[id]; f != nil {
+		return f.w
+	}
+
+	return nil
+}
+
+// ShareFlight lets the requests waiting on the flight read the response from
+// w as it is written.
+func (s *Store) ShareFlight(id ID, f *flight, w *Writer) {
+	s.fmu.Lock()
+	defer s.fmu.Unlock()
+
+	if s.flights[id] == f && f.w == nil {
+		f.w = w
+		close(f.started)
+	}
 }
 
 // EndFlight wakes the requests waiting on the flight. stored tells them the

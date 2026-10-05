@@ -2,6 +2,7 @@ package httpcache
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -72,7 +73,7 @@ func storePut(t testing.TB, s *Store, key string, vary []string, reqHeader http.
 		header: http.Header{"Content-Type": {"application/octet-stream"}, "X-Key": {key}},
 	}
 
-	w, err := s.Create(key, vary, reqHeader, rec, 0)
+	w, err := s.Create(key, vary, reqHeader, rec, 0, -1)
 	if err != nil {
 		return err
 	}
@@ -540,6 +541,150 @@ func TestStoreInactive(t *testing.T) {
 	}
 	if _, hit := storeGet(t, s, "busy", nil); hit == nil {
 		t.Error("the response in use was removed")
+	}
+}
+
+// TestStoreTail reads responses while they are being written.
+func TestStoreTail(t *testing.T) {
+	s := openTestStore(t, t.TempDir(), Limits{})
+	body := bodyFor("tail", 300_000)
+
+	create := func(key string, declared int64) *Writer {
+		now := time.Now()
+		rec := &record{stored: now.UnixMilli(), fresh: now.Add(time.Hour).UnixMilli(), status: http.StatusOK}
+		w, err := s.Create(key, nil, nil, rec, 0, declared)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return w
+	}
+
+	// Readers that start at different moments all get the whole body, and
+	// get its beginning before its end is written.
+	w := create("complete", int64(len(body)))
+	var wg sync.WaitGroup
+	firstRead := make(chan struct{}, 8)
+	read := func() {
+		defer wg.Done()
+		tail, err := w.Tail(context.Background())
+		if err != nil {
+			t.Errorf("opening the tail: %v", err)
+			return
+		}
+		defer tail.Close()
+
+		head := make([]byte, 1000)
+		if _, err := io.ReadFull(tail, head); err != nil {
+			t.Errorf("reading the beginning: %v", err)
+		}
+		firstRead <- struct{}{}
+		rest, err := io.ReadAll(tail)
+		if err != nil || !bytes.Equal(append(head, rest...), body) {
+			t.Errorf("read %d bytes (%v), want the %d of the body", len(head)+len(rest), err, len(body))
+		}
+	}
+
+	wg.Add(1)
+	go read()
+	if _, err := w.Write(body[:100_000]); err != nil {
+		t.Fatal(err)
+	}
+	wg.Add(1)
+	go read()
+	for range 2 {
+		select {
+		case <-firstRead:
+		case <-time.After(5 * time.Second):
+			t.Fatal("a reader got nothing while the response was being written")
+		}
+	}
+
+	// A range of what is announced can be read as soon as it is there.
+	tail, err := w.Tail(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size, err := tail.Seek(0, io.SeekEnd); err != nil || size != int64(len(body)) {
+		t.Errorf("size %d, %v", size, err)
+	}
+	if _, err := tail.Seek(50_000, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	part := make([]byte, 10_000)
+	if _, err := io.ReadFull(tail, part); err != nil || !bytes.Equal(part, body[50_000:60_000]) {
+		t.Errorf("reading a range: %v", err)
+	}
+	tail.Close()
+
+	for off := 100_000; off < len(body); off += 50_000 {
+		if _, err := w.Write(body[off:min(off+50_000, len(body))]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+
+	// Once committed the response is found in the cache, not tailed.
+	if _, err := w.Tail(context.Background()); err == nil {
+		t.Error("tailed a committed response")
+	}
+	if got, _ := storeGet(t, s, "complete", nil); !bytes.Equal(got, body) {
+		t.Error("the committed response differs")
+	}
+
+	// A response that is given up fails its readers instead of leaving them
+	// with a truncated body.
+	w = create("aborted", -1)
+	if _, err := w.Write(body[:1000]); err != nil {
+		t.Fatal(err)
+	}
+	tail, err = w.Tail(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tail.Close()
+	if _, err := io.ReadFull(tail, make([]byte, 1000)); err != nil {
+		t.Fatal(err)
+	}
+	failed := make(chan error)
+	go func() {
+		_, err := tail.Read(make([]byte, 10))
+		failed <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	w.Abort()
+	select {
+	case err := <-failed:
+		if err == nil || err == io.EOF {
+			t.Errorf("reading an aborted response returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the reader of an aborted response was left waiting")
+	}
+
+	// A reader whose client left stops waiting.
+	w = create("canceled", -1)
+	defer w.Abort()
+	ctx, cancel := context.WithCancel(context.Background())
+	tail2, err := w.Tail(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tail2.Close()
+	go func() {
+		_, err := tail2.Read(make([]byte, 10))
+		failed <- err
+	}()
+	cancel()
+	select {
+	case err := <-failed:
+		if err != context.Canceled {
+			t.Errorf("reading with a canceled context returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a canceled reader was left waiting")
 	}
 }
 

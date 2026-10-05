@@ -1,4 +1,4 @@
-module github.com/caddyserver/cache-handler
+module github.com/Meow/cache-handler
 
 go 1.25.1
 

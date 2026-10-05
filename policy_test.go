@@ -209,6 +209,39 @@ func TestNormalizeAcceptEncoding(t *testing.T) {
 	}
 }
 
+func TestSingleRange(t *testing.T) {
+	tests := []struct {
+		header      string
+		first, last int64
+		ok          bool
+	}{
+		{"bytes=0-", 0, 99, true},
+		{"bytes=10-19", 10, 19, true},
+		{"bytes=90-200", 90, 99, true},
+		{"bytes=99-", 99, 99, true},
+		{"bytes=-10", 90, 99, true},
+		{"bytes=-500", 0, 99, true},
+		{"bytes= 5 - 6 ", 5, 6, true},
+		{"", 0, 0, false},
+		{"bytes=100-", 0, 0, false},
+		{"bytes=20-10", 0, 0, false},
+		{"bytes=0-1,5-6", 0, 0, false},
+		{"bytes=-0", 0, 0, false},
+		{"bytes=a-b", 0, 0, false},
+		{"bytes=-", 0, 0, false},
+		{"items=0-5", 0, 0, false},
+	}
+	for _, tt := range tests {
+		first, last, ok := singleRange(tt.header, 100)
+		if ok != tt.ok || (ok && (first != tt.first || last != tt.last)) {
+			t.Errorf("singleRange(%q) = %d, %d, %v; want %d, %d, %v", tt.header, first, last, ok, tt.first, tt.last, tt.ok)
+		}
+	}
+	if _, _, ok := singleRange("bytes=0-", 0); ok {
+		t.Error("a range of an empty body was accepted")
+	}
+}
+
 func TestBuildKey(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "http://example.com/a/b?z=1&a=2", nil)
 	r.Header.Set("X-Tenant", "blue")

@@ -3,9 +3,12 @@ package httpcache
 import (
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,8 +34,12 @@ const (
 	modePass
 	// modeStream: relayed to the client and stored at the same time.
 	modeStream
-	// modeSilent: stored only. The client asked for a range or sent a
-	// precondition, which is answered from the stored response afterwards.
+	// modeRange: stored whole, while the client is relayed the one range it
+	// asked for as it comes by.
+	modeRange
+	// modeSilent: stored only. The client sent a precondition or asked for
+	// something else than one plain range, which is answered from the stored
+	// response afterwards.
 	modeSilent
 	// modeRevalidated: the upstream confirmed the stale response.
 	modeRevalidated
@@ -59,6 +66,9 @@ type fetchWriter struct {
 	stale *Hit
 	// plain tells that the client can be sent the response as it comes.
 	plain bool
+	// rangeHeader is the range the client asked for, when that is all that
+	// keeps the response from being relayed as it comes.
+	rangeHeader string
 	// revalidating tells that the request carries the validators of stale.
 	revalidating bool
 	// forward is the Cache-Status reason the request was forwarded.
@@ -73,9 +83,12 @@ type fetchWriter struct {
 	reason   string
 	w        *Writer
 	declared int64
-	gone     bool
-	finished bool
-	idle     *time.Timer
+	// pos is how much of the body went by. first and last bound the range
+	// relayed in modeRange.
+	pos, first, last int64
+	gone             bool
+	finished         bool
+	idle             *time.Timer
 }
 
 func newFetchWriter(x *exchange, id ID, stale *Hit) *fetchWriter {
@@ -93,6 +106,9 @@ func newFetchWriter(x *exchange, id ID, stale *Hit) *fetchWriter {
 	}
 	if stale != nil {
 		fw.forward = "fwd=stale"
+	}
+	if x.r.Method == http.MethodGet && !conditional(x.r) && x.r.Header.Get("If-Range") == "" {
+		fw.rangeHeader = x.r.Header.Get("Range")
 	}
 
 	return fw
@@ -215,12 +231,17 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 			rec.flags |= flagMustRevalidate
 		}
 
-		w, err := s.Create(x.key, v.vary, x.r.Header, rec, limit)
+		w, err := s.Create(x.key, v.vary, x.r.Header, rec, limit, fw.declared)
 		if err != nil {
 			s.warn("storing a response failed", err)
 			v = reject("STORAGE-ERROR")
 		} else {
 			fw.w = w
+			// From now on the requests waiting for this one are served
+			// from the response as it arrives.
+			if x.flight != nil {
+				s.ShareFlight(x.flightID, x.flight, w)
+			}
 		}
 	}
 
@@ -241,12 +262,14 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 	switch {
 	case v.store && fw.plain:
 		fw.mode = modeStream
-		fw.sendHeaderLocked(fw.forward + "; stored")
+		fw.sendHeaderLocked(http.StatusOK, fw.forward+"; stored")
+	case v.store && fw.relayRangeLocked():
+		fw.mode = modeRange
 	case v.store:
 		fw.mode = modeSilent
 	case fw.plain:
 		fw.mode = modePass
-		fw.sendHeaderLocked(fw.forward + "; detail=" + v.reason)
+		fw.sendHeaderLocked(code, fw.forward+"; detail="+v.reason)
 		if fw.gone {
 			fw.cancel()
 		}
@@ -256,20 +279,88 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 	}
 }
 
-// sendHeaderLocked gives the client response the headers the upstream
-// handlers produced and starts the response.
-func (fw *fetchWriter) sendHeaderLocked(params string) {
+// relayRangeLocked starts a partial response if the client asked for one
+// range of a response whose length is known. The client then gets its bytes
+// as they arrive from the upstream instead of once everything is stored.
+func (fw *fetchWriter) relayRangeLocked() bool {
+	if fw.status != http.StatusOK {
+		return false
+	}
+
+	first, last, ok := singleRange(fw.rangeHeader, fw.declared)
+	if !ok {
+		return false
+	}
+	fw.first, fw.last = first, last
+
+	fw.mergeHeaderLocked()
+	fw.base.Set("Accept-Ranges", "bytes")
+	fw.base.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", first, last, fw.declared))
+	fw.base.Set("Content-Length", strconv.FormatInt(last-first+1, 10))
+	fw.base.Add("Cache-Status", fw.x.status(fw.forward+"; stored"))
+	fw.rw.WriteHeader(http.StatusPartialContent)
+
+	return true
+}
+
+// singleRange parses a Range header asking for one range of a body of the
+// given size and returns its first and last byte. Anything else, valid or
+// not, is reported as not ok and left to the standard library.
+func singleRange(header string, size int64) (first, last int64, ok bool) {
+	spec, isBytes := strings.CutPrefix(header, "bytes=")
+	if !isBytes || size <= 0 || strings.Contains(spec, ",") {
+		return 0, 0, false
+	}
+
+	from, to, _ := strings.Cut(spec, "-")
+	from, to = strings.TrimSpace(from), strings.TrimSpace(to)
+
+	if from == "" {
+		// The last n bytes.
+		n, err := strconv.ParseInt(to, 10, 64)
+		if err != nil || n <= 0 {
+			return 0, 0, false
+		}
+
+		return size - min(n, size), size - 1, true
+	}
+
+	first, err := strconv.ParseInt(from, 10, 64)
+	if err != nil || first < 0 || first >= size {
+		return 0, 0, false
+	}
+	last = size - 1
+	if to != "" {
+		n, err := strconv.ParseInt(to, 10, 64)
+		if err != nil || n < first {
+			return 0, 0, false
+		}
+		last = min(n, last)
+	}
+
+	return first, last, true
+}
+
+// mergeHeaderLocked gives the client response the headers the upstream
+// handlers produced.
+func (fw *fetchWriter) mergeHeaderLocked() {
 	for name := range fw.base {
 		if _, ok := fw.hdr[name]; !ok {
 			delete(fw.base, name)
 		}
 	}
 	for name, values := range fw.hdr {
-		fw.base[name] = values
+		fw.base[name] = slices.Clone(values)
 	}
+}
+
+// sendHeaderLocked starts the client response with what the upstream
+// handlers produced.
+func (fw *fetchWriter) sendHeaderLocked(code int, params string) {
+	fw.mergeHeaderLocked()
 	fw.base.Add("Cache-Status", fw.x.status(params))
 
-	fw.rw.WriteHeader(fw.status)
+	fw.rw.WriteHeader(code)
 }
 
 // Write implements http.ResponseWriter.
@@ -305,6 +396,35 @@ func (fw *fetchWriter) Write(p []byte) (int, error) {
 
 		return len(p), nil
 
+	case modeRange:
+		start := fw.pos
+		fw.pos += int64(len(p))
+
+		if fw.w != nil {
+			if _, err := fw.w.Write(p); err != nil {
+				fw.dropStoreLocked(err)
+			}
+		}
+		// The part of p that falls within the range goes to the client.
+		if from, to := max(start, fw.first), min(fw.pos, fw.last+1); from < to && !fw.gone {
+			if _, err := fw.rw.Write(p[from-start : to-start]); err != nil {
+				fw.gone = true
+			}
+		}
+		if fw.gone || fw.pos > fw.last {
+			// The client has all it will get; only the cache may still
+			// want the rest.
+			if fw.w == nil {
+				fw.cancel()
+				return 0, errClientGone
+			}
+			if fw.gone {
+				fw.armIdleLocked()
+			}
+		}
+
+		return len(p), nil
+
 	case modeSilent:
 		if _, err := fw.w.Write(p); err != nil {
 			fw.dropStoreLocked(err)
@@ -333,7 +453,7 @@ func (fw *fetchWriter) Flush() {
 	fw.mu.Lock()
 	defer fw.mu.Unlock()
 
-	if (fw.mode == modePass || fw.mode == modeStream) && !fw.gone {
+	if (fw.mode == modePass || fw.mode == modeStream || fw.mode == modeRange) && !fw.gone {
 		_ = http.NewResponseController(fw.rw).Flush()
 	}
 }
@@ -368,7 +488,7 @@ func (fw *fetchWriter) clientGone() {
 	switch fw.mode {
 	case modePass, modeAbort:
 		fw.cancel()
-	case modeStream, modeSilent:
+	case modeStream, modeRange, modeSilent:
 		if fw.w == nil {
 			fw.cancel()
 			return

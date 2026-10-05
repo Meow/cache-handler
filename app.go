@@ -1,3 +1,6 @@
+// This file has been modified from the one of caddyserver/cache-handler it
+// replaces, see the NOTICE file.
+
 package httpcache
 
 import (
