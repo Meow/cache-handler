@@ -2164,8 +2164,14 @@ func (s *Store) loadFile(id ID, gen uint64, front bool) {
 		return
 	}
 
-	var size int64
-	rec, err := statRecord(f)
+	var (
+		size int64
+		rec  *record
+	)
+	info, err := f.Stat()
+	if err == nil {
+		rec, err = readRecord(f, info.Size())
+	}
 	if err == nil {
 		size = rec.bodyOff + rec.bodyLen
 		if makeID(rec.key) != id {
@@ -2189,6 +2195,18 @@ func (s *Store) loadFile(id ID, gen uint64, front bool) {
 		size:   (size + diskBlock - 1) / diskBlock * diskBlock,
 		cost:   entryOverhead + int64(len(rec.key)+len(rec.vary)),
 		atime:  time.Now().Unix(),
+	}
+
+	// The file was read with nothing held: it may have been deleted since,
+	// purged or evicted, and would be indexed without being there. Deleting
+	// it takes the stripe of its ID, under which the name is checked to
+	// still be that of the file that was read.
+	stripe := &s.stripes[id[0]]
+	stripe.Lock()
+	defer stripe.Unlock()
+
+	if fi, err := os.Stat(s.path(id)); err != nil || !os.SameFile(fi, info) {
+		return
 	}
 
 	s.mu.Lock()
@@ -2245,17 +2263,34 @@ func (s *Store) expireInactive() {
 
 // Purge removes the response stored for a key, in all its variants.
 func (s *Store) Purge(key string) bool {
-	id := makeID(key)
+	return s.purge(makeID(key), nil)
+}
+
+// purge removes the entry of id together with its file and reports whether
+// there was one. When only is given, nothing but that entry is removed: a
+// response stored under the ID since is kept.
+//
+// The stripe of the ID is held from the entry leaving the index to its file
+// being deleted. While the store loads, a file read in between would be
+// indexed again, see loadFile, and the response would outlive its purge.
+func (s *Store) purge(id ID, only *entry) bool {
+	stripe := &s.stripes[id[0]]
+	stripe.Lock()
+	defer stripe.Unlock()
 
 	s.mu.Lock()
 	e := s.index[id]
+	if only != nil && e != only {
+		s.mu.Unlock()
+		return false
+	}
 	if e != nil {
 		s.removeLocked(e)
 	}
 	s.mu.Unlock()
 
 	// Without the index entry the file may still be there, not loaded yet.
-	s.unlink([]ID{id})
+	_ = os.Remove(s.path(id))
 
 	return e != nil
 }
@@ -2278,19 +2313,14 @@ func (s *Store) PurgeMatch(match func(key string) bool) int {
 		}
 	}
 
-	victims := make([]ID, 0, len(matched))
-	s.mu.Lock()
+	purged := 0
 	for _, e := range matched {
-		if s.index[e.id] == e {
-			s.removeLocked(e)
-			victims = append(victims, e.id)
+		if s.purge(e.id, e) {
+			purged++
 		}
 	}
-	s.mu.Unlock()
 
-	s.unlink(victims)
-
-	return len(victims)
+	return purged
 }
 
 // PurgeAll empties the cache and returns how many entries it held.

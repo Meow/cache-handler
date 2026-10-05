@@ -817,6 +817,59 @@ func TestStorePurge(t *testing.T) {
 	}
 }
 
+// TestStorePurgeWhileLoading checks that a response purged while the store
+// indexes its files stays purged: the file may be read for the index at
+// that very moment, by the loader or by a lookup that does not wait for it.
+func TestStorePurgeWhileLoading(t *testing.T) {
+	s := openTestStore(t, t.TempDir(), Limits{})
+	waitLoaded(t, s)
+
+	const key = "GET-purged"
+	id := makeID(key)
+	s.mu.Lock()
+	gen := s.gen
+	s.mu.Unlock()
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				s.loadFile(id, gen, false)
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-done
+	}()
+
+	for round := range 2000 {
+		if err := storePut(t, s, key, nil, nil, []byte(key)); err != nil {
+			t.Fatal(err)
+		}
+
+		if round%2 == 0 {
+			if !s.Purge(key) {
+				t.Fatalf("round %d: the response was not there to purge", round)
+			}
+		} else if n := s.PurgeMatch(func(k string) bool { return k == key }); n != 1 {
+			t.Fatalf("round %d: purged %d responses by match, want 1", round, n)
+		}
+
+		if s.Purge(key) {
+			t.Fatalf("round %d: the response was indexed again after its purge", round)
+		}
+		if _, err := os.Stat(s.path(id)); err == nil {
+			t.Fatalf("round %d: the file of the response outlived its purge", round)
+		}
+	}
+}
+
 func TestStoreInactive(t *testing.T) {
 	s := openTestStore(t, t.TempDir(), Limits{Inactive: 2 * time.Second})
 
