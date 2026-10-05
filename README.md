@@ -28,7 +28,7 @@ It works the way nginx's `proxy_cache` does: responses are stored as files in a 
 | Response bodies | Streamed through the cache file, a few tens of kilobytes of buffer per request whatever the size. | Buffered whole in memory before the client gets the first byte, and again on every hit. | Streamed, buffered to a temporary file. |
 | Large files | Fine: bounded by disk only. | Bounded by RAM, times the number of concurrent requests. | Fine. |
 | Concurrent requests for a missing response | One upstream request; the others are served from it as it arrives, whatever the speed of the first client. | One upstream request; the others get the response once it is complete. | With `proxy_cache_lock`, the others wait for the complete response, or for a timeout. |
-| `Range` request for a missing response | Streamed as the response arrives, while the whole response is stored. | Served once the whole response is buffered. | The whole response is fetched; ranges can be fetched and cached individually with the `slice` module. |
+| `Range` request for a missing response | Streamed as the response arrives, while the whole response is stored. With `slice`, only the part of the response the range is in is fetched and stored. | Served once the whole response is buffered. | The whole response is fetched; ranges can be fetched and cached individually with the `slice` module. |
 | Client disconnects during a download | The download continues and is stored, if its length is known. | The download is aborted, nothing is stored. | The download continues and is stored. |
 | Expired responses | Revalidated with a conditional request; optionally served stale meanwhile or on error. | Revalidated; optionally served stale. | Refetched, or revalidated with `proxy_cache_revalidate`; optionally served stale. |
 | Restart | The cache is kept, and usable at once. | Depends on the storage. | The cache is kept. |
@@ -43,8 +43,9 @@ It works the way nginx's `proxy_cache` does: responses are stored as files in a 
 
 Known limits of this module, besides what the notice above lists:
 
-* A request for a range far into a response that is not cached yet waits until the download reaches it. Ranges are not fetched from the upstream individually (what nginx's `slice` module does), so a large file is always downloaded from its beginning.
-* The request that triggers a download is held open until the download ends, even if it asked for a range that ends earlier. Its bytes are sent as soon as they arrive; requests arriving meanwhile are not affected.
+* Unless `slice` is set, a large file is always downloaded from its beginning: a request for a range far into a response that is not cached yet waits until the download reaches it. See [Slices](#slices).
+* The request that triggers a download is held open until the download ends, even if it asked for a range that ends earlier. Its bytes are sent as soon as they arrive; requests arriving meanwhile are not affected. With `slice`, what it waits for is the end of the slice it was reading.
+* Slices are fetched one after the other, as the client reads them, never ahead of it.
 * Requests are only served from a download in progress when the response announces its length. Others wait for the complete response.
 * The cache directory belongs to one Caddy process.
 * Linux, macOS and the BSDs only, see [Platform notes](#platform-notes).
@@ -55,6 +56,7 @@ Known limits of this module, besides what the notice above lists:
 * Responses are streamed to the client and to the cache at the same time. A body is never buffered whole in memory, whatever its size.
 * Requests arriving while a response is being downloaded are served from it as it arrives: one upstream request, and nobody waits for the end of the download to get its beginning.
 * A `Range` request for a response that is not cached is streamed as the response arrives, while the whole response is stored.
+* Optionally, large responses are fetched and stored in slices (`slice`), like nginx's `slice` module does: seeking into a video that is not cached fetches what is watched, not everything before it.
 * A response keeps being stored when the client that asked for it disconnects.
 * The cache survives restarts and crashes: files are written atomically and the index is rebuilt from them in the background.
 * Optionally, a response is only written to disk once it is requested again (`min_uses`), and served from memory until then: the many responses that are requested once and never again cost no disk write.
@@ -103,6 +105,7 @@ cache [<matcher>] {
     max_file_count 1000000
     inactive 30d
     min_uses 2
+    slice 16Mi
 
     ttl 24h
     stale 1h
@@ -138,13 +141,14 @@ cache [<matcher>] {
 | `max_file_count` | none | Number of files the cache may hold. The least recently used responses are removed to stay under it. Use it when the filesystem runs out of inodes before it runs out of space, which many small responses can do. |
 | `inactive` | none | Removes the responses that were not requested for this long, fresh or not. |
 | `min_uses` | `1` | Number of requests after which a response is written to disk. With `2` or more, a response is kept in memory only until it has been requested that many times, and is lost if Caddy stops before. See [Requested once](#requested-once). Not available with `max_memory off`. |
+| `slice` | `off` | Size of the ranges a response is asked of the upstream in, each being stored by itself, so that a request for a part of a large response fetches that part only. See [Slices](#slices). The upstream has to support `Range` requests. At least `4Ki`, at most half of `max_size`. |
 | `ttl` | `120s` | How long a response is fresh when the upstream does not say (no `Cache-Control: max-age` / `s-maxage`, no `Expires`). |
 | `stale` | `0` | How long past its freshness a response may still be served while it is being updated, or when the upstream fails. `Cache-Control: stale-while-revalidate` and `stale-if-error` in a response override it. |
 | `lock_timeout` | `5s` | How long a request waits for the upstream to start answering another request for the same response, before going to the upstream itself. |
 | `mode` | | Which `Cache-Control` directives are honoured. By default those of the responses, but not those of the requests: a client cannot force its way past the cache. `strict` also honours the requests' (`no-cache`, `no-store`, `max-age`, `min-fresh`, `max-stale`, `only-if-cached`). `bypass_response` ignores the responses' and caches everything for `ttl`. `bypass` and `bypass_request` are accepted as aliases of `bypass_response` and of the default. |
 | `cache_name` | `Caddy` | Name of the cache in the `Cache-Status` header. |
 | `default_cache_control` | | `Cache-Control` given to the responses that have none. |
-| `max_cacheable_body_bytes` | half of `max_size` | Responses with a larger body are relayed without being stored. |
+| `max_cacheable_body_bytes` | half of `max_size` | Responses with a larger body are relayed without being stored. For a response stored in slices, this is its whole size, and there is no default. |
 | `allowed_additional_status_codes` | | Status codes to cache for `ttl`, besides 200, 203, 204, 300, 301 and 308. |
 | `key` | | Tunes the cache key, see below. |
 | `regex` `exclude` | | Requests whose URI matches are not cached. |
@@ -181,7 +185,7 @@ What is in memory only does not survive Caddy stopping: after a restart, a respo
 
 `max_size` covers the cache files and the downloads in progress. When a response does not fit, the least recently used ones are deleted to make room. A response larger than half of `max_size` (or than `max_cacheable_body_bytes`) is not stored.
 
-`max_file_count` counts one file per response stored on disk, one more per URL whose responses vary (it records which request headers select them), and one per download in progress. A download that would exceed it evicts the least recently used response first. Besides these files the cache directory holds up to 258 directories and two small files of its own, which are not counted.
+`max_file_count` counts one file per response stored on disk, one more per URL whose responses vary (it records which request headers select them), and one per download in progress. A response stored in slices is one file per slice, and one more for the URL. A download that would exceed it evicts the least recently used response first. Besides these files the cache directory holds up to 258 directories and two small files of its own, which are not counted.
 
 `max_memory` covers the index (about 200 bytes plus the key per file) and the bodies and headers kept in memory. The bodies live outside the Go heap, in memory mapped for that purpose and returned to the system when the budget shrinks, so they do not weigh on the garbage collector. When the index alone approaches the budget, which takes millions of files, the least recently used files are removed. With `min_uses`, the responses that are in memory only, headers included, take at most half of the budget, and the body of one of them at most an eighth; the copies of what is on disk make room for them.
 
@@ -195,11 +199,35 @@ Other requests for the same response do not go to the upstream. They wait, up to
 
 When the response turns out not to be cacheable, the waiting requests are released at once and, for a minute, requests for it are not made to wait at all. During that minute, requests with a range or a precondition go straight to the upstream as they are.
 
-The upstream is always asked for the whole response, whatever the client asked for. When the request that triggers the download asks for a range, it is sent that range as the download reaches it. When it carries a precondition (`If-None-Match`…) or asks for several ranges, the response is stored first and the request answered from it.
+Unless [slices](#slices) are used, the upstream is always asked for the whole response, whatever the client asked for. When the request that triggers the download asks for a range, it is sent that range as the download reaches it. When it carries a precondition (`If-None-Match`…) or asks for several ranges, the response is stored first and the request answered from it.
 
 If the client disconnects, the download goes on for the benefit of the next requests, provided the response announced its length and for as long as the upstream keeps sending. A response of unknown length is given up when the last client listening to it leaves.
 
 If a download fails midway, nothing is stored, and the requests that were being served from it are cut short rather than given a truncated response as if it were complete. If a response can no longer be stored while it downloads, for lack of space for instance, the client that triggered it still gets all of it.
+
+### Slices
+
+By default the upstream is asked for whole responses, whatever the client asked for. That is the best use of a cache, one request and one file per response, until someone jumps to the middle of a two hour video nobody watched before: the download starts at the first byte, and the viewer waits for it to get there.
+
+With `slice 16Mi`, the upstream is asked for a response 16MiB at a time, with `Range` requests, and each of these slices is stored by itself. A request is answered from the slices that hold what it asks for, taken from the cache or fetched as the client gets to them. A request for a range fetches the slices the range is in and no other, and a response nobody reads to its end is not downloaded to its end. This is what nginx's `slice` module does.
+
+The client sees none of it. It gets the status, the headers and the length of the whole response, or the range it asked for, and `Range`, `If-Range`, the preconditions and `HEAD` requests are answered as they are without slices.
+
+What the previous section says of a response holds for each slice: one request to the upstream however many clients want the slice, all of them served while it downloads, and a download that goes on when its client leaves. That last one now ends with the slice: the following ones are not fetched for a client that is gone. `min_uses` counts the requests for each slice, and each slice expires and is revalidated by itself.
+
+Not everything is stored in slices:
+
+* A response that fits in its first slice is stored whole, exactly as it is without `slice`. The many small files of a site cost nothing more than a `Range` header in the request made for them.
+* So is the response of an upstream that ignores `Range` and sends everything, and any response that is not a `206`: an error, a redirect.
+* So is a response that something between the cache and the upstream transforms, the way `encode` compresses it: the ranges of what the upstream sent are not ranges of what the client gets. The cache notices when the first slice arrives without its length, and asks again for the whole response: the first request for such a response costs the upstream two. The variant of the response that is left uncompressed, for the clients that do not accept compression, is stored in slices beside it.
+
+The slices of a response have to be parts of the same thing. They are compared by `ETag`, `Last-Modified` and total size with the first one sent to the client. When a file changes on the upstream while the cache holds slices of it, a response that would be made of both versions is cut short instead, and every slice stored for the URL is discarded, so that the next request gets the new version. Give the responses an `ETag` or a `Last-Modified`: without them, two versions of the same size cannot be told apart.
+
+Choosing the size: a slice is one request to the upstream and one file, which counts towards `max_file_count`. Slices are fetched one after the other as the client reads, so small ones mean many round trips to the upstream. Large ones mean that more is fetched before the byte a range starts at, and after the last byte a client that left was interested in. Between `1Mi` and `16Mi` suits most uses. Changing the size makes the slices already stored useless: they are not served anymore, and leave the cache as the space is needed.
+
+A response stored in slices can be larger than half of `max_size`, and larger than the cache: its least recently read slices make room for the next ones. `max_cacheable_body_bytes`, when set, applies to its whole size.
+
+The size of a response is not kept anywhere but in its slices. A request for a range that starts past the end of the response is therefore sent to the upstream, which answers that it has no such range, before the client is told so.
 
 ### Expiry
 
@@ -270,6 +298,8 @@ Responses with a `Vary` header are stored once per combination of the request he
 
 The key follows as `; key=...` unless it is hidden.
 
+For a response stored in slices, the header tells how the first slice sent to the client was come by. The following ones may have been fetched from the upstream when it says `hit`, and the other way around.
+
 ## Admin API
 
 The cache is observed and purged through [Caddy's admin endpoint](https://caddyserver.com/docs/api), `localhost:2019` by default.
@@ -280,7 +310,8 @@ The cache is observed and purged through [Caddy's admin endpoint](https://caddys
 # written to disk at a later request, dropped those that never were.
 curl localhost:2019/cache/stats
 
-# Remove the response stored for a key, as shown in Cache-Status
+# Remove the response stored for a key, as shown in Cache-Status, with all its
+# variants and slices
 curl -X POST 'localhost:2019/cache/purge?key=GET-https-example.com-/logo.png'
 
 # Remove the responses whose key starts with a prefix, or matches a regular expression
@@ -306,6 +337,7 @@ With several caches, add `path=<directory>` to purge one of them only.
 | `proxy_cache_valid 6h` | `ttl 6h`. Add `allowed_additional_status_codes 302` to cover the same statuses. |
 | `proxy_cache_key $request_filename` | `key { template ... }`, see [Cache key](#cache-key). |
 | `proxy_cache_lock on` | Always on, and the waiting requests are served from the download in progress instead of after it. `proxy_cache_lock_timeout` is `lock_timeout`. |
+| `slice 1m`, `proxy_set_header Range $slice_range`, `$slice_range` in `proxy_cache_key`, `proxy_cache_valid 206` | `slice 1m`, and nothing else. Responses that fit in one slice are stored whole, and slices of different versions of a file are never mixed, see [Slices](#slices). |
 | `proxy_cache_revalidate on` | Always on. |
 | `proxy_cache_use_stale updating error timeout http_5xx` | `stale <duration>` |
 | `proxy_cache_background_update on` | With `stale`, one request waits for the update and the others are served stale meanwhile. |

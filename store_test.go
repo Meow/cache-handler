@@ -741,6 +741,39 @@ func TestStoreVary(t *testing.T) {
 	}
 }
 
+// TestStoreVaryNamesAreKept checks that a response listing fewer names than
+// the ones stored before it joins them instead of replacing them all.
+func TestStoreVaryNamesAreKept(t *testing.T) {
+	s := openTestStore(t, t.TempDir(), Limits{})
+
+	gzip := http.Header{"Accept-Encoding": {"gzip"}, "Accept-Language": {"fr"}}
+	plain := http.Header{"Accept-Language": {"fr"}}
+
+	if err := storePut(t, s, "key", []string{"accept-encoding", "accept-language"}, gzip, []byte("compressed")); err != nil {
+		t.Fatal(err)
+	}
+	if err := storePut(t, s, "key", []string{"accept-language"}, plain, []byte("plain")); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := storeGet(t, s, "key", gzip); string(got) != "compressed" {
+		t.Errorf("got %q for the first response once the second was stored", got)
+	}
+	if got, _ := storeGet(t, s, "key", plain); string(got) != "plain" {
+		t.Errorf("got %q for the second response", got)
+	}
+
+	// A name that is not listed yet is another matter: what was stored
+	// without it cannot be told apart by it.
+	if err := storePut(t, s, "key", []string{"accept-language", "origin"}, plain, []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []http.Header{gzip, plain} {
+		if got, _ := storeGet(t, s, "key", h); string(got) != "new" {
+			t.Errorf("got %q once the names were replaced", got)
+		}
+	}
+}
+
 func TestStorePurge(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir, Limits{})
@@ -1586,6 +1619,29 @@ func TestStoreFlights(t *testing.T) {
 
 	if _, leader := s.BeginFlight(id); !leader {
 		t.Error("the next request should lead again")
+	}
+
+	// A response that is stored under another ID than the one it was
+	// fetched under, because it varies, is waited for under both.
+	fl, _ := s.BeginFlight(id)
+	w, err := s.Create("key", []string{"accept-language"}, http.Header{"Accept-Language": {"fr"}}, &record{status: http.StatusOK}, 0, 7, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Abort()
+	if w.id == id {
+		t.Fatal("a variant is stored under the ID of its key")
+	}
+	s.ShareFlight(id, fl, w)
+	if joined, leader := s.BeginFlight(w.id); leader || joined != fl {
+		t.Error("a request for the variant being fetched began a fetch of its own")
+	}
+	if s.SharedFlight(w.id) != w {
+		t.Error("the variant being fetched is not found under its own ID")
+	}
+	s.EndFlight(id, fl, false)
+	if _, leader := s.BeginFlight(w.id); !leader {
+		t.Error("the flight outlived its end under the ID of the variant")
 	}
 
 	if s.Uncacheable(id) {

@@ -388,6 +388,24 @@ func (s *Store) warn(msg string, err error) {
 // It returns the ID to coordinate a fetch on and, when there is a response,
 // a Hit the caller must close.
 func (s *Store) Lookup(key string, reqHeader http.Header) (ID, *Hit) {
+	id, hit := s.find(key, reqHeader)
+	s.count(hit)
+
+	return id, hit
+}
+
+// count records the outcome of a lookup in the statistics.
+func (s *Store) count(hit *Hit) {
+	if hit != nil {
+		s.hits.Add(1)
+	} else {
+		s.misses.Add(1)
+	}
+}
+
+// find is Lookup without the statistics, for the caller that looks in more
+// than one place for one request and counts the outcome itself.
+func (s *Store) find(key string, reqHeader http.Header) (ID, *Hit) {
 	full := key
 	id := makeID(key)
 
@@ -422,11 +440,9 @@ func (s *Store) Lookup(key string, reqHeader http.Header) (ID, *Hit) {
 			hit.Close()
 			break
 		}
-		s.hits.Add(1)
 
 		return id, hit
 	}
-	s.misses.Add(1)
 
 	return id, nil
 }
@@ -713,13 +729,20 @@ func (s *Store) Create(key string, vary []string, reqHeader http.Header, rec *re
 // names and returns its vary specification. A marker created for responses
 // that are not written to disk at once (minUses) is not either: it is when
 // the first of them is, see saveMarker.
+//
+// A marker that lists these names and others is kept as it is. A response
+// stored under more names than it varies on is only found by fewer requests
+// than it could answer, whereas replacing the marker loses every response
+// stored under it: an upstream that only names a header when the response
+// depends on its value, as one that compresses for those who accept it
+// does, would otherwise have each kind of response evict the other.
 func (s *Store) ensureMarker(key, names string, minUses int) (string, error) {
 	s.markerMu.Lock()
 	defer s.markerMu.Unlock()
 
 	if e, hit := s.pin(makeID(key)); e != nil {
 		hit.Close()
-		if _, current, _ := strings.Cut(e.vary, "\x00"); e.marker && current == names {
+		if _, current, _ := strings.Cut(e.vary, "\x00"); e.marker && listsAll(current, names) {
 			return e.vary, nil
 		}
 	}
@@ -739,6 +762,23 @@ func (s *Store) ensureMarker(key, names string, minUses int) (string, error) {
 	}
 
 	return spec, w.Commit()
+}
+
+// listsAll tells whether every name of the comma separated list names is in
+// the list current.
+func listsAll(current, names string) bool {
+	if current == names {
+		return true
+	}
+
+	listed := strings.Split(current, ",")
+	for name := range strings.SplitSeq(names, ",") {
+		if !slices.Contains(listed, name) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // saveMarker writes to disk the marker through which the variant stored under
@@ -2361,6 +2401,10 @@ type flight struct {
 	// be read by the waiters.
 	started chan struct{}
 	w       *Writer
+	// alias is the ID the response is stored under when that is not the one
+	// the flight was begun for, which aliased tells.
+	alias   ID
+	aliased bool
 }
 
 // BeginFlight registers a fetch for id. The caller that gets leader set must
@@ -2393,12 +2437,21 @@ func (s *Store) SharedFlight(id ID) *Writer {
 
 // ShareFlight lets the requests waiting on the flight read the response from
 // w as it is written.
+//
+// A response that turns out to vary is stored under another ID than the one
+// it was looked for, and fetched, under: there was no marker to tell. The
+// requests for it that come from now on find the marker, and are to find
+// the flight where it leads them rather than begin one of their own.
 func (s *Store) ShareFlight(id ID, f *flight, w *Writer) {
 	s.fmu.Lock()
 	defer s.fmu.Unlock()
 
 	if s.flights[id] == f && f.w == nil {
 		f.w = w
+		if w.id != id && s.flights[w.id] == nil {
+			s.flights[w.id] = f
+			f.alias, f.aliased = w.id, true
+		}
 		close(f.started)
 	}
 }
@@ -2413,6 +2466,9 @@ func (s *Store) EndFlight(id ID, f *flight, stored bool) {
 		return
 	}
 	delete(s.flights, id)
+	if f.aliased && s.flights[f.alias] == f {
+		delete(s.flights, f.alias)
+	}
 
 	f.stored = stored
 	close(f.done)

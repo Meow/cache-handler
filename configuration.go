@@ -29,6 +29,9 @@ const (
 	// maxMinUses is the largest number of requests a response can be made
 	// to wait for before it is written to disk.
 	maxMinUses = 1000
+	// minSlice is the smallest slice accepted: each slice is a file and a
+	// request to the upstream.
+	minSlice = 4 << 10
 )
 
 // KeyOptions tunes how the cache key of a request is built. By default the
@@ -86,6 +89,11 @@ type Options struct {
 	// there by the responses that follow if it is not requested again.
 	// Default: 1, every response is written to disk as it is received.
 	MinUses int `json:"min_uses,omitempty"`
+	// Size of the ranges the responses are asked of the upstream in, each
+	// range being stored by itself: a request for the middle of a large
+	// response fetches what it reads and nothing else. The upstream has to
+	// support range requests. Default: off, responses are fetched whole.
+	Slice Size `json:"slice,omitempty"`
 	// How long a response is fresh when the upstream does not say.
 	// Default: 120s.
 	TTL caddy.Duration `json:"ttl,omitempty"`
@@ -133,6 +141,9 @@ func (o Options) inherit(parent Options) Options {
 	if o.MinUses == 0 {
 		o.MinUses = parent.MinUses
 	}
+	if o.Slice == 0 {
+		o.Slice = parent.Slice
+	}
 	if o.TTL == 0 {
 		o.TTL = parent.TTL
 	}
@@ -179,6 +190,7 @@ type config struct {
 	defaultCC      string
 	maxBody        int64
 	minUses        int
+	slice          int64
 	extraStatus    map[int]bool
 	key            KeyOptions
 	keyHeaders     []string
@@ -240,6 +252,18 @@ func (o Options) resolve() (*config, error) {
 		return nil, fmt.Errorf("min_uses must be between 1 and %d", maxMinUses)
 	case c.minUses > 1 && c.limits.MaxMemory == 0:
 		return nil, fmt.Errorf("min_uses keeps the responses in memory until they are requested again, which max_memory off does not allow")
+	}
+
+	switch slice := int64(o.Slice); {
+	case slice <= 0:
+	case slice < minSlice:
+		return nil, fmt.Errorf("slice must be at least %s, or off", Size(minSlice))
+	case slice > c.limits.MaxSize/2:
+		// A slice is stored like a response, and is no more allowed to take
+		// most of the cache.
+		return nil, fmt.Errorf("slice cannot be larger than half of max_size")
+	default:
+		c.slice = slice
 	}
 
 	if c.ttl < 0 || c.stale < 0 || c.lockTimeout < 0 || c.limits.Inactive < 0 || c.maxBody < 0 {
@@ -368,6 +392,14 @@ func parseOptions(d *caddyfile.Dispenser, o *Options) error {
 					return d.Errf("invalid min_uses %q: expected a positive number of requests", arg)
 				}
 				o.MinUses = uses
+			case "slice":
+				if err := parseSizeArg(d, &o.Slice); err != nil {
+					return err
+				}
+				// An unset size is zero, so zero is spelled off.
+				if o.Slice == 0 {
+					o.Slice = SizeOff
+				}
 			case "max_cacheable_body_bytes":
 				if err := parseSizeArg(d, &o.MaxBodyBytes); err != nil {
 					return err

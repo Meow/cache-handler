@@ -14,7 +14,8 @@ Changes made to the original work, starting from its 0.17.0 release:
     (https://github.com/darkweak/souin, MIT License), and the storage
     backends of https://github.com/darkweak/storages were removed and
     replaced by an engine and a storage written for this project (store.go,
-    arena.go, diskfmt.go, fetch.go, policy.go, size.go, platform_*.go).
+    arena.go, diskfmt.go, fetch.go, slice.go, policy.go, size.go,
+    platform_*.go).
   * admin.go, app.go, configuration.go and httpcache.go were rewritten for
     the new engine. cleaner.go and dispatch.go were removed.
   * The configuration options that belonged to Souin or to its storages were

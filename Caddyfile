@@ -110,6 +110,15 @@
 		respond "Nothing here" 404
 	}
 
+	# Fetched and stored 1MiB at a time: a request for the middle of a large
+	# file does not wait for its beginning.
+	route /media/* {
+		cache {
+			slice 1Mi
+		}
+		reverse_proxy 127.0.0.1:9000
+	}
+
 	route /proxy/* {
 		cache {
 			regex {

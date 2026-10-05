@@ -14,12 +14,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
 )
 
 // clientGoneGrace is how long a fetch whose client left may go without
 // receiving anything from the upstream before it is given up.
 var clientGoneGrace = 30 * time.Second
+
+// routeGroupCtxKey is where Caddy's router keeps, in the context of a
+// request, the groups of routes of which one was taken already: those of the
+// rewrite and handle directives, of which only the first that matches
+// applies. Caddy does not export it.
+var routeGroupCtxKey = caddy.CtxKey("route_group")
 
 var (
 	errFetchAborted = errors.New("cache: fetch aborted")
@@ -49,6 +56,10 @@ const (
 	// modeAbort: the response is of no use to the cache and cannot be
 	// relayed as is, so the client's own request is sent to the upstream.
 	modeAbort
+	// modeSlice: stored as one slice of a response. The request it was
+	// fetched for reads it from the cache, like the slices before and after
+	// it, see slice.go.
+	modeSlice
 )
 
 // fetchWriter is the ResponseWriter given to the upstream handlers when the
@@ -128,6 +139,11 @@ func newFetchWriter(x *exchange, id ID, stale *Hit) *fetchWriter {
 	if stale != nil {
 		fw.forward = "fwd=stale"
 	}
+	if x.slice != nil {
+		// Whether the response can be stored is the same for all its
+		// slices, and is remembered for all of them at once.
+		fw.id = x.slice.whole
+	}
 	if x.r.Method == http.MethodGet && !conditional(x.r) && x.r.Header.Get("If-Range") == "" {
 		fw.rangeHeader = x.r.Header.Get("Range")
 	}
@@ -145,21 +161,40 @@ func plainRequest(r *http.Request) bool {
 // a stored response must not depend on the range or the preconditions of the
 // client that happened to trigger the fetch. The validators of the stale
 // response are sent instead, so the upstream can answer that it is still
-// current.
+// current. When responses are stored in slices, the request is for the one
+// slice the fetch is for.
 //
 // The returned function puts the request back as it was received, undoing
 // as well what the upstream handlers changed in it, a rewrite for instance:
-// the request may have to be handled a second time.
+// the request may have to be handled a second time. That includes what the
+// router noted of the routes it took: left there, a rewrite that was undone
+// would not be done again.
 func (fw *fetchWriter) prepareRequest(r *http.Request) (restore func()) {
+	// The request reading slices may be answering the client meanwhile,
+	// which is not to happen while the request changes, see sliceWriter.
+	sf := fw.x.slice
+	if sf != nil {
+		sf.request.Lock()
+		defer sf.request.Unlock()
+	}
+
 	header := r.Header.Clone()
 	url := *r.URL
+	groups, _ := r.Context().Value(routeGroupCtxKey).(map[string]struct{})
+	taken := maps.Clone(groups)
 	fw.reqHeader = header
 
 	for _, name := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since", "If-Match", "If-Unmodified-Since"} {
 		delete(r.Header, name)
 	}
 
-	if fw.stale != nil && fw.stale.rec.status == http.StatusOK {
+	if sf != nil {
+		r.Header.Set("Range", "bytes="+sliceRange(sf.first, sf.last))
+	}
+
+	// A stored 206 is a slice, which the upstream confirms like a whole
+	// response.
+	if fw.stale != nil && (fw.stale.rec.status == http.StatusOK || fw.stale.rec.status == http.StatusPartialContent) {
 		if etag := fw.stale.rec.header.Get("Etag"); etag != "" {
 			r.Header.Set("If-None-Match", etag)
 			fw.revalidating = true
@@ -171,9 +206,18 @@ func (fw *fetchWriter) prepareRequest(r *http.Request) (restore func()) {
 	}
 
 	return func() {
+		if sf != nil {
+			sf.request.Lock()
+			defer sf.request.Unlock()
+		}
+
 		clear(r.Header)
 		maps.Copy(r.Header, header)
 		*r.URL = url
+		if groups != nil {
+			clear(groups)
+			maps.Copy(groups, taken)
+		}
 	}
 }
 
@@ -217,6 +261,15 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 		return
 	}
 
+	if sf := x.slice; sf != nil {
+		if fw.sliceHeaderLocked(sf, now) {
+			return
+		}
+		// Not a slice: the response is handled as the answer to a request
+		// for all of it, which it is.
+		code = fw.status
+	}
+
 	// The decision is taken on what the upstream handlers answered, not on
 	// what the handlers in front of the cache add to every response.
 	own := ownHeaders(fw.base, fw.hdr)
@@ -226,6 +279,11 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 	}
 
 	v := c.evaluate(x.r, code, own, now)
+	if c.slice > 0 && len(v.vary) > 0 {
+		// Where responses are stored in slices, the variants of one that is
+		// stored whole are found beside the slices of those that are not.
+		v.vary = withSliceSelector(v.vary)
+	}
 	// uncacheable tells that the response itself cannot be stored, as
 	// opposed to this one attempt at storing it.
 	uncacheable := !v.store
@@ -250,25 +308,7 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 	}
 
 	if v.store {
-		stored := headerDiff(fw.base, fw.hdr)
-		if stored.Get("Date") == "" {
-			stored.Set("Date", now.UTC().Format(http.TimeFormat))
-		}
-
-		rec := &record{
-			stored: now.UnixMilli(),
-			fresh:  now.Add(v.lifetime).UnixMilli(),
-			swr:    seconds(v.swr),
-			sie:    seconds(v.sie),
-			age:    seconds(v.age),
-			status: code,
-			header: stored,
-		}
-		if v.mustRevalidate {
-			rec.flags |= flagMustRevalidate
-		}
-
-		w, err := s.Create(x.key, v.vary, fw.reqHeader, rec, limit, fw.declared, c.minUses)
+		w, err := s.Create(x.key, v.vary, fw.reqHeader, fw.recordLocked(v, now), limit, fw.declared, c.minUses)
 		if err != nil {
 			s.warn("storing a response failed", err)
 			v = reject("STORAGE-ERROR")
@@ -324,6 +364,30 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 		fw.selfAborted = true
 		fw.cancel()
 	}
+}
+
+// recordLocked describes the response as it is to be stored, for as long as
+// the verdict lets it.
+func (fw *fetchWriter) recordLocked(v verdict, now time.Time) *record {
+	stored := headerDiff(fw.base, fw.hdr)
+	if stored.Get("Date") == "" {
+		stored.Set("Date", now.UTC().Format(http.TimeFormat))
+	}
+
+	rec := &record{
+		stored: now.UnixMilli(),
+		fresh:  now.Add(v.lifetime).UnixMilli(),
+		swr:    seconds(v.swr),
+		sie:    seconds(v.sie),
+		age:    seconds(v.age),
+		status: fw.status,
+		header: stored,
+	}
+	if v.mustRevalidate {
+		rec.flags |= flagMustRevalidate
+	}
+
+	return rec
 }
 
 // relayRangeLocked starts a partial response if the client asked for one
@@ -526,6 +590,24 @@ func (fw *fetchWriter) Write(p []byte) (int, error) {
 
 		return len(p), nil
 
+	case modeSlice:
+		if fw.w == nil {
+			return 0, errFetchAborted
+		}
+		if _, err := fw.w.Write(p); err != nil {
+			// Those reading the slice are cut short: it is from the cache
+			// that they get it, the request this fetch is for included.
+			fw.dropStoreLocked(err)
+			fw.cancel()
+
+			return 0, errFetchAborted
+		}
+		if fw.gone {
+			fw.armIdleLocked()
+		}
+
+		return len(p), nil
+
 	case modeAbort:
 		return 0, errFetchAborted
 
@@ -590,7 +672,7 @@ func (fw *fetchWriter) clientGone() {
 	switch fw.mode {
 	case modePass, modeAbort:
 		fw.cancel()
-	case modeRelay, modeSilent:
+	case modeRelay, modeSilent, modeSlice:
 		// The download goes on for the requests to come, provided it is
 		// known to end.
 		if fw.w == nil || fw.declared < 0 {

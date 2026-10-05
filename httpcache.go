@@ -111,6 +111,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
+	if c.slice > 0 {
+		return x.serveSliced()
+	}
+
 	return x.serve()
 }
 
@@ -131,6 +135,10 @@ type exchange struct {
 	flightID    ID
 	flight      *flight
 	flightEnded atomic.Bool
+
+	// slice is set on the exchange that fetches one slice of a response on
+	// behalf of the request reading it, see slice.go.
+	slice *sliceFetch
 }
 
 // status builds the Cache-Status value of this cache.
@@ -218,9 +226,7 @@ func (x *exchange) serve() error {
 
 		if x.reqCC.has("only-if-cached") {
 			hit.Close()
-			x.w.Header().Add("Cache-Status", x.status("fwd=bypass; detail=ONLY-IF-CACHED"))
-
-			return caddyhttp.Error(http.StatusGatewayTimeout, errors.New("the response is not in the cache"))
+			return x.notCached()
 		}
 
 		// The cache is filled by GET requests only, but a HEAD request can
@@ -284,6 +290,14 @@ func (x *exchange) serve() error {
 		}
 		timer.Stop()
 	}
+}
+
+// notCached answers a request that only wants what the cache holds, which
+// is not its response.
+func (x *exchange) notCached() error {
+	x.w.Header().Add("Cache-Status", x.status("fwd=bypass; detail=ONLY-IF-CACHED"))
+
+	return caddyhttp.Error(http.StatusGatewayTimeout, errors.New("the response is not in the cache"))
 }
 
 // serveTail answers the request from a response another request is still
@@ -468,7 +482,11 @@ func (x *exchange) endFlight(stored bool) {
 // is closed here. fl is nil when the request does not hold the flight, which
 // is the case for responses recently found uncacheable.
 func (x *exchange) fetch(id ID, fl *flight, stale *Hit) error {
-	defer stale.Close()
+	// In the fetch of a slice, the stale response may be handed to the
+	// request reading the slices, whose business closing it then is.
+	if x.slice == nil {
+		defer stale.Close()
+	}
 
 	s, r := x.store, x.r
 	x.flightID, x.flight = id, fl
@@ -505,17 +523,29 @@ func (x *exchange) fetch(id ID, fl *flight, stale *Hit) error {
 		hit := x.refresh(stale, fw, now)
 		x.endFlight(true)
 
-		return x.serveHit(hit, now, "fwd=stale; fwd-status=304; detail=REVALIDATED")
+		return x.deliver(hit, now, "fwd=stale; fwd-status=304; detail=REVALIDATED")
 
 	case modeStaleError:
 		x.endFlight(false)
 
-		return x.serveHit(stale, now, fmt.Sprintf("fwd=stale; fwd-status=%d; detail=STALE", fw.status))
+		return x.deliver(stale, now, fmt.Sprintf("fwd=stale; fwd-status=%d; detail=STALE", fw.status))
+
+	case modeSlice:
+		// Nothing is sent from here: the slice is read from the cache by the
+		// request it was fetched for, which finds it cut short if it is.
+		sf := x.slice
+		sf.stored = !failed && fw.commit()
+		if sf.stored {
+			s.SetUncacheable(fw.id, false)
+		}
+		x.endFlight(sf.stored)
+
+		return nil
 
 	case modeRelay:
 		committed := !failed && fw.commit()
 		if committed {
-			s.SetUncacheable(id, false)
+			s.SetUncacheable(fw.id, false)
 		}
 		x.endFlight(committed)
 
@@ -537,7 +567,7 @@ func (x *exchange) fetch(id ID, fl *flight, stale *Hit) error {
 
 	case modeSilent:
 		if !failed && fw.commit() {
-			s.SetUncacheable(id, false)
+			s.SetUncacheable(fw.id, false)
 			x.endFlight(true)
 			if _, hit := s.Lookup(x.key, r.Header); hit != nil {
 				return x.serveHit(hit, now, fw.forward+"; stored")
@@ -556,7 +586,7 @@ func (x *exchange) fetch(id ID, fl *flight, stale *Hit) error {
 		// The upstream failed before answering.
 		x.endFlight(false)
 		if stale != nil && x.staleUsable(stale.rec, now, stale.rec.sie) {
-			return x.serveHit(stale, now, "fwd=stale; detail=STALE")
+			return x.deliver(stale, now, "fwd=stale; detail=STALE")
 		}
 		if err == nil && !aborted {
 			return r.Context().Err()
@@ -581,10 +611,31 @@ func (x *exchange) fallback(fw *fetchWriter, stale *Hit, now time.Time, failed b
 	// The stale response stands in for an upstream that failed, not for a
 	// fetch the cache gave up by itself.
 	if failed && !fw.selfAborted && stale != nil && x.staleUsable(stale.rec, now, stale.rec.sie) {
-		return x.serveHit(stale, now, "fwd=stale; detail=STALE")
+		return x.deliver(stale, now, "fwd=stale; detail=STALE")
+	}
+	if sf := x.slice; sf != nil && !sf.passable() {
+		return errSliceLost
 	}
 
 	return x.pass(fw.reason)
+}
+
+// deliver answers the request with a stored response. In the fetch of a
+// slice, a stored slice is not sent from here: it is handed to the request
+// reading the slices.
+func (x *exchange) deliver(hit *Hit, now time.Time, params string) error {
+	if sf := x.slice; sf != nil {
+		if hit.rec.status == http.StatusPartialContent {
+			sf.hit, sf.params = hit, params
+			return nil
+		}
+		if !sf.lead {
+			hit.Close()
+			return errSliceLost
+		}
+	}
+
+	return x.serveHit(hit, now, params)
 }
 
 // callNext runs the next handlers. A reverse proxy that loses its upstream
@@ -640,7 +691,17 @@ func (x *exchange) refresh(stale *Hit, fw *fetchWriter, now time.Time) *Hit {
 		own["Age"] = age
 	}
 
-	v := x.c.evaluate(x.r, old.status, own, now)
+	// A slice is judged like the response it is part of, and found again
+	// like it was found.
+	status, selector := old.status, x.r.Header
+	if status == http.StatusPartialContent {
+		status = http.StatusOK
+		if x.slice != nil {
+			selector = x.slice.header
+		}
+	}
+
+	v := x.c.evaluate(x.r, status, own, now)
 	if !v.store {
 		// Confirmed for this request, but not to be kept any longer.
 		stale.Discard()
@@ -664,7 +725,7 @@ func (x *exchange) refresh(stale *Hit, fw *fetchWriter, now time.Time) *Hit {
 	if err := x.store.Rewrite(stale, rec, x.c.minUses); err != nil {
 		return stale
 	}
-	if _, hit := x.store.Lookup(x.key, x.r.Header); hit != nil {
+	if _, hit := x.store.Lookup(x.key, selector); hit != nil {
 		return hit
 	}
 

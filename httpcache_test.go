@@ -2224,6 +2224,33 @@ func TestRequestIsHandledTwiceAsReceived(t *testing.T) {
 	})
 }
 
+// TestRewriteIsAppliedToARequestHandledTwice covers the directives of which
+// Caddy applies only the first that matches, rewrite and handle: the router
+// remembers in the request that one was applied, which must not keep it from
+// applying it again to a request the cache starts over.
+func TestRewriteIsAppliedToARequestHandledTwice(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/real/x" {
+			t.Errorf("the upstream got a request for %q", r.URL.Path)
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		http.ServeContent(w, r, "", time.Time{}, strings.NewReader("path="+r.URL.Path))
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache
+		rewrite * /real{path}
+		reverse_proxy `+up.addr())
+
+	resp, body := get(t, tester, "/x", "Range: bytes=5-")
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Errorf("status %d, want 206", resp.StatusCode)
+	}
+	expectBody(t, body, "/real/x")
+	if n := up.hits.Load(); n != 2 {
+		t.Errorf("the upstream got %d requests, want 2", n)
+	}
+}
+
 func TestFailedReloadLeavesTheCacheAlone(t *testing.T) {
 	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(bodyFor(r.URL.Path, 300_000))
@@ -2316,6 +2343,9 @@ func TestInvalidConfigurations(t *testing.T) {
 		"min_uses 0":                       "invalid min_uses",
 		"min_uses 5000":                    "min_uses must be between",
 		"min_uses 2\n max_memory off":      "max_memory off does not allow",
+		"slice lots":                       "invalid size",
+		"slice 1k":                         "slice must be at least",
+		"slice 64Mi\n max_size 100Mi":      "slice cannot be larger than half of max_size",
 		"mode relaxed":                     "unknown cache mode",
 		"ttl":                              "wrong argument count",
 		"ttl soon":                         "invalid duration",

@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.1.0
+
+### Added
+
+* Option `slice`: responses are asked of the upstream in ranges of that size, each stored by itself, like nginx's `slice` module does. A request for a range of a large response that is not cached fetches the slices the range is in, instead of waiting for a download that starts at the first byte.
+
+### Changed
+
+* A response that varies on fewer request headers than the ones already stored for its URL is stored beside them, instead of replacing them all.
+
+### Fixed
+
+* Requests for a response that varies are served from its first download while it is in progress, like those for any other response, instead of each starting a download of their own.
+* The `rewrite` and `handle` directives placed after the cache were not applied when the cache sent a request to the upstream a second time, which it does for a range or a conditional request whose response turns out not to be cacheable.
+
 ## 1.0.0
 
 First release of this module, forked from [caddyserver/cache-handler](https://github.com/caddyserver/cache-handler) 0.17.0. Version numbers start over: this is a different module, with a different configuration, not version 0.18 of the original.
