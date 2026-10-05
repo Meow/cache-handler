@@ -23,6 +23,7 @@ Changes made to the original work, starting from its 0.17.0 release:
     lock_timeout were added.
   * The tests, README.md, the example configurations and go.mod were changed
     accordingly. The Go module path is github.com/Meow/cache-handler.
+  * A benchmark was added (bench/).
 
 The modifications are distributed under the same license as the original
 work. See the LICENSE file.

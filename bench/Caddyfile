@@ -1,0 +1,154 @@
+# Configuration of the benchmark, run by bench.sh, which sets the variables.
+# Every scenario is a route of its own, and `route` rather than `handle_path`
+# so that the cache sees the whole path: scenarios sharing a cache directory
+# must not share keys.
+{
+	# Nothing here needs the admin endpoint, and without it the benchmark
+	# cannot collide with a running Caddy or leave a configuration behind.
+	admin off
+	persist_config off
+	default_bind 127.0.0.1
+
+	cache {
+		path {$BENCH_CACHE}/default
+		# Nothing expires during a run: the hits are measured, not the
+		# revalidations.
+		ttl 1h
+	}
+}
+
+# The upstream of the reverse_proxy scenarios.
+http://127.0.0.1:{$BENCH_UPSTREAM_PORT} {
+	root * {$BENCH_ROOT}
+	file_server
+}
+
+http://127.0.0.1:{$BENCH_PORT} {
+	#
+	# A short text.
+	#
+
+	# Baseline: no cache.
+	route /plain {
+		respond "Hello, world!"
+	}
+
+	# Defaults: on disk, and in memory once requested twice.
+	route /cache/plain {
+		cache
+		respond "Hello, world!"
+	}
+
+	# On disk only. The memory limit belongs to the directory, hence another.
+	route /disk/plain {
+		cache {
+			path {$BENCH_CACHE}/disk
+			max_memory off
+		}
+		respond "Hello, world!"
+	}
+
+	# In memory first, written to disk at the second request.
+	route /min-uses/plain {
+		cache {
+			min_uses 2
+		}
+		respond "Hello, world!"
+	}
+
+	# Two lookups per hit: the marker, then the variant.
+	route /vary/plain {
+		cache
+		header Vary X-Bench
+		respond "Hello, world!"
+	}
+
+	# The key is the path alone.
+	route /template/plain {
+		cache {
+			key {
+				template {http.request.uri.path}
+			}
+		}
+		respond "Hello, world!"
+	}
+
+	# Never stored: what the cache costs the responses it cannot keep.
+	route /no-store/plain {
+		cache
+		header Cache-Control no-store
+		respond "Hello, world!"
+	}
+
+	#
+	# A file.
+	#
+
+	# Baseline: no cache.
+	route /file/* {
+		uri strip_prefix /file
+		root * {$BENCH_ROOT}
+		file_server
+	}
+
+	route /cache/file/* {
+		cache
+		uri strip_prefix /cache/file
+		root * {$BENCH_ROOT}
+		file_server
+	}
+
+	route /disk/file/* {
+		cache {
+			path {$BENCH_CACHE}/disk
+			max_memory off
+		}
+		uri strip_prefix /disk/file
+		root * {$BENCH_ROOT}
+		file_server
+	}
+
+	route /min-uses/file/* {
+		cache {
+			min_uses 2
+		}
+		uri strip_prefix /min-uses/file
+		root * {$BENCH_ROOT}
+		file_server
+	}
+
+	# Stored and served as slices of 16KiB: three for fixtures/test.png.
+	route /slice/file/* {
+		cache {
+			slice 16Ki
+		}
+		uri strip_prefix /slice/file
+		root * {$BENCH_ROOT}
+		file_server
+	}
+
+	#
+	# The same file, behind a reverse proxy: what a cache is for.
+	#
+
+	# Baseline: no cache.
+	route /proxy/* {
+		uri strip_prefix /proxy
+		reverse_proxy 127.0.0.1:{$BENCH_UPSTREAM_PORT}
+	}
+
+	route /cache/proxy/* {
+		cache
+		uri strip_prefix /cache/proxy
+		reverse_proxy 127.0.0.1:{$BENCH_UPSTREAM_PORT}
+	}
+
+	route /disk/proxy/* {
+		cache {
+			path {$BENCH_CACHE}/disk
+			max_memory off
+		}
+		uri strip_prefix /disk/proxy
+		reverse_proxy 127.0.0.1:{$BENCH_UPSTREAM_PORT}
+	}
+}

@@ -1,2 +1,3 @@
 /caddy
 vendor/
+.DS_Store
