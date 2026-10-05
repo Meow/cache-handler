@@ -907,7 +907,7 @@ func (s *Store) newWriter(rec *record, maxBody, declared int64, minUses int) (*W
 // stored under id needs before it is written to disk, counting the one it is
 // fetched for. Zero means it is to be written whatever is asked.
 func (s *Store) usesLeftLocked(id ID, minUses int) uint16 {
-	if old := s.index[id]; old != nil && !(old.transient && old.marker) {
+	if old := s.index[id]; old != nil && (!old.transient || !old.marker) {
 		// What is on disk stays there, and a new version of a transient
 		// response carries on with its count. The request it is fetched for
 		// was counted when it found the old one, and will be again.
