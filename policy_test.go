@@ -264,6 +264,7 @@ func TestSingleRange(t *testing.T) {
 		{"bytes=-0", 0, 0, false},
 		{"bytes=a-b", 0, 0, false},
 		{"bytes=-", 0, 0, false},
+		{"bytes=5", 0, 0, false},
 		{"items=0-5", 0, 0, false},
 	}
 	for _, tt := range tests {

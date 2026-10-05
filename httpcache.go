@@ -521,7 +521,14 @@ func (x *exchange) fetch(id ID, fl *flight, stale *Hit) error {
 
 		// The client may still be receiving what was stored. It is cut
 		// short if the response is not whole.
-		if perr := fw.close(); perr != nil || aborted {
+		perr := fw.close()
+		if fw.satisfied {
+			// The cache stopped the fetch itself once the client had the
+			// range it asked for: the response is complete, however the
+			// handlers took being stopped.
+			return nil
+		}
+		if perr != nil || aborted {
 			panic(http.ErrAbortHandler)
 		}
 		fw.copyTrailers()
@@ -608,6 +615,14 @@ func (x *exchange) refresh(stale *Hit, fw *fetchWriter, now time.Time) *Hit {
 		switch name {
 		// These describe the body, which the 304 does not carry.
 		case "Content-Encoding", "Content-Range", "Content-Type":
+		case "Etag":
+			// The upstream confirmed the tag it was sent, which is the
+			// stored one. The clients were given that one, and a handler
+			// in between may spell it differently: encode takes off the
+			// suffix it added to it, and does not put it back on a 304.
+			if header.Get("Etag") == "" {
+				header[name] = values
+			}
 		default:
 			header[name] = values
 		}
@@ -618,8 +633,14 @@ func (x *exchange) refresh(stale *Hit, fw *fetchWriter, now time.Time) *Hit {
 	// response gets.
 	final := fw.base.Clone()
 	applyHeaders(final, header)
+	own := ownHeaders(fw.base, final)
+	// The age is not among the stored headers. The one that counts from now
+	// on is that of the confirmation.
+	if age := ownHeaders(fw.base, fw.hdr)["Age"]; len(age) > 0 {
+		own["Age"] = age
+	}
 
-	v := x.c.evaluate(x.r, old.status, ownHeaders(fw.base, final), now)
+	v := x.c.evaluate(x.r, old.status, own, now)
 	if !v.store {
 		// Confirmed for this request, but not to be kept any longer.
 		stale.Discard()

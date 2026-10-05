@@ -76,6 +76,10 @@ type fetchWriter struct {
 	rangeHeader string
 	// revalidating tells that the request carries the validators of stale.
 	revalidating bool
+	// reqHeader holds the request headers as the client sent them. They are
+	// what selects the variant a response is stored as, like they are when
+	// it is looked up: the upstream handlers may change the request since.
+	reqHeader http.Header
 	// forward is the Cache-Status reason the request was forwarded.
 	forward string
 	cancel  context.CancelFunc
@@ -100,9 +104,12 @@ type fetchWriter struct {
 	// selfAborted tells that the cache itself cut the fetch short, which is
 	// not a failure of the upstream.
 	selfAborted bool
-	gone        bool
-	finished    bool
-	idle        *time.Timer
+	// satisfied tells that the fetch was cut short because the client had
+	// been sent all of the range it asked for.
+	satisfied bool
+	gone      bool
+	finished  bool
+	idle      *time.Timer
 }
 
 func newFetchWriter(x *exchange, id ID, stale *Hit) *fetchWriter {
@@ -146,6 +153,7 @@ func plainRequest(r *http.Request) bool {
 func (fw *fetchWriter) prepareRequest(r *http.Request) (restore func()) {
 	header := r.Header.Clone()
 	url := *r.URL
+	fw.reqHeader = header
 
 	for _, name := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since", "If-Match", "If-Unmodified-Since"} {
 		delete(r.Header, name)
@@ -260,7 +268,7 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 			rec.flags |= flagMustRevalidate
 		}
 
-		w, err := s.Create(x.key, v.vary, x.r.Header, rec, limit, fw.declared)
+		w, err := s.Create(x.key, v.vary, fw.reqHeader, rec, limit, fw.declared)
 		if err != nil {
 			s.warn("storing a response failed", err)
 			v = reject("STORAGE-ERROR")
@@ -351,7 +359,10 @@ func singleRange(header string, size int64) (first, last int64, ok bool) {
 		return 0, 0, false
 	}
 
-	from, to, _ := strings.Cut(spec, "-")
+	from, to, dash := strings.Cut(spec, "-")
+	if !dash {
+		return 0, 0, false
+	}
 	from, to = strings.TrimSpace(from), strings.TrimSpace(to)
 
 	if from == "" {
@@ -493,6 +504,7 @@ func (fw *fetchWriter) Write(p []byte) (int, error) {
 		if fw.pos > fw.last {
 			// The client has the range it asked for and nothing is stored:
 			// the rest is of no use.
+			fw.satisfied = true
 			fw.cancel()
 			return 0, errClientGone
 		}

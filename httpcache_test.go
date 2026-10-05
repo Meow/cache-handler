@@ -335,6 +335,82 @@ func TestRevalidation(t *testing.T) {
 	expectBody(t, body, "body v2")
 }
 
+// TestRevalidationCountsTheAge checks that a response confirmed by a cache
+// upstream of this one is not taken for fresher than that cache said.
+func TestRevalidationCountsTheAge(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Etag", `"v1"`)
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			w.Header().Set("Cache-Control", "max-age=120")
+			w.Header().Set("Age", "100")
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Cache-Control", "max-age=1")
+		_, _ = io.WriteString(w, "body")
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		cache
+		reverse_proxy `+up.addr())
+	const key = "GET-http-localhost:9080-/doc"
+
+	get(t, tester, "/doc")
+	time.Sleep(1100 * time.Millisecond)
+
+	resp, body := get(t, tester, "/doc")
+	expectStatus(t, resp, "Caddy; fwd=stale; fwd-status=304; detail=REVALIDATED; key="+key)
+	expectBody(t, body, "body")
+	if resp.Header.Get("Age") != "100" {
+		t.Errorf("Age: %q, want 100", resp.Header.Get("Age"))
+	}
+
+	// Of the 120 seconds the response is fresh for, 100 are already spent.
+	resp, _ = get(t, tester, "/doc")
+	expectHit(t, resp, key, 20)
+}
+
+// TestRevalidationKeepsTheEntityTag checks that the clients keep being
+// answered on the entity tag they were given once the response is confirmed
+// by the upstream, which knows it under another one when encode changed it.
+func TestRevalidationKeepsTheEntityTag(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Etag", `"v1"`)
+		w.Header().Set("Content-Type", "text/plain")
+		if r.Header.Get("If-None-Match") == `"v1"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		_, _ = io.WriteString(w, strings.Repeat("compress me ", 200))
+	})
+	tester := startCaddy(t, t.TempDir(), "ttl 1s", `
+		cache
+		encode gzip
+		reverse_proxy `+up.addr())
+	const key = "GET-http-localhost:9080-/doc"
+
+	resp, _ := get(t, tester, "/doc", "Accept-Encoding: gzip")
+	expectStatus(t, resp, "Caddy; fwd=uri-miss; stored; key="+key)
+	etag := resp.Header.Get("Etag")
+	if resp.Header.Get("Content-Encoding") != "gzip" || etag == `"v1"` {
+		t.Fatalf("Content-Encoding %q, Etag %s: want a compressed response with a tag of its own", resp.Header.Get("Content-Encoding"), etag)
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+	resp, _ = get(t, tester, "/doc", "Accept-Encoding: gzip")
+	expectStatus(t, resp, "Caddy; fwd=stale; fwd-status=304; detail=REVALIDATED; key="+key)
+	if got := resp.Header.Get("Etag"); got != etag {
+		t.Errorf("Etag %s once revalidated, want %s", got, etag)
+	}
+
+	resp, _ = get(t, tester, "/doc", "Accept-Encoding: gzip", "If-None-Match: "+etag)
+	if resp.StatusCode != http.StatusNotModified {
+		t.Errorf("status %d for a client that has the response, want 304", resp.StatusCode)
+	}
+	if n := up.hits.Load(); n != 2 {
+		t.Errorf("the upstream got %d requests, want 2", n)
+	}
+}
+
 func TestRangeAndConditionalRequests(t *testing.T) {
 	const content = "0123456789abcdefghijklmnopqrstuvwxyz"
 	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
@@ -443,6 +519,30 @@ func TestVary(t *testing.T) {
 	}
 	if n := up.hits.Load(); n != 3 {
 		t.Errorf("the upstream got %d requests, want 3", n)
+	}
+}
+
+// TestVaryIsSelectedByTheRequestAsReceived checks that a response is stored
+// as the variant the next request for it will look up: the one the headers
+// the client sent select, whatever the handlers after the cache made of them.
+func TestVaryIsSelectedByTheRequestAsReceived(t *testing.T) {
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Vary", "X-Lang")
+		_, _ = io.WriteString(w, "lang="+r.Header.Get("X-Lang"))
+	})
+	tester := startCaddy(t, t.TempDir(), "", `
+		route {
+			cache
+			request_header X-Lang any
+			reverse_proxy `+up.addr()+`
+		}`)
+
+	for _, lang := range []string{"fr", "fr", "en", "en", "fr"} {
+		_, body := get(t, tester, "/page", "X-Lang: "+lang)
+		expectBody(t, body, "lang=any")
+	}
+	if n := up.hits.Load(); n != 2 {
+		t.Errorf("the upstream got %d requests, want 2", n)
 	}
 }
 
@@ -957,6 +1057,72 @@ func TestResponseTooLargeToStoreIsStillDelivered(t *testing.T) {
 	if left, _ := os.ReadDir(filepath.Join(st.Path, tmpDirName)); len(left) != 0 {
 		t.Errorf("%d temporary files left", len(left))
 	}
+}
+
+// TestRangeIsDeliveredWhenTheResponseCannotBeStored checks that the request
+// which triggered a download gets the range it asked for when the response
+// can no longer be stored midway, like it would get a whole response.
+func TestRangeIsDeliveredWhenTheResponseCannotBeStored(t *testing.T) {
+	const size = 32 << 10
+	content := string(bodyFor("range", size))
+	release := make(chan struct{})
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(size))
+		if r.URL.Path == "/hog" {
+			_, _ = io.WriteString(w, content[:size-1])
+			w.(http.Flusher).Flush()
+			select {
+			case <-release:
+			case <-time.After(10 * time.Second):
+			}
+			_, _ = io.WriteString(w, content[size-1:])
+			return
+		}
+		_, _ = io.WriteString(w, content[:size/2])
+		w.(http.Flusher).Flush()
+		time.Sleep(20 * time.Millisecond)
+		_, _ = io.WriteString(w, content[size/2:])
+	})
+	// Each response takes half of the cache, before its headers are counted:
+	// a second one cannot be stored while the first is still downloading.
+	tester := startCaddy(t, t.TempDir(), "max_size 64Ki", `
+		cache
+		reverse_proxy `+up.addr())
+
+	hog, err := tester.Client.Get(testURL + "/hog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = hog.Body.Close() }()
+	head := make([]byte, size-1)
+	if _, err := io.ReadFull(hog.Body, head); err != nil {
+		t.Fatal(err)
+	}
+
+	for path, r := range map[string][2]int{
+		// Sent before, across and after the point where storing fails.
+		"/before": {100, 299},
+		"/across": {1000, size - 100},
+		"/after":  {size - 68, size - 1},
+	} {
+		resp, body := get(t, tester, path, fmt.Sprintf("Range: bytes=%d-%d", r[0], r[1]))
+		if want := fmt.Sprintf("bytes %d-%d/%d", r[0], r[1], size); resp.StatusCode != http.StatusPartialContent || resp.Header.Get("Content-Range") != want {
+			t.Errorf("%s: status %d, Content-Range %q, want 206 and %q", path, resp.StatusCode, resp.Header.Get("Content-Range"), want)
+		}
+		expectBody(t, body, content[r[0]:r[1]+1])
+	}
+	if st := cacheStats(t); st.Entries != 0 {
+		t.Errorf("%d responses were stored, where none could be", st.Entries)
+	}
+
+	close(release)
+	rest, err := io.ReadAll(hog.Body)
+	if err != nil || string(head)+string(rest) != content {
+		t.Errorf("the download in progress was disturbed: %d more bytes, %v", len(rest), err)
+	}
+	resp, body := get(t, tester, "/hog")
+	expectHit(t, resp, "GET-http-localhost:9080-/hog", 120)
+	expectBody(t, body, content)
 }
 
 // TestStaleIsNotServedForAResponseTheCacheGaveUp checks that the stale
