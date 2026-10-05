@@ -203,6 +203,17 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriterWrapper.WriteHeader(code)
 }
 
+// bodyWriter is the ResponseWriter http.ServeContent is given to send a body
+// that is not a file. ServeContent hands the body to ReadFrom, which here is
+// a plain copy through a reused buffer, see copyBuffered.
+type bodyWriter struct {
+	http.ResponseWriter
+}
+
+func (w bodyWriter) ReadFrom(r io.Reader) (int64, error) {
+	return copyBuffered(w.ResponseWriter, r)
+}
+
 // serve answers a GET or HEAD request from the cache, fetching the response
 // first when it is missing or stale.
 func (x *exchange) serve() error {
@@ -345,14 +356,14 @@ func (x *exchange) serveTail(w *Writer) bool {
 		if t, err := http.ParseTime(header.Get("Last-Modified")); err == nil {
 			modified = t
 		}
-		http.ServeContent(sw, x.r, "", modified, tail)
+		http.ServeContent(bodyWriter{sw}, x.r, "", modified, tail)
 	} else {
 		if w.declared >= 0 {
 			header.Set("Content-Length", strconv.FormatInt(w.declared, 10))
 		}
 		sw.WriteHeader(rec.status)
 		if x.r.Method != http.MethodHead {
-			_, _ = io.Copy(sw, tail)
+			_, _ = copyBuffered(sw, tail)
 		}
 	}
 
@@ -446,7 +457,7 @@ func (x *exchange) serveHit(hit *Hit, now time.Time, params string) error {
 		if t, err := http.ParseTime(header.Get("Last-Modified")); err == nil {
 			modified = t
 		}
-		http.ServeContent(x.w, x.r, "", modified, hit.Body())
+		http.ServeContent(bodyWriter{x.w}, x.r, "", modified, hit.Body())
 
 		return nil
 	}

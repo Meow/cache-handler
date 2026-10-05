@@ -3328,6 +3328,33 @@ func TestStorePersistFailures(t *testing.T) {
 	})
 }
 
+func TestStoreTruncatedFile(t *testing.T) {
+	s := openTestStore(t, t.TempDir(), Limits{})
+	if err := storePut(t, s, "key", nil, nil, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	_, hit := s.Lookup("key", nil)
+	if hit == nil {
+		t.Fatal("not found")
+	}
+	defer hit.Close()
+
+	// The file lost its end since it was opened: the body is sent up to the
+	// end of the file, which is not that of the body anymore.
+	fi, err := hit.f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(s.path(hit.e.id), fi.Size()-2); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if err := hit.WriteBody(&buf); !errors.Is(err, io.ErrUnexpectedEOF) || buf.String() != "bo" {
+		t.Errorf("a truncated body was written as %q, %v", buf.String(), err)
+	}
+}
+
 func TestStoreRewriteFailure(t *testing.T) {
 	s := openTestStore(t, t.TempDir(), Limits{})
 	if err := storePut(t, s, "key", nil, nil, []byte("body")); err != nil {

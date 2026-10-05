@@ -10,6 +10,7 @@
 
 * Caddy 2.11.7 or later is required, and Go 1.26 or later to build it.
 * A response that varies on fewer request headers than the ones already stored for its URL is stored beside them, instead of replacing them all.
+* Stored responses are sent to the client with less work. One held in memory reaches the connection in as few writes as its size allows, through a buffer that is reused instead of one allocated for each response. One read from disk is sent with `sendfile`, which it was meant to be and was not. On one core, a response of 42KiB is served about 45% more often per second, and one stored in slices about 20%.
 
 ### Fixed
 

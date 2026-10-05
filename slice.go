@@ -489,7 +489,7 @@ func (sr *sliceReader) serve(part *slicePart) error {
 	r := x.r.WithContext(x.r.Context())
 	r.Header = sr.plain
 
-	http.ServeContent(sr.sw, r, "", modified, sr)
+	http.ServeContent(bodyWriter{sr.sw}, r, "", modified, sr)
 
 	if sr.shut() != nil {
 		// A slice is missing or the client left: the response is cut short,

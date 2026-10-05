@@ -614,11 +614,17 @@ func (h *Hit) WriteBody(w io.Writer) error {
 		return err
 	}
 
-	// Copying from the file itself lets the server use sendfile.
+	// Copying from the file itself lets the server use sendfile, and from
+	// the file bare: sendfile is only used for a file, or for a file in one
+	// io.LimitedReader, and Caddy already puts what it is given in one. The
+	// body needs no limit of its own, since it is the end of the file.
 	if _, err := h.f.Seek(h.rec.bodyOff, io.SeekStart); err != nil {
 		return err
 	}
-	_, err := io.CopyN(w, h.f, h.rec.bodyLen)
+	n, err := io.Copy(w, h.f)
+	if err == nil && n != h.rec.bodyLen {
+		err = io.ErrUnexpectedEOF
+	}
 
 	return err
 }

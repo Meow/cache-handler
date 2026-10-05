@@ -286,6 +286,44 @@ func (b *blob) writeTo(w io.Writer, size int64) error {
 	return bw.Flush()
 }
 
+// copyBufSize is how much of a body held in memory is given to a client in
+// one Write. Caddy does not let a Write to a client exceed 64KiB.
+const copyBufSize = 64 << 10
+
+var copyBufs = sync.Pool{New: func() any {
+	buf := make([]byte, copyBufSize)
+
+	return &buf
+}}
+
+// copyBuffered copies r to w through a buffer of copyBufs, one Write for
+// each Read. It is for the bodies that are not files, which are those the
+// ReadFrom of a ResponseWriter does poorly with: it tries sendfile, and
+// failing that sends the first bytes by themselves and the rest through a
+// buffer it allocates for every response.
+func copyBuffered(w io.Writer, r io.Reader) (int64, error) {
+	bufp := copyBufs.Get().(*[]byte)
+	defer copyBufs.Put(bufp)
+
+	var written int64
+	for {
+		n, err := r.Read(*bufp)
+		if n > 0 {
+			m, werr := w.Write((*bufp)[:n])
+			written += int64(m)
+			if werr != nil {
+				return written, werr
+			}
+		}
+		if err == io.EOF {
+			return written, nil
+		}
+		if err != nil {
+			return written, err
+		}
+	}
+}
+
 // blobReader reads a blob as a stream. The caller must hold a reference on
 // the blob for as long as it uses the reader.
 type blobReader struct {
@@ -302,6 +340,13 @@ func (r *blobReader) Read(p []byte) (int, error) {
 	r.off += int64(n)
 
 	return n, nil
+}
+
+// WriteTo writes what is left of the blob to w. It is what io.Copy uses, in
+// preference to the ReadFrom of w. A Read gathers as many blocks as the
+// buffer holds, so that most bodies reach the connection in one Write.
+func (r *blobReader) WriteTo(w io.Writer) (int64, error) {
+	return copyBuffered(w, r)
 }
 
 func (r *blobReader) Seek(offset int64, whence int) (int64, error) {
