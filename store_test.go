@@ -65,6 +65,14 @@ func bodyFor(key string, size int) []byte {
 func storePut(t testing.TB, s *Store, key string, vary []string, reqHeader http.Header, body []byte) error {
 	t.Helper()
 
+	return storePutUses(t, s, key, vary, reqHeader, body, 1)
+}
+
+// storePutUses stores a response that is to be written to disk once it was
+// requested minUses times.
+func storePutUses(t testing.TB, s *Store, key string, vary []string, reqHeader http.Header, body []byte, minUses int) error {
+	t.Helper()
+
 	now := time.Now()
 	rec := &record{
 		stored: now.UnixMilli(),
@@ -73,16 +81,72 @@ func storePut(t testing.TB, s *Store, key string, vary []string, reqHeader http.
 		header: http.Header{"Content-Type": {"application/octet-stream"}, "X-Key": {key}},
 	}
 
-	w, err := s.Create(key, vary, reqHeader, rec, 0, -1)
+	w, err := s.Create(key, vary, reqHeader, rec, 0, -1, minUses)
 	if err != nil {
 		return err
 	}
+
+	// The request a response is fetched for reads it as it arrives, which
+	// counts as its first use.
+	var tail *Tail
+	if minUses > 1 {
+		if tail, err = w.Tail(context.Background()); err != nil {
+			w.Abort()
+			return err
+		}
+		defer tail.Close()
+	}
+
 	if _, err := w.Write(body); err != nil {
 		w.Abort()
 		return err
 	}
+	if err := w.Commit(); err != nil {
+		return err
+	}
 
-	return w.Commit()
+	if tail != nil {
+		if got, err := io.ReadAll(tail); err != nil || !bytes.Equal(got, body) {
+			return fmt.Errorf("read %d bytes (%v) from the response as it was stored, want the %d of its body", len(got), err, len(body))
+		}
+	}
+
+	return nil
+}
+
+// cacheFiles counts the responses and markers that have a file under dir.
+func cacheFiles(dir string) int {
+	files := 0
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() && len(info.Name()) == 32 {
+			files++
+		}
+		return nil
+	})
+
+	return files
+}
+
+// waitPersisted blocks until the store has nothing left to write to disk of
+// what it was asked to.
+func waitPersisted(t *testing.T, s *Store) {
+	t.Helper()
+
+	waitFor(t, "the responses requested again to be written to disk", func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		if len(s.persistCh) > 0 {
+			return false
+		}
+		for _, e := range s.index {
+			if e.persisting {
+				return false
+			}
+		}
+
+		return true
+	})
 }
 
 func storeGet(t testing.TB, s *Store, key string, reqHeader http.Header) ([]byte, *Hit) {
@@ -462,7 +526,7 @@ func TestStoreMaxFiles(t *testing.T) {
 	create := func(i int) (*Writer, error) {
 		now := time.Now()
 		rec := &record{stored: now.UnixMilli(), fresh: now.Add(time.Hour).UnixMilli(), status: http.StatusOK}
-		return s.Create(fmt.Sprintf("download-%d", i), nil, nil, rec, 0, -1)
+		return s.Create(fmt.Sprintf("download-%d", i), nil, nil, rec, 0, -1, 1)
 	}
 	var writers []*Writer
 	for i := range maxFiles {
@@ -752,7 +816,7 @@ func TestStoreTail(t *testing.T) {
 	create := func(key string, declared int64) *Writer {
 		now := time.Now()
 		rec := &record{stored: now.UnixMilli(), fresh: now.Add(time.Hour).UnixMilli(), status: http.StatusOK}
-		w, err := s.Create(key, nil, nil, rec, 0, declared)
+		w, err := s.Create(key, nil, nil, rec, 0, declared, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -905,6 +969,596 @@ func TestStoreTail(t *testing.T) {
 	}
 }
 
+// transientUsage returns the memory the transient responses are accounted
+// for.
+func transientUsage(s *Store) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.transMeta + int64(s.transBlocks)*int64(s.arena.blockSize)
+}
+
+// TestStoreMinUses checks that a response is only written to disk once it
+// was requested as many times as asked, and is served from memory meanwhile.
+func TestStoreMinUses(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir, Limits{MaxMemory: 4 << 20})
+
+	sizes := map[string]int{"twice": 20_000, "once": 9000, "empty": 0}
+	for key, size := range sizes {
+		if err := storePutUses(t, s, key, nil, nil, bodyFor(key, size), 2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := s.Stats()
+	if n := cacheFiles(dir); n != 0 || st.Entries != 3 || st.TransientEntries != 3 || st.DiskBytes != 0 || st.Stored != 3 {
+		t.Fatalf("%d files after the first request: %+v", n, st)
+	}
+	if left, _ := os.ReadDir(filepath.Join(dir, tmpDirName)); len(left) != 0 {
+		t.Errorf("%d temporary files for responses held in memory", len(left))
+	}
+
+	// The second request is served from memory, and has the response
+	// written.
+	for _, key := range []string{"twice", "empty"} {
+		got, hit := storeGet(t, s, key, nil)
+		if hit == nil || !hit.InMemory() || !bytes.Equal(got, bodyFor(key, sizes[key])) {
+			t.Fatalf("%s: second request not served from memory", key)
+		}
+	}
+	waitFor(t, "the responses requested twice to be written", func() bool { return cacheFiles(dir) == 2 })
+	waitPersisted(t, s)
+	st = s.Stats()
+	if st.TransientEntries != 1 || st.Persisted != 2 || st.DiskBytes == 0 || st.HotEntries != 2 || st.Stored != 3 {
+		t.Errorf("after the second request: %+v", st)
+	}
+	if u := transientUsage(s); u == 0 || u > 4<<20/transientShare {
+		t.Errorf("%d bytes accounted for the one response left in memory only", u)
+	}
+
+	// It stays in memory, as the copy of a file now.
+	got, hit := storeGet(t, s, "twice", nil)
+	if hit == nil || !hit.InMemory() || !bytes.Equal(got, bodyFor("twice", sizes["twice"])) {
+		t.Error("the response left memory when it was written")
+	}
+
+	// Only what was written survives a restart.
+	_ = s.Close()
+	if n := s.arena.inUse.Load(); n != 0 {
+		t.Errorf("%d memory blocks still in use after closing", n)
+	}
+	s = openTestStore(t, dir, Limits{MaxMemory: 4 << 20})
+	if got, hit := storeGet(t, s, "twice", nil); hit == nil || !bytes.Equal(got, bodyFor("twice", sizes["twice"])) {
+		t.Error("the response requested twice did not survive the restart")
+	}
+	if _, hit := storeGet(t, s, "empty", nil); hit == nil {
+		t.Error("the empty response requested twice did not survive the restart")
+	}
+	if _, hit := storeGet(t, s, "once", nil); hit != nil {
+		t.Error("the response requested once survived the restart")
+	}
+
+	// A response that memory cannot hold is written at once.
+	large := bodyFor("large", 4<<20/transientBodyShare+1)
+	if err := storePutUses(t, s, "large", nil, nil, large, 2); err != nil {
+		t.Fatal(err)
+	}
+	if got, hit := storeGet(t, s, "large", nil); hit == nil || hit.InMemory() || !bytes.Equal(got, large) {
+		t.Error("a response too large for memory was not stored on disk")
+	}
+	// As all are without memory.
+	s.SetLimits(Limits{MaxSize: 64 << 20})
+	if err := storePutUses(t, s, "no-memory", nil, nil, []byte("body"), 2); err != nil {
+		t.Fatal(err)
+	}
+	if got, hit := storeGet(t, s, "no-memory", nil); hit == nil || hit.InMemory() || string(got) != "body" {
+		t.Error("a response was not stored on disk with the memory off")
+	}
+	if st := s.Stats(); st.TransientEntries != 0 || st.MemoryBytes != st.IndexBytes {
+		t.Errorf("with the memory off: %+v", st)
+	}
+}
+
+// TestStoreMinUsesCounts follows the count of the requests a response is
+// still to get, through what can happen to the response meanwhile.
+func TestStoreMinUsesCounts(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir, Limits{MaxMemory: 4 << 20})
+
+	left := func(key string) int {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		e := s.index[makeID(key)]
+		if e == nil || !e.transient {
+			return -1
+		}
+		return int(e.left)
+	}
+	drop := func(key string) {
+		s.mu.Lock()
+		s.dropLocked(s.index[makeID(key)])
+		s.mu.Unlock()
+	}
+	body := bodyFor("key", 10_000)
+
+	// Three requests, the one that stores it included.
+	if err := storePutUses(t, s, "key", nil, nil, body, 3); err != nil {
+		t.Fatal(err)
+	}
+	if n := left("key"); n != 2 {
+		t.Fatalf("%d requests left after the first, want 2", n)
+	}
+	storeGet(t, s, "key", nil)
+	waitPersisted(t, s)
+	if n := left("key"); n != 1 || cacheFiles(dir) != 0 {
+		t.Fatalf("%d requests left after the second, want 1 and no file", n)
+	}
+	storeGet(t, s, "key", nil)
+	waitFor(t, "the response to be written at its third request", func() bool { return cacheFiles(dir) == 1 })
+	waitPersisted(t, s)
+
+	// A response dropped from memory is not made to start over when it
+	// comes back…
+	if err := storePutUses(t, s, "dropped", nil, nil, body, 3); err != nil {
+		t.Fatal(err)
+	}
+	drop("dropped")
+	if _, hit := storeGet(t, s, "dropped", nil); hit != nil {
+		t.Fatal("a dropped response was served")
+	}
+	if err := storePutUses(t, s, "dropped", nil, nil, body, 3); err != nil {
+		t.Fatal(err)
+	}
+	if n := left("dropped"); n != 1 {
+		t.Fatalf("%d requests left for a response stored a second time, want 1", n)
+	}
+	// …and is written at once the time it has been requested enough.
+	drop("dropped")
+	if err := storePutUses(t, s, "dropped", nil, nil, body, 3); err != nil {
+		t.Fatal(err)
+	}
+	if n := cacheFiles(dir); n != 2 || left("dropped") != -1 {
+		t.Fatalf("%d files, want the response stored a third time on disk", n)
+	}
+	if st := s.Stats(); st.Dropped != 2 || st.Persisted != 1 {
+		t.Errorf("unexpected counters: %+v", st)
+	}
+
+	// The requests that join a download count like those that come after.
+	now := time.Now()
+	rec := &record{stored: now.UnixMilli(), fresh: now.Add(time.Hour).UnixMilli(), status: http.StatusOK}
+	w, err := s.Create("joined", nil, nil, rec, 0, int64(len(body)), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		tail, err := w.Tail(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tail.Close()
+	}
+	if _, err := w.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "a response two requests were served from to be written", func() bool { return cacheFiles(dir) == 3 })
+	waitPersisted(t, s)
+
+	// A response found stale at its second request is replaced, not
+	// written: its new version is, and only that.
+	persisted := s.Stats().Persisted
+	if err := storePutUses(t, s, "stale", nil, nil, []byte("old"), 2); err != nil {
+		t.Fatal(err)
+	}
+	_, hit := s.Lookup("stale", nil)
+	if hit == nil {
+		t.Fatal("not found")
+	}
+	if err := storePutUses(t, s, "stale", nil, nil, []byte("new"), 2); err != nil {
+		t.Fatal(err)
+	}
+	hit.Close()
+	waitPersisted(t, s)
+	if got, hit := storeGet(t, s, "stale", nil); string(got) != "new" || hit.InMemory() {
+		t.Errorf("got %q, want the new version, from disk", got)
+	}
+	if n := s.Stats().Persisted; n != persisted || cacheFiles(dir) != 4 {
+		t.Errorf("%d responses written from memory and %d files, want the new version stored directly", n-persisted, cacheFiles(dir))
+	}
+
+	// The same goes for one the upstream confirmed.
+	if err := storePutUses(t, s, "confirmed", nil, nil, []byte("same"), 2); err != nil {
+		t.Fatal(err)
+	}
+	_, hit = s.Lookup("confirmed", nil)
+	if hit == nil {
+		t.Fatal("not found")
+	}
+	fresh := *hit.rec
+	fresh.header = http.Header{"X-Version": {"2"}}
+	if err := s.Rewrite(hit, &fresh, 2); err != nil {
+		t.Fatal(err)
+	}
+	hit.Close()
+	waitPersisted(t, s)
+	got, hit := storeGet(t, s, "confirmed", nil)
+	if string(got) != "same" || hit.InMemory() || hit.rec.header.Get("X-Version") != "2" {
+		t.Errorf("got %q, want the confirmed response, from disk", got)
+	}
+	if n := s.Stats().Persisted; n != persisted || cacheFiles(dir) != 5 {
+		t.Errorf("%d responses written from memory and %d files, want the confirmed response stored directly", n-persisted, cacheFiles(dir))
+	}
+
+	// A response in memory only that replaces one on disk takes its file
+	// away: it would come back at the next start.
+	now = time.Now()
+	rec = &record{stored: now.UnixMilli(), fresh: now.Add(time.Hour).UnixMilli(), status: http.StatusOK}
+	if w, err = s.Create("replaced", nil, nil, rec, 0, -1, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := storePut(t, s, "replaced", nil, nil, []byte("on disk")); err != nil {
+		t.Fatal(err)
+	}
+	files := cacheFiles(dir)
+	if _, err := w.Write([]byte("in memory")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if got, hit := storeGet(t, s, "replaced", nil); string(got) != "in memory" || !hit.InMemory() {
+		t.Errorf("got %q, want the response in memory", got)
+	}
+	if n := cacheFiles(dir); n != files-1 {
+		t.Errorf("%d files, want the one of the replaced response gone from %d", n, files)
+	}
+}
+
+// TestStoreMinUsesLimits checks that the responses held in memory only stay
+// within their share of it, the oldest making way.
+func TestStoreMinUsesLimits(t *testing.T) {
+	const maxMemory = 1 << 20
+
+	dir := t.TempDir()
+	s := openTestStore(t, dir, Limits{MaxMemory: maxMemory})
+
+	const objects = 100
+	const size = 40_000
+	for i := range objects {
+		key := fmt.Sprintf("key-%d", i)
+		if err := storePutUses(t, s, key, nil, nil, bodyFor(key, size), 2); err != nil {
+			t.Fatal(err)
+		}
+		if u := transientUsage(s); u > maxMemory/transientShare {
+			t.Fatalf("%d bytes in memory only after %d responses, over their share", u, i+1)
+		}
+		if st := s.Stats(); st.MemoryBytes > maxMemory {
+			t.Fatalf("%d bytes of memory in use, over the limit of %d", st.MemoryBytes, maxMemory)
+		}
+	}
+
+	st := s.Stats()
+	if st.Dropped == 0 || st.TransientEntries == 0 || st.TransientEntries >= objects || st.Entries != st.TransientEntries {
+		t.Errorf("unexpected state: %+v", st)
+	}
+	if n := cacheFiles(dir); n != 0 {
+		t.Errorf("%d files for responses requested once", n)
+	}
+	if _, hit := storeGet(t, s, "key-0", nil); hit != nil {
+		t.Error("the oldest response is still in memory")
+	}
+
+	// The latest is still there, and its second request has it written.
+	last := fmt.Sprintf("key-%d", objects-1)
+	if got, hit := storeGet(t, s, last, nil); hit == nil || !bytes.Equal(got, bodyFor(last, size)) {
+		t.Fatal("the latest response is gone")
+	}
+	waitFor(t, "the response requested twice to be written", func() bool { return cacheFiles(dir) == 1 })
+
+	// A response that was dropped is remembered: its second request, though
+	// it finds nothing, has it written.
+	if err := storePutUses(t, s, "key-0", nil, nil, bodyFor("key-0", size), 2); err != nil {
+		t.Fatal(err)
+	}
+	if n := cacheFiles(dir); n != 2 {
+		t.Errorf("%d files, want the response stored a second time on disk", n)
+	}
+
+	// Responses without a body take no blocks, yet do not pile up.
+	for i := range 3000 {
+		if err := storePutUses(t, s, fmt.Sprintf("empty-%d", i), nil, nil, nil, 2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if u := transientUsage(s); u > maxMemory/transientShare {
+		t.Errorf("%d bytes in memory only, over their share", u)
+	}
+	if st := s.Stats(); st.MemoryBytes > maxMemory || st.TransientEntries >= 3000 {
+		t.Errorf("unexpected state: %+v", st)
+	}
+
+	// The responses not requested for too long leave memory too.
+	s.SetLimits(Limits{MaxSize: 64 << 20, MaxMemory: maxMemory, Inactive: time.Nanosecond})
+	time.Sleep(1100 * time.Millisecond)
+	s.expireInactive()
+	if st := s.Stats(); st.Entries != 0 || st.HotBytes != 0 {
+		t.Errorf("after the inactive period: %+v", st)
+	}
+
+	// Lowering the memory drops what no longer fits, turning it off all.
+	s.SetLimits(Limits{MaxSize: 64 << 20, MaxMemory: 4 * maxMemory})
+	for i := range 20 {
+		key := fmt.Sprintf("key-%d", i)
+		if err := storePutUses(t, s, "again-"+key, nil, nil, bodyFor(key, size), 2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if st := s.Stats(); st.TransientEntries != 20 {
+		t.Fatalf("%d responses in memory only, want 20", st.TransientEntries)
+	}
+	s.SetLimits(Limits{MaxSize: 64 << 20, MaxMemory: maxMemory})
+	if u := transientUsage(s); u > maxMemory/transientShare || u == 0 {
+		t.Errorf("%d bytes in memory only after lowering the limit", u)
+	}
+	s.SetLimits(Limits{MaxSize: 64 << 20})
+	if st := s.Stats(); st.Entries != 0 || st.HotBytes != 0 || transientUsage(s) != 0 {
+		t.Errorf("with the memory off: %+v", st)
+	}
+	waitFor(t, "all the memory to be given back", func() bool { return s.arena.residentBytes() == 0 })
+}
+
+// TestStoreMinUsesVary checks that what tells the variants of a response
+// apart is written to disk with the first of them that is.
+func TestStoreMinUsesVary(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir, Limits{MaxMemory: 4 << 20})
+
+	french := http.Header{"Accept-Language": {"fr"}}
+	english := http.Header{"Accept-Language": {"en"}}
+	german := http.Header{"Accept-Language": {"de"}}
+	vary := []string{"accept-language"}
+
+	if err := storePutUses(t, s, "key", vary, french, []byte("bonjour"), 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := storePutUses(t, s, "key", vary, english, []byte("hello"), 2); err != nil {
+		t.Fatal(err)
+	}
+	if st := s.Stats(); cacheFiles(dir) != 0 || st.Entries != 3 || st.TransientEntries != 3 {
+		t.Fatalf("%d files after the first requests: %+v", cacheFiles(dir), st)
+	}
+
+	if got, _ := storeGet(t, s, "key", french); string(got) != "bonjour" {
+		t.Errorf("fr: got %q", got)
+	}
+	waitFor(t, "the variant requested twice to be written", func() bool { return cacheFiles(dir) == 2 })
+	waitPersisted(t, s)
+	if st := s.Stats(); st.TransientEntries != 1 {
+		t.Errorf("%d entries in memory only, want the other variant", st.TransientEntries)
+	}
+
+	// A variant written at once does the same.
+	other := t.TempDir()
+	s2 := openTestStore(t, other, Limits{MaxMemory: 4 << 20})
+	if err := storePutUses(t, s2, "key", vary, french, []byte("bonjour"), 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := storePut(t, s2, "key", vary, german, []byte("hallo")); err != nil {
+		t.Fatal(err)
+	}
+	if n := cacheFiles(other); n != 2 {
+		t.Errorf("%d files, want the variant and what leads to it", n)
+	}
+	_ = s2.Close()
+	s2 = openTestStore(t, other, Limits{})
+	if got, _ := storeGet(t, s2, "key", german); string(got) != "hallo" {
+		t.Errorf("de after restart: got %q", got)
+	}
+
+	// The variants on disk are found after a restart, the others are gone.
+	_ = s.Close()
+	s = openTestStore(t, dir, Limits{MaxMemory: 4 << 20})
+	if got, _ := storeGet(t, s, "key", french); string(got) != "bonjour" {
+		t.Errorf("fr after restart: got %q", got)
+	}
+	if _, hit := storeGet(t, s, "key", english); hit != nil {
+		t.Error("en: a variant requested once survived the restart")
+	}
+
+	// A variant nothing leads to anymore is not worth a file.
+	if err := storePutUses(t, s, "other", vary, french, []byte("bonjour"), 2); err != nil {
+		t.Fatal(err)
+	}
+	_, hit := s.Lookup("other", french)
+	if hit == nil {
+		t.Fatal("not found")
+	}
+	if err := storePutUses(t, s, "other", nil, nil, []byte("same for all"), 2); err != nil {
+		t.Fatal(err)
+	}
+	files, persisted := cacheFiles(dir), s.Stats().Persisted
+	hit.Close()
+	waitPersisted(t, s)
+	if n := cacheFiles(dir); n != files || s.Stats().Persisted != persisted {
+		t.Errorf("%d files, want %d: a variant nothing leads to was written", n, files)
+	}
+	if got, _ := storeGet(t, s, "other", french); string(got) != "same for all" {
+		t.Errorf("got %q once the response stopped varying", got)
+	}
+}
+
+// TestStoreMinUsesTail reads responses received in memory while they are,
+// one of which outgrows memory on its way.
+func TestStoreMinUsesTail(t *testing.T) {
+	const maxMemory = 1 << 20
+
+	dir := t.TempDir()
+	s := openTestStore(t, dir, Limits{MaxMemory: maxMemory})
+	body := bodyFor("tail", 300_000)
+
+	create := func(key string, declared int64) *Writer {
+		now := time.Now()
+		rec := &record{stored: now.UnixMilli(), fresh: now.Add(time.Hour).UnixMilli(), status: http.StatusOK}
+		// More requests than the test makes, so that nothing is written
+		// to disk that does not have to be.
+		w, err := s.Create(key, nil, nil, rec, 0, declared, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return w
+	}
+	tmpFiles := func() int {
+		left, _ := os.ReadDir(filepath.Join(dir, tmpDirName))
+		return len(left)
+	}
+	var wg sync.WaitGroup
+	read := func(w *Writer, want []byte, started chan<- struct{}) {
+		defer wg.Done()
+		tail, err := w.Tail(context.Background())
+		if err != nil {
+			t.Errorf("opening the tail: %v", err)
+			close(started)
+			return
+		}
+		defer tail.Close()
+
+		head := make([]byte, 1000)
+		if _, err := io.ReadFull(tail, head); err != nil {
+			t.Errorf("reading the beginning: %v", err)
+		}
+		close(started)
+		rest, err := io.ReadAll(tail)
+		if err != nil || !bytes.Equal(append(head, rest...), want) {
+			t.Errorf("read %d bytes (%v), want the %d of the body", len(head)+len(rest), err, len(want))
+		}
+	}
+
+	// A response that fits is read from memory as it arrives.
+	small := body[:100_000]
+	w := create("small", int64(len(small)))
+	if w.mem == nil || tmpFiles() != 0 {
+		t.Fatal("a response that fits in memory is received in a file")
+	}
+	if _, err := w.Write(small[:30_000]); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	wg.Add(1)
+	go read(w, small, started)
+	<-started
+	// A range of what is announced can be read as soon as it is there.
+	tail, err := w.Tail(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tail.Seek(20_000, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	part := make([]byte, 5000)
+	if _, err := io.ReadFull(tail, part); err != nil || !bytes.Equal(part, small[20_000:25_000]) {
+		t.Errorf("reading a range: %v", err)
+	}
+	tail.Close()
+	for off := 30_000; off < len(small); off += 7000 {
+		if _, err := w.Write(small[off:min(off+7000, len(small))]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	if _, err := w.Tail(context.Background()); err == nil {
+		t.Error("tailed a committed response")
+	}
+	if got, hit := storeGet(t, s, "small", nil); !bytes.Equal(got, small) || !hit.InMemory() || cacheFiles(dir) != 0 {
+		t.Error("the committed response differs, or is not in memory only")
+	}
+
+	// One of unknown length that outgrows what memory may hold of it moves
+	// to a file, which its readers do not notice.
+	w = create("grown", -1)
+	if w.mem == nil {
+		t.Fatal("a response of unknown length is not received in memory")
+	}
+	if _, err := w.Write(body[:100_000]); err != nil {
+		t.Fatal(err)
+	}
+	started = make(chan struct{})
+	wg.Add(1)
+	go read(w, body, started)
+	<-started
+	if w.mem == nil || tmpFiles() != 0 {
+		t.Fatal("the response left memory before it had to")
+	}
+	for off := 100_000; off < len(body); off += 50_000 {
+		if _, err := w.Write(body[off:min(off+50_000, len(body))]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if w.mem != nil || tmpFiles() != 1 {
+		t.Fatal("a response larger than memory may hold is still received there")
+	}
+	// A reader that comes after reads the file.
+	started = make(chan struct{})
+	wg.Add(1)
+	go read(w, body, started)
+	<-started
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	if got, hit := storeGet(t, s, "grown", nil); !bytes.Equal(got, body) || hit.InMemory() {
+		t.Error("the response that outgrew memory differs, or is not on disk")
+	}
+	if cacheFiles(dir) != 1 || tmpFiles() != 0 {
+		t.Errorf("%d files and %d temporary ones, want the response on disk", cacheFiles(dir), tmpFiles())
+	}
+	if u := transientUsage(s); u > maxMemory/transientShare {
+		t.Errorf("%d bytes accounted in memory only", u)
+	}
+
+	// A response that is given up fails its readers, except the one told
+	// where to stop.
+	w = create("aborted", -1)
+	if _, err := w.Write(body[:5000]); err != nil {
+		t.Fatal(err)
+	}
+	failing, err := w.Tail(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer failing.Close()
+	drained, err := w.Tail(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer drained.Close()
+	drained.finishAt(5000)
+	w.Abort()
+	if got, err := io.ReadAll(failing); err == nil {
+		t.Errorf("read %d bytes of an aborted response without error", len(got))
+	}
+	if got, err := io.ReadAll(drained); err != nil || !bytes.Equal(got, body[:5000]) {
+		t.Errorf("read %d bytes (%v) of a response dropped after 5000", len(got), err)
+	}
+	if _, hit := storeGet(t, s, "aborted", nil); hit != nil {
+		t.Error("an aborted response was stored")
+	}
+
+	// The memory of what is not stored is given back once nobody reads it.
+	failing.Close()
+	drained.Close()
+	s.Purge("small")
+	if n := s.arena.inUse.Load(); n != 0 || transientUsage(s) != 0 {
+		t.Errorf("%d memory blocks in use, %d bytes accounted, with nothing in memory", n, transientUsage(s))
+	}
+}
+
 func TestStoreFlights(t *testing.T) {
 	s := openTestStore(t, t.TempDir(), Limits{})
 	id := makeID("key")
@@ -952,6 +1606,16 @@ func TestStoreFlights(t *testing.T) {
 // served from memory that was freed, or from a file that was replaced, would
 // show here. Run with -race.
 func TestStoreStress(t *testing.T) {
+	// With min_uses the responses start in memory only, and reach the disk
+	// from there.
+	for _, minUses := range []int{1, 2} {
+		t.Run(fmt.Sprintf("min_uses=%d", minUses), func(t *testing.T) {
+			stressStore(t, minUses)
+		})
+	}
+}
+
+func stressStore(t *testing.T, minUses int) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir, Limits{MaxSize: 3 << 20, MaxMemory: 1 << 20})
 
@@ -985,7 +1649,7 @@ func TestStoreStress(t *testing.T) {
 				case op < 70:
 					_, hit := s.Lookup(key, nil)
 					if hit == nil {
-						if err := storePut(t, s, key, nil, nil, bodyFor(key, sizeOf(k))); err != nil {
+						if err := storePutUses(t, s, key, nil, nil, bodyFor(key, sizeOf(k)), minUses); err != nil {
 							errs <- fmt.Errorf("storing %s: %w", key, err)
 							return
 						}
@@ -1007,7 +1671,7 @@ func TestStoreStress(t *testing.T) {
 						return
 					}
 				case op < 90:
-					if err := storePut(t, s, key, nil, nil, bodyFor(key, sizeOf(k))); err != nil {
+					if err := storePutUses(t, s, key, nil, nil, bodyFor(key, sizeOf(k)), minUses); err != nil {
 						errs <- fmt.Errorf("storing %s: %w", key, err)
 						return
 					}
@@ -1033,10 +1697,14 @@ func TestStoreStress(t *testing.T) {
 		t.Error(err)
 	}
 
+	waitPersisted(t, s)
 	st := s.Stats()
 	t.Logf("%+v", st)
 	if st.HotHits == 0 {
 		t.Error("nothing was ever served from memory")
+	}
+	if minUses > 1 && st.Persisted == 0 {
+		t.Error("nothing was ever written to disk from memory")
 	}
 
 	// Once idle, the accounting must match the disk exactly.
@@ -1050,12 +1718,30 @@ func TestStoreStress(t *testing.T) {
 		}
 		return nil
 	})
-	if files != st.Entries || onDisk != st.DiskBytes || onDisk > limits.MaxSize {
-		t.Errorf("%d files of %d bytes on disk, %d entries of %d bytes accounted, limit %d", files, onDisk, st.Entries, st.DiskBytes, limits.MaxSize)
+	if files != st.Entries-st.TransientEntries || onDisk != st.DiskBytes || onDisk > limits.MaxSize {
+		t.Errorf("%d files of %d bytes on disk, %d entries of %d bytes accounted, %d of them in memory only, limit %d",
+			files, onDisk, st.Entries, st.DiskBytes, st.TransientEntries, limits.MaxSize)
 	}
 	if left, _ := os.ReadDir(filepath.Join(dir, tmpDirName)); len(left) != 0 {
 		t.Errorf("%d temporary files left", len(left))
 	}
+	// And so must that of the memory the transient responses take.
+	s.mu.Lock()
+	blocks, meta, transients := 0, int64(0), 0
+	for _, e := range s.index {
+		if e.transient {
+			transients++
+		}
+		if e.transient && e.hot != nil {
+			blocks += len(e.hot.body.ids)
+			meta += e.cost + e.hot.cost
+		}
+	}
+	if blocks != s.transBlocks || meta != s.transMeta || transients != s.transients {
+		t.Errorf("%d transient entries with %d blocks and %d bytes of index, %d with %d and %d accounted",
+			transients, blocks, meta, s.transients, s.transBlocks, s.transMeta)
+	}
+	s.mu.Unlock()
 
 	// Closing with nothing in flight gives all the memory back.
 	_ = s.Close()

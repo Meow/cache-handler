@@ -268,7 +268,7 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 			rec.flags |= flagMustRevalidate
 		}
 
-		w, err := s.Create(x.key, v.vary, fw.reqHeader, rec, limit, fw.declared)
+		w, err := s.Create(x.key, v.vary, fw.reqHeader, rec, limit, fw.declared, c.minUses)
 		if err != nil {
 			s.warn("storing a response failed", err)
 			v = reject("STORAGE-ERROR")

@@ -1,6 +1,7 @@
 package httpcache
 
 import (
+	"bufio"
 	"io"
 	"os"
 	"sync"
@@ -49,25 +50,44 @@ func (a *arena) blocksFor(size int64) int {
 // alloc returns a blob able to hold size bytes, or nil when that would exceed
 // the limit or memory cannot be obtained.
 func (a *arena) alloc(size int64) *blob {
-	n := a.blocksFor(size)
+	b := a.newBlob()
+	b.size = size
+	if !a.grow(b, a.blocksFor(size)) {
+		return nil
+	}
 
+	return b
+}
+
+// newBlob returns a blob that holds nothing yet, to be grown as its body
+// arrives.
+func (a *arena) newBlob() *blob {
+	b := &blob{a: a, blockSize: a.blockSize}
+	b.refs.Store(1)
+
+	return b
+}
+
+// grow gives b n more blocks. It reports whether it could: not when that
+// would exceed the limit or memory cannot be obtained. The caller sees to it
+// that nobody reads the list of blocks of b meanwhile.
+func (a *arena) grow(b *blob, n int) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	if a.retired || int(a.inUse.Load())+n > a.limit {
-		return nil
+		return false
 	}
 
 	for len(a.free)+len(a.cold)+len(a.segs)*a.segBlocks-a.carved < n {
 		seg, err := mapSegment(a.segBlocks * a.blockSize)
 		if err != nil {
-			return nil
+			return false
 		}
 		a.segs = append(a.segs, seg)
 	}
 
-	b := &blob{a: a, size: size, blockSize: a.blockSize, ids: make([]uint32, n), blocks: make([][]byte, n)}
-	for i := range n {
+	for range n {
 		var id uint32
 		switch {
 		case len(a.free) > 0:
@@ -80,13 +100,12 @@ func (a *arena) alloc(size int64) *blob {
 			id = uint32(a.carved)
 			a.carved++
 		}
-		b.ids[i] = id
-		b.blocks[i] = a.block(id)
+		b.ids = append(b.ids, id)
+		b.blocks = append(b.blocks, a.block(id))
 	}
-	b.refs.Store(1)
 	a.inUse.Add(int64(n))
 
-	return b
+	return true
 }
 
 func (a *arena) block(id uint32) []byte {
@@ -191,9 +210,11 @@ func (a *arena) residentBytes() int64 {
 }
 
 // blob is a body held in arena blocks. It is reference counted: the index
-// owns one reference while the blob is attached to an entry, and every reader
-// owns one while it serves from it. References are only taken under the store
-// lock from an attached blob, so the count can never climb back from zero.
+// owns one reference while the blob is attached to an entry, the Writer
+// receiving the body owns one until it is done, and every reader owns one
+// while it serves from it. References are only taken under the store lock
+// from an attached blob, or under the lock of the Writer from the blob it
+// holds, so the count can never climb back from zero.
 type blob struct {
 	a         *arena
 	ids       []uint32
@@ -226,6 +247,45 @@ func (b *blob) fill(r io.ReaderAt, off int64) error {
 	return nil
 }
 
+// write copies p into the blob at offset off, which its blocks must cover.
+func (b *blob) write(p []byte, off int64) {
+	bs := int64(b.blockSize)
+	for len(p) > 0 {
+		n := copy(b.blocks[off/bs][off%bs:], p)
+		p = p[n:]
+		off += int64(n)
+	}
+}
+
+// readBlocks copies to p what the blocks, of bs bytes each, hold from offset
+// off to end. It returns the number of bytes copied.
+func readBlocks(p []byte, blocks [][]byte, bs, off, end int64) int {
+	n := 0
+	for n < len(p) && off < end {
+		i := off / bs
+		c := copy(p[n:], blocks[i][off%bs:min(bs, end-i*bs)])
+		n += c
+		off += int64(c)
+	}
+
+	return n
+}
+
+// writeTo writes the first size bytes of the blob to w, a few blocks at a
+// time. The caller sees to it that the blob is not grown meanwhile.
+func (b *blob) writeTo(w io.Writer, size int64) error {
+	bw := bufio.NewWriterSize(w, 64<<10)
+
+	bs := int64(b.blockSize)
+	for i := int64(0); i*bs < size; i++ {
+		if _, err := bw.Write(b.blocks[i][:min(bs, size-i*bs)]); err != nil {
+			return err
+		}
+	}
+
+	return bw.Flush()
+}
+
 // blobReader reads a blob as a stream. The caller must hold a reference on
 // the blob for as long as it uses the reader.
 type blobReader struct {
@@ -238,16 +298,8 @@ func (r *blobReader) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 
-	bs := int64(r.b.blockSize)
-	n := 0
-	for n < len(p) && r.off < r.b.size {
-		i := r.off / bs
-		start := r.off % bs
-		end := min(bs, r.b.size-i*bs)
-		c := copy(p[n:], r.b.blocks[i][start:end])
-		n += c
-		r.off += int64(c)
-	}
+	n := readBlocks(p, r.b.blocks, int64(r.b.blockSize), r.off, r.b.size)
+	r.off += int64(n)
 
 	return n, nil
 }

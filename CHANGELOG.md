@@ -21,6 +21,7 @@ First release of this module, forked from [caddyserver/cache-handler](https://gi
 ### Added
 
 * Options `path`, `max_size`, `max_memory`, `max_file_count`, `inactive`, `lock_timeout`.
+* Option `min_uses`: a response is kept in memory only until it has been requested that many times, and written to disk then. Responses that are requested once cost no disk write.
 * `key { sort_query }` and Caddy placeholders in `key { template }`.
 
 ### Removed

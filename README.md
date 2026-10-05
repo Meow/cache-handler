@@ -32,6 +32,7 @@ It works the way nginx's `proxy_cache` does: responses are stored as files in a 
 | Client disconnects during a download | The download continues and is stored, if its length is known. | The download is aborted, nothing is stored. | The download continues and is stored. |
 | Expired responses | Revalidated with a conditional request; optionally served stale meanwhile or on error. | Revalidated; optionally served stale. | Refetched, or revalidated with `proxy_cache_revalidate`; optionally served stale. |
 | Restart | The cache is kept, and usable at once. | Depends on the storage. | The cache is kept. |
+| Responses requested once | With `min_uses 2`, kept in memory and never written to disk. | Written to the storage. | With `proxy_cache_min_uses 2`, not cached: the second request goes to the upstream too. |
 | Shared between instances | No. | Yes, with a distributed storage. | No. |
 | Purge | By key, prefix or regular expression, on the admin endpoint. | By key, regular expression or surrogate key, with CDN propagation. | By key in the commercial version, or with third-party modules. |
 | Cached methods | `GET` (and `HEAD` from it). | Configurable, including `POST` with the body in the key. | Configurable. |
@@ -56,6 +57,7 @@ Known limits of this module, besides what the notice above lists:
 * A `Range` request for a response that is not cached is streamed as the response arrives, while the whole response is stored.
 * A response keeps being stored when the client that asked for it disconnects.
 * The cache survives restarts and crashes: files are written atomically and the index is rebuilt from them in the background.
+* Optionally, a response is only written to disk once it is requested again (`min_uses`), and served from memory until then: the many responses that are requested once and never again cost no disk write.
 * Expired responses are revalidated with `If-None-Match` / `If-Modified-Since` instead of being downloaded again, and can be served stale while they are updated or when the upstream fails.
 * `Range`, `If-None-Match`, `If-Modified-Since` and `HEAD` requests are answered from the cache.
 * `Vary` support, with `Accept-Encoding` normalized so that compressed variants are not multiplied.
@@ -100,6 +102,7 @@ cache [<matcher>] {
     max_memory 8Gi
     max_file_count 1000000
     inactive 30d
+    min_uses 2
 
     ttl 24h
     stale 1h
@@ -134,6 +137,7 @@ cache [<matcher>] {
 | `max_memory` | `256Mi` | RAM the cache may take, for its index and for the most requested responses. `off` keeps the responses on disk only. |
 | `max_file_count` | none | Number of files the cache may hold. The least recently used responses are removed to stay under it. Use it when the filesystem runs out of inodes before it runs out of space, which many small responses can do. |
 | `inactive` | none | Removes the responses that were not requested for this long, fresh or not. |
+| `min_uses` | `1` | Number of requests after which a response is written to disk. With `2` or more, a response is kept in memory only until it has been requested that many times, and is lost if Caddy stops before. See [Requested once](#requested-once). Not available with `max_memory off`. |
 | `ttl` | `120s` | How long a response is fresh when the upstream does not say (no `Cache-Control: max-age` / `s-maxage`, no `Expires`). |
 | `stale` | `0` | How long past its freshness a response may still be served while it is being updated, or when the upstream fails. `Cache-Control: stale-while-revalidate` and `stale-if-error` in a response override it. |
 | `lock_timeout` | `5s` | How long a request waits for the upstream to start answering another request for the same response, before going to the upstream itself. |
@@ -159,15 +163,27 @@ Every stored response is one file under `path`. It is written to a temporary fil
 
 An index of the files is kept in memory. On start it is rebuilt by reading the directory in the background; meanwhile, requests find the files that are not indexed yet directly on disk, so the cache is warm immediately.
 
-A response requested at least twice in a few minutes is copied to memory, provided it is requested more than the response it would push out. Responses in memory are still on disk: memory is an accelerator, never the only copy.
+A response requested at least twice in a few minutes is copied to memory, provided it is requested more than the response it would push out. Responses in memory are still on disk: memory is an accelerator, never the only copy, unless `min_uses` says otherwise.
+
+### Requested once
+
+On most sites, most of the responses a cache stores are requested once and never again. Writing them to disk wears the disk, and competes with the reads that serve the responses people do ask for, to no benefit. This is what Cloudflare [observed](https://blog.cloudflare.com/why-we-started-putting-unpopular-assets-in-memory/) on its own cache, and `min_uses` applies the same remedy.
+
+With `min_uses 2`, a new response is stored in memory only. If it is requested a second time, that request is served from memory, and the response is then written to disk, where it stays like any other. If it is not, it is dropped from memory when the responses that came after it need the room, without ever having touched the disk. A higher value waits for more requests. The requests that are served from a response while it downloads count.
+
+Unlike nginx's `proxy_cache_min_uses`, the response is cached from its first request on: the second request is a hit, not another trip to the upstream. That holds for as long as memory keeps the response, which depends on how much there is and on how fast new responses arrive. Responses waiting for their next request share half of `max_memory`, the least recently requested ones leaving first. A response that left this way is remembered, at a cost of a few bytes: when it is requested again it is fetched again, but this time written to disk. A response requested twice is therefore fetched once in the usual case, and twice otherwise, as it always is by nginx. Only a response that comes back after so long that it has been forgotten starts over.
+
+Some responses are written to disk at their first request as if `min_uses` were not set: those larger than an eighth of `max_memory`, and those arriving when the memory they may use is all taken by other responses that are still downloading. So are the new versions of a response that is already on disk.
+
+What is in memory only does not survive Caddy stopping: after a restart, a response that was requested once is fetched again. A configuration reload keeps everything.
 
 ### Limits
 
 `max_size` covers the cache files and the downloads in progress. When a response does not fit, the least recently used ones are deleted to make room. A response larger than half of `max_size` (or than `max_cacheable_body_bytes`) is not stored.
 
-`max_file_count` counts one file per stored response, one more per URL whose responses vary (it records which request headers select them), and one per download in progress. A download that would exceed it evicts the least recently used response first. Besides these files the cache directory holds up to 258 directories and two small files of its own, which are not counted.
+`max_file_count` counts one file per response stored on disk, one more per URL whose responses vary (it records which request headers select them), and one per download in progress. A download that would exceed it evicts the least recently used response first. Besides these files the cache directory holds up to 258 directories and two small files of its own, which are not counted.
 
-`max_memory` covers the index (about 200 bytes plus the key per file) and the bodies and headers kept in memory. The bodies live outside the Go heap, in memory mapped for that purpose and returned to the system when the budget shrinks, so they do not weigh on the garbage collector. When the index alone approaches the budget, which takes millions of files, the least recently used files are removed.
+`max_memory` covers the index (about 200 bytes plus the key per file) and the bodies and headers kept in memory. The bodies live outside the Go heap, in memory mapped for that purpose and returned to the system when the budget shrinks, so they do not weigh on the garbage collector. When the index alone approaches the budget, which takes millions of files, the least recently used files are removed. With `min_uses`, the responses that are in memory only, headers included, take at most half of the budget, and the body of one of them at most an eighth; the copies of what is on disk make room for them.
 
 What is not counted is what serving requests takes: a few tens of kilobytes of buffers per request in progress, whatever the size of the response.
 
@@ -260,6 +276,8 @@ The cache is observed and purged through [Caddy's admin endpoint](https://caddys
 
 ```sh
 # State of the caches: entries, bytes on disk and in memory, hits, misses, evictions…
+# With min_uses: transient_entries are in memory only, persisted counts the responses
+# written to disk at a later request, dropped those that never were.
 curl localhost:2019/cache/stats
 
 # Remove the response stored for a key, as shown in Cache-Status
@@ -283,6 +301,7 @@ With several caches, add `path=<directory>` to purge one of them only.
 | `max_size=25000m` | `max_size 25000m`. nginx has no limit on the number of files; here there is `max_file_count`. |
 | `keys_zone=name:8m` | Not needed: the index is part of `max_memory`. |
 | `inactive=720m` | `inactive 720m` |
+| `proxy_cache_min_uses 2` | `min_uses 2`. The response is kept in memory until its second request instead of not being cached, see [Requested once](#requested-once). |
 | `levels=1:2`, `use_temp_path=off` | Not needed. |
 | `proxy_cache_valid 6h` | `ttl 6h`. Add `allowed_additional_status_codes 302` to cover the same statuses. |
 | `proxy_cache_key $request_filename` | `key { template ... }`, see [Cache key](#cache-key). |

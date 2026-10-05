@@ -1705,6 +1705,104 @@ func TestCacheSurvivesReloadAndRestart(t *testing.T) {
 	}
 }
 
+// TestMinUses checks that with min_uses a response is kept in memory until
+// it is requested again, and only then written to disk.
+func TestMinUses(t *testing.T) {
+	const size = 50_000
+	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/varied/"):
+			w.Header().Set("Vary", "Accept-Language")
+			_, _ = io.WriteString(w, r.Header.Get("Accept-Language")+" "+r.URL.Path)
+		case strings.HasPrefix(r.URL.Path, "/stream/"):
+			// No announced length, and more than memory is to hold of one
+			// response.
+			body := bodyFor(r.URL.Path, 300_000)
+			for off := 0; off < len(body); off += 30_000 {
+				_, _ = w.Write(body[off : off+30_000])
+				w.(http.Flusher).Flush()
+			}
+		default:
+			w.Header().Set("Content-Length", fmt.Sprint(size))
+			_, _ = w.Write(bodyFor(r.URL.Path, size))
+		}
+	})
+	dir := t.TempDir()
+	options := `
+			ttl 1h
+			max_memory 1Mi
+			min_uses 2`
+	site := `
+		cache
+		reverse_proxy ` + up.addr()
+	tester := startCaddy(t, dir, options, site)
+	const prefix = "GET-http-localhost:9080-"
+
+	// The first request stores the response, in memory only.
+	for _, path := range []string{"/twice", "/once"} {
+		resp, body := get(t, tester, path)
+		expectStatus(t, resp, "Caddy; fwd=uri-miss; stored; key="+prefix+path)
+		expectBody(t, body, string(bodyFor(path, size)))
+	}
+	_, body := get(t, tester, "/varied/page", "Accept-Language: fr")
+	expectBody(t, body, "fr /varied/page")
+	if st := cacheStats(t); cacheFiles(dir) != 0 || st.Entries != 4 || st.TransientEntries != 4 || st.DiskBytes != 0 {
+		t.Fatalf("%d files after the first requests: %+v", cacheFiles(dir), st)
+	}
+
+	// The second is served from memory, and has the response written.
+	resp, body := get(t, tester, "/twice")
+	if tier := expectHit(t, resp, prefix+"/twice", 3600); tier != "MEMORY" {
+		t.Errorf("second request served from %s, want MEMORY", tier)
+	}
+	expectBody(t, body, string(bodyFor("/twice", size)))
+	waitFor(t, "the response requested twice to be written", func() bool { return cacheFiles(dir) == 1 })
+
+	// So does it for a response that varies, along with what tells its
+	// variants apart.
+	resp, body = get(t, tester, "/varied/page", "Accept-Language: fr")
+	expectHit(t, resp, prefix+"/varied/page", 3600)
+	expectBody(t, body, "fr /varied/page")
+	waitFor(t, "the variant requested twice to be written", func() bool { return cacheFiles(dir) == 3 })
+	waitFor(t, "the counters to tell", func() bool {
+		st := cacheStats(t)
+		return st.Persisted == 2 && st.TransientEntries == 1
+	})
+
+	// A response memory cannot hold is written as it arrives, as without
+	// min_uses.
+	large := string(bodyFor("/stream/large", 300_000))
+	resp, body = get(t, tester, "/stream/large")
+	expectStatus(t, resp, "Caddy; fwd=uri-miss; stored; key="+prefix+"/stream/large")
+	expectBody(t, body, large)
+	waitFor(t, "the large response to be stored", func() bool { return cacheFiles(dir) == 4 })
+	resp, body = get(t, tester, "/stream/large")
+	if tier := expectHit(t, resp, prefix+"/stream/large", 3600); tier != "DISK" {
+		t.Errorf("large response served from %s, want DISK", tier)
+	}
+	expectBody(t, body, large)
+	if st := cacheStats(t); st.Persisted != 2 || st.MemoryBytes > 1<<20 {
+		t.Errorf("unexpected stats: %+v", st)
+	}
+
+	// Closing the store, as stopping Caddy does, loses what was requested
+	// once and nothing else.
+	startCaddy(t, t.TempDir(), options, site)
+	tester = startCaddy(t, dir, options, site)
+	for _, path := range []string{"/twice", "/varied/page", "/stream/large"} {
+		resp, _ = get(t, tester, path, "Accept-Language: fr")
+		if status := resp.Header.Get("Cache-Status"); !strings.Contains(status, "; hit; ") {
+			t.Errorf("%s after a restart: %s, want a hit", path, status)
+		}
+	}
+	resp, _ = get(t, tester, "/once")
+	expectStatus(t, resp, "Caddy; fwd=uri-miss; stored; key="+prefix+"/once")
+
+	if n := up.hits.Load(); n != 5 {
+		t.Errorf("the upstream got %d requests, want 5", n)
+	}
+}
+
 func TestAdminAPI(t *testing.T) {
 	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, r.URL.Path)
@@ -2215,6 +2313,9 @@ func TestInvalidConfigurations(t *testing.T) {
 		"max_memory 4k":                    "max_memory must be at least",
 		"max_file_count lots":              "invalid max_file_count",
 		"max_file_count 0":                 "invalid max_file_count",
+		"min_uses 0":                       "invalid min_uses",
+		"min_uses 5000":                    "min_uses must be between",
+		"min_uses 2\n max_memory off":      "max_memory off does not allow",
 		"mode relaxed":                     "unknown cache mode",
 		"ttl":                              "wrong argument count",
 		"ttl soon":                         "invalid duration",

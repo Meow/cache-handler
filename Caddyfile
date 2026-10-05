@@ -34,6 +34,14 @@
 		respond "Hello, stale!"
 	}
 
+	# Kept in memory only at first, written to disk at its second request.
+	route /min-uses {
+		cache {
+			min_uses 2
+		}
+		respond "Hello, again!"
+	}
+
 	# One stored response per value of the X-Something request header.
 	route /vary {
 		cache {

@@ -661,7 +661,7 @@ func (x *exchange) refresh(stale *Hit, fw *fetchWriter, now time.Time) *Hit {
 		rec.flags |= flagMustRevalidate
 	}
 
-	if err := x.store.Rewrite(stale, rec); err != nil {
+	if err := x.store.Rewrite(stale, rec, x.c.minUses); err != nil {
 		return stale
 	}
 	if _, hit := x.store.Lookup(x.key, x.r.Header); hit != nil {

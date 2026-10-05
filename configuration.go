@@ -26,6 +26,9 @@ const (
 	// minMaxMemory is the smallest memory budget accepted: below it the
 	// index could not even describe a useful number of files.
 	minMaxMemory = 1 << 20
+	// maxMinUses is the largest number of requests a response can be made
+	// to wait for before it is written to disk.
+	maxMinUses = 1000
 )
 
 // KeyOptions tunes how the cache key of a request is built. By default the
@@ -78,6 +81,11 @@ type Options struct {
 	// Remove the responses that were not requested for that long.
 	// Default: keep them until the space is needed.
 	Inactive caddy.Duration `json:"inactive,omitempty"`
+	// Number of requests after which a response is written to disk. Until
+	// then it is kept in memory, within half of max_memory, and dropped from
+	// there by the responses that follow if it is not requested again.
+	// Default: 1, every response is written to disk as it is received.
+	MinUses int `json:"min_uses,omitempty"`
 	// How long a response is fresh when the upstream does not say.
 	// Default: 120s.
 	TTL caddy.Duration `json:"ttl,omitempty"`
@@ -121,6 +129,9 @@ func (o Options) inherit(parent Options) Options {
 	}
 	if o.Inactive == 0 {
 		o.Inactive = parent.Inactive
+	}
+	if o.MinUses == 0 {
+		o.MinUses = parent.MinUses
 	}
 	if o.TTL == 0 {
 		o.TTL = parent.TTL
@@ -167,6 +178,7 @@ type config struct {
 	ignoreResponse bool
 	defaultCC      string
 	maxBody        int64
+	minUses        int
 	extraStatus    map[int]bool
 	key            KeyOptions
 	keyHeaders     []string
@@ -183,6 +195,7 @@ func (o Options) resolve() (*config, error) {
 		lockTimeout: time.Duration(o.LockTimeout),
 		defaultCC:   o.DefaultCacheControl,
 		maxBody:     int64(o.MaxBodyBytes),
+		minUses:     o.MinUses,
 		extraStatus: make(map[int]bool),
 		limits: Limits{
 			MaxSize:   int64(o.MaxSize),
@@ -218,6 +231,15 @@ func (o Options) resolve() (*config, error) {
 
 	if c.limits.MaxFiles < 0 {
 		return nil, fmt.Errorf("max_file_count must be positive")
+	}
+
+	switch {
+	case c.minUses == 0:
+		c.minUses = 1
+	case c.minUses < 1 || c.minUses > maxMinUses:
+		return nil, fmt.Errorf("min_uses must be between 1 and %d", maxMinUses)
+	case c.minUses > 1 && c.limits.MaxMemory == 0:
+		return nil, fmt.Errorf("min_uses keeps the responses in memory until they are requested again, which max_memory off does not allow")
 	}
 
 	if c.ttl < 0 || c.stale < 0 || c.lockTimeout < 0 || c.limits.Inactive < 0 || c.maxBody < 0 {
@@ -336,6 +358,16 @@ func parseOptions(d *caddyfile.Dispenser, o *Options) error {
 					return d.Errf("invalid max_file_count %q: expected a positive number of files", arg)
 				}
 				o.MaxFileCount = count
+			case "min_uses":
+				var arg string
+				if !d.AllArgs(&arg) {
+					return d.ArgErr()
+				}
+				uses, err := strconv.Atoi(arg)
+				if err != nil || uses < 1 {
+					return d.Errf("invalid min_uses %q: expected a positive number of requests", arg)
+				}
+				o.MinUses = uses
 			case "max_cacheable_body_bytes":
 				if err := parseSizeArg(d, &o.MaxBodyBytes); err != nil {
 					return err
