@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -118,12 +119,19 @@ func expectStatus(t *testing.T, resp *http.Response, want string) {
 var hitPattern = regexp.MustCompile(`^Caddy; hit; ttl=(\d+); detail=(DISK|MEMORY); key=(.+)$`)
 
 // expectHit checks that the response is a fresh one from the cache and
-// returns the tier it came from.
+// returns the tier it came from. The ttl may fall short by up to two
+// seconds: one for the time the test takes, and one because the age of a
+// response counts from its Date header, which the upstream stamps in whole
+// seconds, so a response can look up to a second older than it is.
 func expectHit(t *testing.T, resp *http.Response, key string, ttl int) string {
 	t.Helper()
 
 	m := hitPattern.FindStringSubmatch(resp.Header.Get("Cache-Status"))
-	if m == nil || m[3] != key || (m[1] != fmt.Sprint(ttl) && m[1] != fmt.Sprint(ttl-1)) {
+	if m == nil || m[3] != key {
+		t.Errorf("Cache-Status: %s\n         want: a hit for %s with ttl=%d", resp.Header.Get("Cache-Status"), key, ttl)
+		return ""
+	}
+	if got, _ := strconv.Atoi(m[1]); got > ttl || got < ttl-2 {
 		t.Errorf("Cache-Status: %s\n         want: a hit for %s with ttl=%d", resp.Header.Get("Cache-Status"), key, ttl)
 		return ""
 	}
