@@ -945,7 +945,6 @@ func (s *Store) usesLeftLocked(id ID, minUses int) uint16 {
 	return uint16(min(minUses, math.MaxUint16))
 }
 
-// createFile creates the temporary file of the response.
 func (w *Writer) createFile() (*os.File, os.FileInfo, error) {
 	s := w.s
 

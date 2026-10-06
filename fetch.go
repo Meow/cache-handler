@@ -218,7 +218,6 @@ func (fw *fetchWriter) prepareRequest(r *http.Request) (restore func()) {
 	}
 }
 
-// Header implements http.ResponseWriter.
 func (fw *fetchWriter) Header() http.Header {
 	return fw.hdr
 }
@@ -516,7 +515,6 @@ func (fw *fetchWriter) startPumpLocked(count int64) {
 	}()
 }
 
-// Write implements http.ResponseWriter.
 func (fw *fetchWriter) Write(p []byte) (int, error) {
 	fw.mu.Lock()
 	defer fw.mu.Unlock()
@@ -611,7 +609,6 @@ func (fw *fetchWriter) Write(p []byte) (int, error) {
 	}
 }
 
-// Flush implements http.Flusher.
 func (fw *fetchWriter) Flush() {
 	fw.mu.Lock()
 	defer fw.mu.Unlock()

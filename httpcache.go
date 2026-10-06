@@ -780,7 +780,6 @@ func seconds(d time.Duration) uint32 {
 	return uint32(min(max(d/time.Second, 0), 1<<32-1))
 }
 
-// Interface guards
 var (
 	_ caddy.Provisioner           = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)

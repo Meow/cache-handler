@@ -2074,10 +2074,8 @@ func TestBlobReader(t *testing.T) {
 	}
 }
 
-// errInjected is the failure the tests inject.
 var errInjected = errors.New("injected failure")
 
-// failingWriter refuses whatever it is given.
 type failingWriter struct{}
 
 func (failingWriter) Write([]byte) (int, error) { return 0, errInjected }

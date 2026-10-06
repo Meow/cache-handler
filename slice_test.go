@@ -644,7 +644,6 @@ func TestSlicesOfAVaryingResponse(t *testing.T) {
 	}
 }
 
-// gunzip inflates the body of a response that was compressed.
 func gunzip(t *testing.T, body string) string {
 	t.Helper()
 
@@ -660,7 +659,6 @@ func gunzip(t *testing.T, body string) string {
 	return string(plain)
 }
 
-// compressibleText returns a body that compression makes much smaller.
 func compressibleText(size int) string {
 	var text strings.Builder
 	for i := 0; text.Len() < size; i++ {

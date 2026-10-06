@@ -49,12 +49,9 @@ import (
 const sliceSelector = ":slice"
 
 var (
-	// errSliceAnswered tells that the request was answered without slices.
 	errSliceAnswered = errors.New("cache: the request was answered without slices")
-	// errSliceBeyond tells that the response ends before the slice.
-	errSliceBeyond = errors.New("cache: the response ends before the slice")
-	// errSliceWhole tells that the response cannot be had in slices.
-	errSliceWhole = errors.New("cache: the response cannot be fetched in slices")
+	errSliceBeyond   = errors.New("cache: the response ends before the slice")
+	errSliceWhole    = errors.New("cache: the response cannot be fetched in slices")
 	// errSliceChanged tells that the upstream no longer has the response
 	// the slices sent so far belong to.
 	errSliceChanged = errors.New("cache: the response changed while it was being sent")
@@ -560,7 +557,6 @@ func (sr *sliceReader) flush() {
 	}
 }
 
-// Seek implements io.Seeker.
 func (sr *sliceReader) Seek(offset int64, whence int) (int64, error) {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()

@@ -30,7 +30,6 @@ func init() {
 // purge to the cache in that directory; without it every cache is purged.
 type adminAPI struct{}
 
-// CaddyModule returns the Caddy module information.
 func (*adminAPI) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "admin.api.cache",
@@ -38,7 +37,6 @@ func (*adminAPI) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Routes returns the admin routes.
 func (a *adminAPI) Routes() []caddy.AdminRoute {
 	return []caddy.AdminRoute{
 		{Pattern: "/cache/stats", Handler: caddy.AdminHandlerFunc(a.handleStats)},
