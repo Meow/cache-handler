@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="625" viewBox="0 0 820 625" role="img" aria-labelledby="t d">
+<title id="t">Requests per second of each option, against Caddy without a cache</title>
+<desc id="d">Horizontal bars, three panels. A hit from memory costs a few percent against respond and is 30% faster than file_server; in front of a reverse proxy it answers 2.3 times the requests. max_memory off, Vary, slices and uncacheable responses each cost from 5% to 23%.</desc>
+<style>
+  text { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 12px; fill: #52514e; }
+  .title { font-size: 15px; font-weight: 600; fill: #0b0b0b; }
+  .panel { font-size: 13px; font-weight: 600; fill: #0b0b0b; }
+  .label { fill: #0b0b0b; }
+  .value { fill: #52514e; font-variant-numeric: tabular-nums; }
+  .cache { fill: #2a78d6; }
+  .none { fill: #eb6834; }
+  .axis { stroke: #d9d8d3; stroke-width: 1; }
+  @media (prefers-color-scheme: dark) {
+    text { fill: #c3c2b7; }
+    .title, .panel, .label { fill: #ffffff; }
+    .value { fill: #c3c2b7; }
+    .cache { fill: #3987e5; }
+    .none { fill: #d95926; }
+    .axis { stroke: #3a3a37; }
+  }
+</style>
+<text x="0" y="24" class="title">Requests per second of each option, against Caddy without a cache</text>
+<text x="0" y="43">Ryzen 9 9900X, all cores, plain HTTP, 64 keep-alive connections, median of 3 runs of 100,000 requests. One response, requested over and over.</text>
+<rect x="0" y="57" width="12" height="12" rx="3" class="cache"/>
+<text x="18" y="67">Served from the cache</text>
+<rect x="172.20000000000002" y="57" width="12" height="12" rx="3" class="none"/>
+<text x="190.20000000000002" y="67">No cache: the handler itself</text>
+<text x="0" y="97" class="panel">Text, 13 bytes, from respond</text>
+<text x="238" y="122" text-anchor="end" class="label">No cache</text>
+<path class="none" d="M250,111 h462.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-462.0 z"/>
+<text x="726.0" y="122" class="value">274k</text>
+<text x="238" y="156" text-anchor="end" class="label">cache</text>
+<path class="cache" d="M250,145 h439.9 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-439.9 z"/>
+<text x="703.9" y="156" class="value">261k (0.95x)</text>
+<text x="238" y="182" text-anchor="end" class="label">cache, max_memory off</text>
+<path class="cache" d="M250,171 h378.4 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-378.4 z"/>
+<text x="642.4" y="182" class="value">225k (0.82x)</text>
+<text x="238" y="208" text-anchor="end" class="label">cache, min_uses 2</text>
+<path class="cache" d="M250,197 h441.7 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-441.7 z"/>
+<text x="705.7" y="208" class="value">262k (0.96x)</text>
+<text x="238" y="234" text-anchor="end" class="label">cache, response with Vary</text>
+<path class="cache" d="M250,223 h418.5 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-418.5 z"/>
+<text x="682.5" y="234" class="value">249k (0.91x)</text>
+<text x="238" y="260" text-anchor="end" class="label">cache, key template</text>
+<path class="cache" d="M250,249 h456.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-456.0 z"/>
+<text x="720.0" y="260" class="value">271k (0.99x)</text>
+<text x="238" y="286" text-anchor="end" class="label">cache, response with no-store</text>
+<path class="cache" d="M250,275 h356.3 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-356.3 z"/>
+<text x="620.3" y="286" class="value">212k (0.77x)</text>
+<line x1="249.5" y1="107" x2="249.5" y2="297" class="axis"/>
+<text x="0" y="327" class="panel">Image, 42 KiB, from file_server</text>
+<text x="238" y="352" text-anchor="end" class="label">No cache</text>
+<path class="none" d="M250,341 h345.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-345.0 z"/>
+<text x="609.0" y="352" class="value">112k</text>
+<text x="238" y="386" text-anchor="end" class="label">cache</text>
+<path class="cache" d="M250,375 h449.6 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-449.6 z"/>
+<text x="713.6" y="386" class="value">145k (1.30x)</text>
+<text x="238" y="412" text-anchor="end" class="label">cache, max_memory off</text>
+<path class="cache" d="M250,401 h440.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-440.0 z"/>
+<text x="704.0" y="412" class="value">142k (1.27x)</text>
+<text x="238" y="438" text-anchor="end" class="label">cache, min_uses 2</text>
+<path class="cache" d="M250,427 h462.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-462.0 z"/>
+<text x="726.0" y="438" class="value">149k (1.34x)</text>
+<text x="238" y="464" text-anchor="end" class="label">cache, slice 16Ki</text>
+<path class="cache" d="M250,453 h385.6 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-385.6 z"/>
+<text x="649.6" y="464" class="value">125k (1.12x)</text>
+<line x1="249.5" y1="337" x2="249.5" y2="475" class="axis"/>
+<text x="0" y="505" class="panel">The same image, from reverse_proxy to a file_server</text>
+<text x="238" y="530" text-anchor="end" class="label">No cache</text>
+<path class="none" d="M250,519 h195.6 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-195.6 z"/>
+<text x="459.6" y="530" class="value">63k</text>
+<text x="238" y="564" text-anchor="end" class="label">cache</text>
+<path class="cache" d="M250,553 h462.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-462.0 z"/>
+<text x="726.0" y="564" class="value">147k (2.33x)</text>
+<text x="238" y="590" text-anchor="end" class="label">cache, max_memory off</text>
+<path class="cache" d="M250,579 h443.6 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-443.6 z"/>
+<text x="707.6" y="590" class="value">141k (2.24x)</text>
+<line x1="249.5" y1="515" x2="249.5" y2="601" class="axis"/>
+</svg>

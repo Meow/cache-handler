@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="820" height="591" viewBox="0 0 820 591" role="img" aria-labelledby="t d">
-<title id="t">Requests per second over TLS, each cache in front of the same upstream, server on 8 cores</title>
-<desc id="d">Horizontal bars for a 13-byte text and a 42KiB image. Over TLS, this module serves about three quarters of what nginx does, on a par with Varnish behind hitch; caddyserver/cache-handler is far behind on the image.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="603" viewBox="0 0 820 603" role="img" aria-labelledby="t d">
+<title id="t">Requests per second over TLS, server on 8 cores</title>
+<desc id="d">Horizontal bars for a 13-byte text and a 42KiB image. Over TLS, this module serves about three quarters of what nginx does, a little more than Varnish behind hitch; caddyserver/cache-handler is far behind on the image.</desc>
 <style>
   text { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 12px; fill: #52514e; }
   .title { font-size: 15px; font-weight: 600; fill: #0b0b0b; }
@@ -23,58 +23,58 @@
 <text x="0" y="43">Ryzen 9 9900X, 64 keep-alive connections, median of 3 runs of 100,000 requests. Every cache is in front of the same upstream, a Caddy without a cache.</text>
 <rect x="0" y="57" width="12" height="12" rx="3" class="cache"/>
 <text x="18" y="67">Served from the cache</text>
-<rect x="176.4" y="57" width="12" height="12" rx="3" class="none"/>
-<text x="194.4" y="67">No cache: the upstream through the same server</text>
+<rect x="172.20000000000002" y="57" width="12" height="12" rx="3" class="none"/>
+<text x="190.20000000000002" y="67">No cache: the upstream through the same server</text>
 <text x="0" y="97" class="panel">Text, 13 bytes</text>
-<text x="238" y="122.0" text-anchor="end" class="label">This module</text>
-<path class="cache" d="M250,111 h343.4 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-343.4 z"/>
-<text x="603.4" y="122.0" class="value">206k</text>
-<text x="238" y="148.0" text-anchor="end" class="label">This module, max_memory off</text>
-<path class="cache" d="M250,137 h319.4 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-319.4 z"/>
-<text x="579.4" y="148.0" class="value">192k</text>
-<text x="238" y="174.0" text-anchor="end" class="label">caddyserver/cache-handler, Otter</text>
+<text x="238" y="122" text-anchor="end" class="label">This module</text>
+<path class="cache" d="M250,111 h347.6 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-347.6 z"/>
+<text x="611.6" y="122" class="value">210k</text>
+<text x="238" y="148" text-anchor="end" class="label">This module, max_memory off</text>
+<path class="cache" d="M250,137 h321.2 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-321.2 z"/>
+<text x="585.2" y="148" class="value">194k</text>
+<text x="238" y="174" text-anchor="end" class="label">caddyserver/cache-handler, Otter</text>
 <path class="cache" d="M250,163 h294.2 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-294.2 z"/>
-<text x="554.2" y="174.0" class="value">177k</text>
-<text x="238" y="200.0" text-anchor="end" class="label">nginx proxy_cache</text>
-<path class="cache" d="M250,189 h466.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-466.0 z"/>
-<text x="726.0" y="200.0" class="value">279k</text>
-<text x="238" y="226.0" text-anchor="end" class="label">Varnish, malloc, behind hitch</text>
-<path class="cache" d="M250,215 h315.5 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-315.5 z"/>
-<text x="575.5" y="226.0" class="value">190k</text>
-<text x="238" y="260.0" text-anchor="end" class="label">Caddy reverse_proxy</text>
-<path class="none" d="M250,249 h184.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-184.0 z"/>
-<text x="444.0" y="260.0" class="value">112k</text>
-<text x="238" y="286.0" text-anchor="end" class="label">nginx proxy_pass</text>
-<path class="none" d="M250,275 h340.2 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-340.2 z"/>
-<text x="600.2" y="286.0" class="value">204k</text>
-<text x="238" y="312.0" text-anchor="end" class="label">Varnish pass, behind hitch</text>
-<path class="none" d="M250,301 h172.5 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-172.5 z"/>
-<text x="432.5" y="312.0" class="value">105k</text>
-<line x1="249.5" y1="107" x2="249.5" y2="319" class="axis"/>
-<text x="0" y="349" class="panel">Image, 42 KiB (fixtures/test.png)</text>
-<text x="238" y="374.0" text-anchor="end" class="label">This module</text>
-<path class="cache" d="M250,363 h353.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-353.0 z"/>
-<text x="613.0" y="374.0" class="value">97k</text>
-<text x="238" y="400.0" text-anchor="end" class="label">This module, max_memory off</text>
-<path class="cache" d="M250,389 h339.8 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-339.8 z"/>
-<text x="599.8" y="400.0" class="value">93k</text>
-<text x="238" y="426.0" text-anchor="end" class="label">caddyserver/cache-handler, Otter</text>
-<path class="cache" d="M250,415 h10.5 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-10.5 z"/>
-<text x="270.5" y="426.0" class="value">3.9k</text>
-<text x="238" y="452.0" text-anchor="end" class="label">nginx proxy_cache</text>
-<path class="cache" d="M250,441 h466.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-466.0 z"/>
-<text x="726.0" y="452.0" class="value">128k</text>
-<text x="238" y="478.0" text-anchor="end" class="label">Varnish, malloc, behind hitch</text>
-<path class="cache" d="M250,467 h335.6 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-335.6 z"/>
-<text x="595.6" y="478.0" class="value">92k</text>
-<text x="238" y="512.0" text-anchor="end" class="label">Caddy reverse_proxy</text>
-<path class="none" d="M250,501 h222.6 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-222.6 z"/>
-<text x="482.6" y="512.0" class="value">62k</text>
-<text x="238" y="538.0" text-anchor="end" class="label">nginx proxy_pass</text>
-<path class="none" d="M250,527 h254.2 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-254.2 z"/>
-<text x="514.2" y="538.0" class="value">70k</text>
-<text x="238" y="564.0" text-anchor="end" class="label">Varnish pass, behind hitch</text>
-<path class="none" d="M250,553 h224.7 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-224.7 z"/>
-<text x="484.7" y="564.0" class="value">62k</text>
-<line x1="249.5" y1="359" x2="249.5" y2="571" class="axis"/>
+<text x="558.2" y="174" class="value">178k</text>
+<text x="238" y="200" text-anchor="end" class="label">nginx proxy_cache</text>
+<path class="cache" d="M250,189 h462.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-462.0 z"/>
+<text x="726.0" y="200" class="value">279k</text>
+<text x="238" y="226" text-anchor="end" class="label">Varnish, malloc, behind hitch</text>
+<path class="cache" d="M250,215 h327.2 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-327.2 z"/>
+<text x="591.2" y="226" class="value">198k</text>
+<text x="238" y="260" text-anchor="end" class="label">Caddy reverse_proxy</text>
+<path class="none" d="M250,249 h182.5 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-182.5 z"/>
+<text x="446.5" y="260" class="value">112k</text>
+<text x="238" y="286" text-anchor="end" class="label">nginx proxy_pass</text>
+<path class="none" d="M250,275 h339.7 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-339.7 z"/>
+<text x="603.7" y="286" class="value">205k</text>
+<text x="238" y="312" text-anchor="end" class="label">Varnish pass, behind hitch</text>
+<path class="none" d="M250,301 h174.2 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-174.2 z"/>
+<text x="438.2" y="312" class="value">107k</text>
+<line x1="249.5" y1="107" x2="249.5" y2="323" class="axis"/>
+<text x="0" y="353" class="panel">Image, 42 KiB (fixtures/test.png)</text>
+<text x="238" y="378" text-anchor="end" class="label">This module</text>
+<path class="cache" d="M250,367 h348.5 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-348.5 z"/>
+<text x="612.5" y="378" class="value">97k</text>
+<text x="238" y="404" text-anchor="end" class="label">This module, max_memory off</text>
+<path class="cache" d="M250,393 h338.9 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-338.9 z"/>
+<text x="602.9" y="404" class="value">95k</text>
+<text x="238" y="430" text-anchor="end" class="label">caddyserver/cache-handler, Otter</text>
+<path class="cache" d="M250,419 h10.2 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-10.2 z"/>
+<text x="274.2" y="430" class="value">3.9k</text>
+<text x="238" y="456" text-anchor="end" class="label">nginx proxy_cache</text>
+<path class="cache" d="M250,445 h462.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-462.0 z"/>
+<text x="726.0" y="456" class="value">129k</text>
+<text x="238" y="482" text-anchor="end" class="label">Varnish, malloc, behind hitch</text>
+<path class="cache" d="M250,471 h310.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-310.0 z"/>
+<text x="574.0" y="482" class="value">87k</text>
+<text x="238" y="516" text-anchor="end" class="label">Caddy reverse_proxy</text>
+<path class="none" d="M250,505 h220.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-220.0 z"/>
+<text x="484.0" y="516" class="value">62k</text>
+<text x="238" y="542" text-anchor="end" class="label">nginx proxy_pass</text>
+<path class="none" d="M250,531 h248.6 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-248.6 z"/>
+<text x="512.6" y="542" class="value">70k</text>
+<text x="238" y="568" text-anchor="end" class="label">Varnish pass, behind hitch</text>
+<path class="none" d="M250,557 h220.0 a4,4 0 0 1 4,4 v6 a4,4 0 0 1 -4,4 h-220.0 z"/>
+<text x="484.0" y="568" class="value">62k</text>
+<line x1="249.5" y1="363" x2="249.5" y2="579" class="axis"/>
 </svg>
