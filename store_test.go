@@ -1947,6 +1947,13 @@ func TestStoreClosed(t *testing.T) {
 }
 
 func TestArena(t *testing.T) {
+	// Blocks are no smaller than a page, whatever its size.
+	for pageSize, want := range map[int]int{4096: 4096, 1024: 4096, 16384: 16384} {
+		if a := newArenaFor(pageSize); a.blockSize != want || a.segBlocks != arenaSegmentSize/want {
+			t.Errorf("page size %d: block size %d, %d blocks per segment", pageSize, a.blockSize, a.segBlocks)
+		}
+	}
+
 	a := newArena()
 	bs := int64(a.blockSize)
 

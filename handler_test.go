@@ -650,6 +650,13 @@ func TestUnsafeMethods(t *testing.T) {
 	c.expect(c.get("/e", up), "/e", "fwd=uri-miss; stored")
 	// A Location that cannot be read is not an error.
 	unsafe(http.MethodPost, respond(http.StatusCreated, "", "Location: ::not a url"))
+
+	// With a key template there is no telling the key of another URI.
+	templated := newCacheTest(t, Options{Key: &KeyOptions{Template: "{http.request.uri.path}"}})
+	x := &exchange{c: templated.h.cfg, r: newRequest(http.MethodPost, "/a")}
+	if keys := x.locationKeys(x.r.URL, http.Header{"Location": {"/b"}}); keys != nil {
+		t.Errorf("keys for a templated Location: %v", keys)
+	}
 }
 
 // TestAgeFromDate checks that a response's age counts from its Date, not

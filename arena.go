@@ -33,10 +33,15 @@ type arena struct {
 }
 
 func newArena() *arena {
+	return newArenaFor(os.Getpagesize())
+}
+
+// newArenaFor returns an arena for a system whose pages have the given size.
+func newArenaFor(pageSize int) *arena {
 	bs := 4096
 	// Blocks are released page by page, so they must be page aligned.
-	if ps := os.Getpagesize(); ps > bs {
-		bs = ps
+	if pageSize > bs {
+		bs = pageSize
 	}
 
 	return &arena{blockSize: bs, segBlocks: arenaSegmentSize / bs}
