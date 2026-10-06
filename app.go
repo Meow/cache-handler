@@ -65,11 +65,11 @@ func (a *App) Provision(ctx caddy.Context) error {
 	return err
 }
 
-// Start implements caddy.App. The stores are opened here rather than when
-// the handlers are provisioned, because this only runs for a configuration
-// that is accepted and meant to serve: checking a configuration
-// (caddy validate), or loading one that turns out to be refused, must not
-// touch the cache of the server that is running, nor apply new limits to it.
+// Start implements caddy.App. The stores are opened here rather than at
+// Provision because Start only runs for a configuration that is accepted and
+// about to serve: caddy validate and a refused reload provision every module,
+// and must neither touch the running server's cache nor apply new limits to
+// it.
 func (a *App) Start() error {
 	defer a.readyOnce.Do(func() { close(a.ready) })
 
@@ -110,8 +110,8 @@ func (a *App) Stop() error {
 	return nil
 }
 
-// Cleanup implements caddy.CleanerUpper. It releases the requests that
-// would be waiting for an app that was never started.
+// Cleanup implements caddy.CleanerUpper. It releases the requests waiting
+// for an app that was never started.
 func (a *App) Cleanup() error {
 	a.readyOnce.Do(func() { close(a.ready) })
 

@@ -26,9 +26,9 @@ import (
 )
 
 // cacheTest is a cache handler with a store of its own, called directly
-// rather than through Caddy. It is for what takes a client that fails, an
-// upstream that does something at a precise moment, or a look at the store:
-// what a server and a network in between do not let a test decide.
+// rather than through Caddy. It is for tests that need a client that fails,
+// an upstream that acts at a precise moment, or a look at the store: things
+// a server and a network in between do not let a test control.
 type cacheTest struct {
 	t *testing.T
 	h *Handler
@@ -61,8 +61,8 @@ func newCacheTest(t *testing.T, o Options) *cacheTest {
 	}
 }
 
-// newFetch returns the writer of a fetch for key that no request runs, for
-// what is only seen of a fetch by calling for it.
+// newFetch returns the writer of a fetch for key, with no request running
+// it, for testing parts of a fetch directly.
 func (c *cacheTest) newFetch(key string) *fetchWriter {
 	x := &exchange{h: c.h, c: c.h.cfg, store: c.s, w: httptest.NewRecorder(), r: newRequest(http.MethodGet, "/a"), key: key}
 	fw := newFetchWriter(x, makeID(key), nil)
@@ -73,8 +73,8 @@ func (c *cacheTest) newFetch(key string) *fetchWriter {
 
 // outcome is how the handling of a request ended.
 type outcome struct {
-	// err is what the handler returned. aborted tells that it cut the
-	// response short, and panicked what else it panicked with.
+	// err is what the handler returned, aborted whether it cut the response
+	// short (http.ErrAbortHandler), and panicked any other panic value.
 	err      error
 	aborted  bool
 	panicked any
@@ -169,8 +169,8 @@ func (c *cacheTest) expectHit(rep *reply, path string, ttl int) {
 	}
 }
 
-// backend stands for the handlers behind the cache: an upstream, of which
-// it counts the requests.
+// backend stands for the handlers behind the cache: an upstream that
+// counts its requests.
 type backend struct {
 	calls  atomic.Int32
 	handle func(w http.ResponseWriter, r *http.Request, call int) error
@@ -193,8 +193,8 @@ func respond(status int, body string, headers ...string) *backend {
 }
 
 // sendHeader writes the header of a response with the given "Name: value"
-// headers. It has a type, without which the standard library reads the
-// beginning of a body to find one before it serves any of it.
+// headers. It sets a Content-Type, since without one the standard library
+// sniffs the beginning of the body before it serves any of it.
 func sendHeader(w http.ResponseWriter, status int, headers ...string) {
 	for _, h := range headers {
 		name, value, _ := strings.Cut(h, ": ")
@@ -250,10 +250,9 @@ func (c *brokenClient) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// watchedContext tells how far the request it belongs to got, by the number
-// of times it was asked for its Done channel: a request asks once to find
-// out whether the cache is ready, and again each time it starts waiting for
-// the fetch of another request.
+// watchedContext tells how far its request got by counting the times its
+// Done channel was asked for: once to find out whether the cache is ready,
+// then once each time the request starts waiting for another one's fetch.
 type watchedContext struct {
 	context.Context
 
@@ -293,9 +292,9 @@ func (c *watchedContext) Done() <-chan struct{} {
 	return c.Context.Done()
 }
 
-// waiting is the number of times a request asked its context when it waits
-// for the fetch of another one, and waitingAgain when it does again after
-// it found that the response being fetched is not for it.
+// waiting is the count of Done calls when a request waits for another one's
+// fetch, and waitingAgain when it waits again after finding that the
+// response being fetched is not for it.
 const (
 	waiting      = 2
 	waitingAgain = 3
@@ -365,8 +364,8 @@ func TestAppStart(t *testing.T) {
 		return app
 	}
 
-	// One of the directories cannot be made, for a file being in the way:
-	// the other is not left open.
+	// One directory cannot be made, a file being in the way: the other is not
+	// left open.
 	good := t.TempDir()
 	file := filepath.Join(t.TempDir(), "file")
 	if err := os.WriteFile(file, nil, 0o600); err != nil {
@@ -459,7 +458,8 @@ func TestProvision(t *testing.T) {
 	}
 }
 
-// TestAdminAPIRequests covers the admin endpoint, without one.
+// TestAdminAPIRequests covers the admin endpoint's handlers, called without
+// an admin server.
 func TestAdminAPIRequests(t *testing.T) {
 	api := new(adminAPI)
 	if routes := api.Routes(); len(routes) != 2 || routes[0].Pattern != "/cache/stats" || routes[1].Pattern != "/cache/purge" {
@@ -575,7 +575,7 @@ func TestRequestsThatBypass(t *testing.T) {
 		t.Errorf("the cache was involved: %+v", st)
 	}
 
-	// What the configuration keeps out of the cache, and what is no request
+	// What the configuration excludes, and an upgrade, which is no request
 	// for a response.
 	c = newCacheTest(t, Options{Regex: &RegexOptions{Exclude: "^/private/"}})
 	for _, r := range []*http.Request{newRequest(http.MethodGet, "/private/a"), newRequest(http.MethodGet, "/a", "Upgrade: websocket")} {
@@ -625,8 +625,8 @@ func TestUnsafeMethods(t *testing.T) {
 	}
 	c.expectHit(c.get("/a", up), "/a", 120)
 
-	// So does one of a method the cache does not know to be safe, while
-	// the safe ones leave the cache alone (RFC 9111, section 4.4).
+	// A method the cache does not know to be safe invalidates too; the safe
+	// ones leave the cache alone (RFC 9111, section 4.4).
 	unsafe("LOCK", respond(http.StatusOK, "locked"))
 	c.expect(c.get("/a", up), "/a", "fwd=uri-miss; stored")
 	unsafe(http.MethodOptions, respond(http.StatusNoContent, ""))
@@ -728,8 +728,8 @@ func TestRequestsNothingIsFetchedFor(t *testing.T) {
 	c.expect(c.get("/private", private), "/private", "fwd=uri-miss; detail=PRIVATE")
 }
 
-// TestHitFromMemory covers the response that has a copy in memory, made
-// here without waiting for it to be requested enough.
+// TestHitFromMemory covers a response with a copy in memory, promoted here
+// by hand rather than by being requested enough.
 func TestHitFromMemory(t *testing.T) {
 	c := newCacheTest(t, Options{})
 	up := respond(http.StatusOK, "0123456789")
@@ -753,8 +753,8 @@ func TestHitFromMemory(t *testing.T) {
 	}
 }
 
-// TestResponseHeaders covers what the cache makes of the headers that are
-// not all the upstream's, or not all there when the response starts.
+// TestResponseHeaders covers headers not all set by the upstream, and
+// headers not all present when the response starts (trailers).
 func TestResponseHeaders(t *testing.T) {
 	c := newCacheTest(t, Options{DefaultCacheControl: "max-age=60"})
 
@@ -805,8 +805,8 @@ func TestResponseHeaders(t *testing.T) {
 }
 
 // TestRequestIsPutBack checks that a request the cache sends to the
-// upstream a second time, as the client made it, is no longer what the
-// first attempt made of it.
+// upstream a second time is as the client made it, not as the first attempt
+// left it.
 func TestRequestIsPutBack(t *testing.T) {
 	c := newCacheTest(t, Options{})
 
@@ -853,7 +853,7 @@ func TestPragma(t *testing.T) {
 
 	c.expect(c.get("/a", up), "/a", "fwd=uri-miss; stored")
 	c.expectHit(c.get("/a", up), "/a", 120)
-	// It is what a client that knows nothing of Cache-Control says.
+	// Pragma is what a client that knows nothing of Cache-Control says.
 	c.expect(c.get("/a", up, "Pragma: no-cache"), "/a", "fwd=stale; stored")
 	c.expectHit(c.get("/a", up, "Pragma: no-cache", "Cache-Control: max-age=60"), "/a", 120)
 	if n := up.calls.Load(); n != 2 {
@@ -861,12 +861,12 @@ func TestPragma(t *testing.T) {
 	}
 }
 
-// TestWaitingForAFetch covers the requests that find another one fetching
-// the response they want, of which they cannot be sent anything before it
-// is whole: it does not say how long it is.
+// TestWaitingForAFetch covers requests that find another one fetching the
+// response they want and must wait for all of it: with no announced length,
+// nothing of it can be sent before it is whole.
 func TestWaitingForAFetch(t *testing.T) {
-	// slow returns an upstream whose first answer waits for release, once
-	// it told that it was asked.
+	// slow returns an upstream whose first answer signals that it was asked,
+	// then waits for release.
 	slow := func(release <-chan struct{}) (*backend, <-chan struct{}) {
 		entered := make(chan struct{})
 
@@ -983,9 +983,8 @@ func TestJoiningADownload(t *testing.T) {
 		t.Errorf("body %q after %d requests to the upstream", rep.body(), up.calls.Load())
 	}
 
-	// The variant being received is another one, which could not be told
-	// when the request started waiting: it goes on waiting, then fetches
-	// its own.
+	// The variant being received is another one, which could not be known
+	// when the request started waiting: it waits on, then fetches its own.
 	ctx := watch(context.Background())
 	entered := make(chan struct{})
 	up = upstreamFunc(func(w http.ResponseWriter, r *http.Request, call int) error {
@@ -1081,9 +1080,9 @@ func TestStaleResponseWhileUpdating(t *testing.T) {
 	}
 }
 
-// TestTailThatCannotBeServed covers the responses in progress a request is
-// not served from, which only happens here by calling for it: the requests
-// are never offered such a response.
+// TestTailThatCannotBeServed covers responses in progress that serveTail
+// refuses. Requests are never offered such a response, so it is called
+// directly.
 func TestTailThatCannotBeServed(t *testing.T) {
 	c := newCacheTest(t, Options{})
 
@@ -1151,8 +1150,7 @@ func TestStoredResponseThatCannotBeSent(t *testing.T) {
 		t.Errorf("%d entries after a client left", n)
 	}
 
-	// An input/output error is taken for one of the file, which is then not
-	// served anymore.
+	// An I/O error is blamed on the file, which is then not served anymore.
 	client = &brokenClient{takes: 100, err: fmt.Errorf("read: %w", syscall.EIO)}
 	if out := c.serve(client, newRequest(http.MethodGet, "/a"), up); out.err != nil || !out.aborted {
 		t.Errorf("a response that could not be read was not cut short: %v", out.err)
@@ -1162,9 +1160,9 @@ func TestStoredResponseThatCannotBeSent(t *testing.T) {
 	}
 }
 
-// TestFetchThatFails covers the upstream that fails once the cache decided
-// to store its response without sending it to the client meanwhile, as it
-// does for a request with a precondition.
+// TestFetchThatFails covers an upstream that fails after the cache decided
+// to store its response without relaying it, as for a request with a
+// precondition.
 func TestFetchThatFails(t *testing.T) {
 	failing := func(first *backend) *backend {
 		return upstreamFunc(func(w http.ResponseWriter, r *http.Request, call int) error {
@@ -1188,8 +1186,8 @@ func TestFetchThatFails(t *testing.T) {
 	c := newCacheTest(t, Options{Stale: caddy.Duration(time.Hour)})
 	up := failing(respond(http.StatusNotFound, "nothing yet"))
 	c.expect(c.get("/a", up), "/a", "fwd=uri-miss; detail=UNCACHEABLE-STATUS")
-	// The response is known not to be cacheable for now, which only a
-	// request for all of it could find out to have changed.
+	// The response is remembered as uncacheable, which only a request for all
+	// of it could find out to have changed: forget it here.
 	c.s.SetUncacheable(makeID(keyOf("/a")), false)
 	rep := c.get("/a", up, `If-None-Match: "other"`)
 	c.expect(rep, "/a", "fwd=uri-miss; detail=UPSTREAM-ERROR")
@@ -1220,8 +1218,8 @@ func TestFetchThatFails(t *testing.T) {
 		case 3:
 			return errInjected
 		default:
-			// Unless it has a response after all, which is not to be stored:
-			// the one that was is not served anymore.
+			// Unless it has a response after all, one not to be stored: the
+			// stale one is dropped.
 			send(w, http.StatusOK, "private", "Cache-Control: private")
 		}
 
@@ -1309,8 +1307,8 @@ func TestClientThatLeaves(t *testing.T) {
 	// A response that does not say where it ends is not stored for a client
 	// that is gone: it could go on forever.
 	ctx, cancel = context.WithCancel(context.Background())
-	// stopped is why the fetch was stopped, if it was when the upstream was
-	// done.
+	// stopped is the fetch context's error when the upstream is done: why it
+	// was stopped, if it was.
 	var stopped error
 	up = upstreamFunc(func(w http.ResponseWriter, r *http.Request, _ int) error {
 		cancel()
@@ -1422,7 +1420,8 @@ func TestConfirmedResponse(t *testing.T) {
 			case 1:
 				send(w, http.StatusOK, "body", "Cache-Control: no-cache", "Last-Modified: "+lastModified)
 			case 2:
-				// The type is that of the body, which this is not.
+				// A 304 carries no body: its Content-Type does not replace the
+				// stored one.
 				sendHeader(w, http.StatusNotModified, `Etag: "v2"`, "Content-Type: text/html", "X-Confirmed: once")
 			default:
 				// It comes from a cache, which had it for a while.
@@ -1585,9 +1584,8 @@ func TestRangeOfWhatIsNotABody(t *testing.T) {
 	}
 }
 
-// TestResponseThatCannotBeReadBack covers the response that is stored but
-// cannot be sent to the client from where it is stored, which only happens
-// here by taking its file away.
+// TestResponseThatCannotBeReadBack covers a stored response the pump cannot
+// read back, which only happens here by taking its file away.
 func TestResponseThatCannotBeReadBack(t *testing.T) {
 	c := newCacheTest(t, Options{})
 
@@ -1688,9 +1686,9 @@ func TestResponseThatCannotBeStoredAfterAll(t *testing.T) {
 		t.Errorf("%d entries, %d temporary files", st.Entries, tempFiles(c.s))
 	}
 
-	// One the disk has no room for, other downloads having taken it, of
-	// which the client asked for a range: once it has that range, the rest
-	// is of no use to anyone.
+	// One the disk has no room for, other downloads having taken it, while
+	// the client asked for a range: once it has that range, the rest is of
+	// no use to anyone.
 	c = newCacheTest(t, Options{MaxSize: 64 << 10})
 	for _, key := range []string{"first", "second"} {
 		other, err := c.s.Create(key, nil, nil, testRecord(), 0, -1, 1)
@@ -1810,7 +1808,7 @@ func TestSliceOrNothing(t *testing.T) {
 		t.Errorf("a whole response was delivered in the middle of another: %v, %q", err, rec.Body)
 	}
 
-	// Nor is it written anything.
+	// Nor is the client written anything: a sliceSink swallows it.
 	var sink http.ResponseWriter = &sliceSink{header: make(http.Header)}
 	sink.WriteHeader(http.StatusOK)
 	if n, err := sink.Write([]byte("body")); n != 4 || err != nil {
@@ -1826,11 +1824,10 @@ const testSlice = minSlice
 
 var slicedBody = string(sliceContent("v1", 10_000))
 
-// sliced returns an upstream that has content and sends the range of it
-// that it is asked for, with the given headers. If answer is set, it is
-// given each request first, with the first byte of the range asked for or
-// -1 when the request is for all of the content, and tells whether it
-// answered the request itself.
+// sliced returns an upstream that serves content, or the range of it that
+// is asked for, with the given headers. If answer is set, it sees each
+// request first, with the first byte of the range asked for (-1 for the
+// whole content), and reports whether it answered the request itself.
 func sliced(content string, answer func(w http.ResponseWriter, r *http.Request, first, call int) (bool, error), headers ...string) *backend {
 	return upstreamFunc(func(w http.ResponseWriter, r *http.Request, call int) error {
 		first, last := -1, len(content)-1
@@ -1953,7 +1950,7 @@ func TestUpstreamThatAnswersAnotherRange(t *testing.T) {
 		"/all": contentRange(0, len(slicedBody)-1, len(slicedBody)),
 		// The slice, of a response it does not tell the size of.
 		"/unsized": fmt.Sprintf("Content-Range: bytes 0-%d/*", testSlice-1),
-		// The slice, it says, with a body that is not.
+		// The slice, it says, but with the whole body.
 		"/longer": contentRange(0, testSlice-1, len(slicedBody)),
 	} {
 		up := sliced(slicedBody, func(w http.ResponseWriter, _ *http.Request, first, _ int) (bool, error) {
@@ -2215,8 +2212,8 @@ func TestSliceOutlivesTheClientItIsFetchedFor(t *testing.T) {
 	}
 }
 
-// TestPanicInTheFetchOfASlice checks that the panic of an upstream handler
-// is the request's, whenever it happens.
+// TestPanicInTheFetchOfASlice checks that a panic in an upstream handler
+// reaches the request, whenever it happens.
 func TestPanicInTheFetchOfASlice(t *testing.T) {
 	c := newCacheTest(t, Options{Slice: testSlice})
 
@@ -2265,9 +2262,9 @@ func (c *cacheTest) plantSlice(path string, n, status int, contentRange, body st
 	return w
 }
 
-// TestSliceThatIsNotOne covers what is found where a slice is looked for
-// without being that slice. The cache stores no such thing: it is put
-// there.
+// TestSliceThatIsNotOne covers finding something other than the slice where
+// a slice is looked for. The cache never stores such a thing, so the test
+// plants it.
 func TestSliceThatIsNotOne(t *testing.T) {
 	c := newCacheTest(t, Options{Slice: testSlice})
 	up := sliced(slicedBody, nil, "Cache-Control: max-age=60")
@@ -2306,8 +2303,8 @@ func TestSliceThatIsNotOne(t *testing.T) {
 		t.Error("a response being received was taken for a slice it is not")
 	}
 
-	// A slice the upstream confirms, which is made another one meanwhile:
-	// the fetch is the only one to hold it.
+	// A slice the upstream confirms, turned into another range meanwhile: the
+	// fetch holds the only copy, so the test alters it there.
 	up = upstreamFunc(func(w http.ResponseWriter, r *http.Request, _ int) error {
 		if r.Header.Get("If-None-Match") == "" {
 			return sliced(slicedBody, nil, "Cache-Control: no-cache", `Etag: "v1"`).ServeHTTP(w, r)
@@ -2332,8 +2329,8 @@ func TestSliceStoredBeforeItIsRead(t *testing.T) {
 	up := sliced(slicedBody, nil)
 	defer func() { openFile = os.Open }()
 
-	// stored makes the request find the slice it wants to read as it
-	// arrives stored already, and then does what it is told.
+	// stored makes the request find the slice it is about to read already
+	// stored, then calls then.
 	stored := func(n int64, then func()) {
 		openFile = func(name string) (*os.File, error) {
 			openFile = os.Open
@@ -2519,7 +2516,7 @@ func TestStaleSlicesWhileUpdating(t *testing.T) {
 	c := newCacheTest(t, Options{Slice: testSlice, Stale: caddy.Duration(time.Hour)})
 
 	// updating returns an upstream whose responses are stale at once, and
-	// which takes its time to confirm the beginning of one, once.
+	// which, once, waits for release before confirming the first slice.
 	updating := func(content string, release <-chan struct{}) (*backend, <-chan struct{}) {
 		asked := make(chan struct{})
 		var once sync.Once

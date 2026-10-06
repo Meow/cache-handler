@@ -1,36 +1,34 @@
-# A cache that conforms to RFC 9111 (HTTP Caching, which obsoletes RFC 7234),
-# see "Standards compliance" in the README. The defaults favour hit rate over
-# the letter of the standard; this configuration takes the other side where
-# the two differ.
+# A cache that conforms to RFC 9111 (HTTP Caching), see "Standards
+# compliance" in the README. The defaults favor hit rate over the letter of
+# the standard; this configuration takes the standard's side where they differ.
 {
 	cache {
 		path /var/cache/caddy
 		max_size 10Gi
 		max_memory 256Mi
 
-		# Honour the requests' Cache-Control directives (no-cache, no-store,
-		# max-age, min-fresh, max-stale, only-if-cached) and Pragma: no-cache,
-		# and store a response to a request with Authorization only when it
-		# carries public, s-maxage or must-revalidate (sections 4 and 3.5).
+		# Honor request Cache-Control directives (no-cache, no-store, max-age,
+		# min-fresh, max-stale, only-if-cached) and Pragma: no-cache, and store
+		# a response to a request with Authorization only when it carries
+		# public, s-maxage or must-revalidate (sections 4 and 3.5).
 		mode strict
 
-		# Heuristic freshness for the responses that say nothing of theirs
-		# (section 4.2.2). Any value is allowed; a short one is prudent.
+		# Heuristic freshness for responses that say nothing (section 4.2.2).
+		# Any value is allowed; keep it short.
 		ttl 2m
 
-		# Not set: a response is only served stale when it says so itself with
-		# stale-while-revalidate or stale-if-error (RFC 5861), or the request
-		# allows it with max-stale. Setting stale is permitted by section 4.2.4
-		# as "configuration in accordance with an out-of-band contract" with
-		# the origin, but it is a decision to take knowingly.
+		# Left unset: a response is served stale only when it allows it
+		# (stale-while-revalidate, stale-if-error, RFC 5861) or the request
+		# does (max-stale). Section 4.2.4 permits a configured stale as an
+		# "out-of-band contract" with the origin; set it knowingly.
 		# stale 1h
 	}
 }
 
 example.com {
-	# Keep every option that overrides what the origin says out of the
-	# directive: no default_cache_control, no allowed_additional_status_codes,
-	# no key { disable_vary }, and no Authorization among key { headers }.
+	# No option that overrides the origin: no default_cache_control, no
+	# allowed_additional_status_codes, no key { disable_vary }, and no
+	# Authorization among key { headers }.
 	cache
 	reverse_proxy 127.0.0.1:9000
 }

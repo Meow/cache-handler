@@ -27,7 +27,7 @@ func TestLockDir(t *testing.T) {
 		t.Error("locked a directory twice")
 	}
 
-	// The lock goes with the one that held it.
+	// Closing the holder releases the lock.
 	_ = first.Close()
 	second, err := lockDir(filepath.Join(dir, lockName))
 	if err != nil {
@@ -36,14 +36,13 @@ func TestLockDir(t *testing.T) {
 	_ = second.Close()
 }
 
-// TestStorePurgedAsItsLoaderEnds covers the cache that is emptied while its
-// loader is busy with the last file it has to read: the loader is not to
-// say that the cache is as it found it.
+// TestStorePurgedAsItsLoaderEnds covers a purge while the loader reads its
+// last file: the loader must not report the cache as it found it.
 func TestStorePurgedAsItsLoaderEnds(t *testing.T) {
 	dir := t.TempDir()
 
-	// The last file the loader gets to is a pipe, which is only opened once
-	// someone opens it for writing: that tells when the loader is there.
+	// The loader's last file is a pipe, whose open blocks until a writer
+	// opens it: that signals when the loader gets there.
 	var id ID
 	for i := range id {
 		id[i] = 0xff
@@ -65,11 +64,11 @@ func TestStorePurgedAsItsLoaderEnds(t *testing.T) {
 	}
 
 	s := openTestStore(t, dir, Limits{})
-	// Whatever happens, the loader is not left waiting for the pipe: the
-	// store could not be closed.
+	// The loader must never be left blocked on the pipe, or the store could
+	// not be closed.
 	t.Cleanup(func() { meet() })
 
-	// The pipe is no cache file. Removing it takes the lock of its name,
+	// The pipe is not a cache file. Removing it takes its name's stripe lock,
 	// which is where the loader is held next.
 	stripe := &s.stripes[id[0]]
 	stripe.Lock()

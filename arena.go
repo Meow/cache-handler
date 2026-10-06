@@ -68,9 +68,9 @@ func (a *arena) newBlob() *blob {
 	return b
 }
 
-// grow gives b n more blocks. It reports whether it could: not when that
-// would exceed the limit or memory cannot be obtained. The caller sees to it
-// that nobody reads the list of blocks of b meanwhile.
+// grow gives b n more blocks and reports whether it could: not when that
+// would exceed the limit or memory cannot be obtained. The caller ensures
+// nobody reads the block list of b meanwhile.
 func (a *arena) grow(b *blob, n int) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -135,8 +135,8 @@ func (a *arena) setLimit(blocks int) {
 	defer a.mu.Unlock()
 
 	a.limit = blocks
-	// Enough for the limit moving as the index grows. A limit lowered by a
-	// lot is caught up with by trim.
+	// Enough for the limit drifting as the index grows. trim catches up
+	// with a limit lowered by a lot.
 	a.trimLocked(64)
 }
 
@@ -272,7 +272,7 @@ func readBlocks(p []byte, blocks [][]byte, bs, off, end int64) int {
 }
 
 // writeTo writes the first size bytes of the blob to w, a few blocks at a
-// time. The caller sees to it that the blob is not grown meanwhile.
+// time. The caller ensures the blob is not grown meanwhile.
 func (b *blob) writeTo(w io.Writer, size int64) error {
 	bw := bufio.NewWriterSize(w, 64<<10)
 
@@ -297,10 +297,10 @@ var copyBufs = sync.Pool{New: func() any {
 }}
 
 // copyBuffered copies r to w through a buffer of copyBufs, one Write for
-// each Read. It is for the bodies that are not files, which are those the
-// ReadFrom of a ResponseWriter does poorly with: it tries sendfile, and
-// failing that sends the first bytes by themselves and the rest through a
-// buffer it allocates for every response.
+// each Read. It is for bodies that are not files, which a ResponseWriter's
+// ReadFrom handles poorly: it tries sendfile, and failing that sends the
+// first bytes by themselves and the rest through a buffer it allocates for
+// every response.
 func copyBuffered(w io.Writer, r io.Reader) (int64, error) {
 	bufp := copyBufs.Get().(*[]byte)
 	defer copyBufs.Put(bufp)

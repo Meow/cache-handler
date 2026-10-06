@@ -54,8 +54,8 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-// bodyFor returns a body that can be told apart from the body of any other
-// key, so that a response served for the wrong key is noticed.
+// bodyFor returns a body unique to key, so that a response served for the
+// wrong key is noticed.
 func bodyFor(key string, size int) []byte {
 	sum := sha256.Sum256([]byte(key))
 	body := make([]byte, size)
@@ -72,7 +72,7 @@ func storePut(t testing.TB, s *Store, key string, vary []string, reqHeader http.
 	return storePutUses(t, s, key, vary, reqHeader, body, 1)
 }
 
-// storePutUses stores a response that is to be written to disk once it was
+// storePutUses stores a response to be written to disk once it has been
 // requested minUses times.
 func storePutUses(t testing.TB, s *Store, key string, vary []string, reqHeader http.Header, body []byte, minUses int) error {
 	t.Helper()
@@ -90,8 +90,8 @@ func storePutUses(t testing.TB, s *Store, key string, vary []string, reqHeader h
 		return err
 	}
 
-	// The request a response is fetched for reads it as it arrives, which
-	// counts as its first use.
+	// The request that fetched the response reads it as it arrives; that is
+	// its first use.
 	var tail *Tail
 	if minUses > 1 {
 		if tail, err = w.Tail(context.Background()); err != nil {
@@ -131,8 +131,8 @@ func cacheFiles(dir string) int {
 	return files
 }
 
-// waitPersisted blocks until the store has nothing left to write to disk of
-// what it was asked to.
+// waitPersisted blocks until the persister has written everything it was
+// asked to.
 func waitPersisted(t *testing.T, s *Store) {
 	t.Helper()
 
@@ -345,9 +345,9 @@ func TestStoreServesWhatWasDeletedBehindItsBack(t *testing.T) {
 	}
 }
 
-// TestStoreKeepsWhatItCannotOpen checks that an entry is only forgotten when
+// TestStoreKeepsWhatItCannotOpen checks that an entry is forgotten only when
 // its file is gone or damaged, not when opening it fails for another reason,
-// as it does when the process is out of file descriptors.
+// such as running out of file descriptors.
 func TestStoreKeepsWhatItCannotOpen(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("file permissions do not apply to root")
@@ -524,8 +524,8 @@ func TestStoreMaxFiles(t *testing.T) {
 		t.Error("the most recent varied response is gone")
 	}
 
-	// Downloads in progress count: when they take every slot there is no
-	// room for another, and room again once one ends.
+	// Downloads in progress count: with every slot taken, another is refused
+	// until one ends.
 	s.PurgeAll()
 	create := func(i int) (*Writer, error) {
 		now := time.Now()
@@ -624,8 +624,8 @@ func TestStoreMemoryTier(t *testing.T) {
 		t.Fatal("the response served from memory differs")
 	}
 
-	// Requesting everything cannot take more memory than allowed: 40 objects
-	// of 200kB do not fit in 2MiB.
+	// Requesting everything stays within the limit: 40 objects of 200kB do
+	// not fit in 2MiB.
 	for range 5 {
 		for i := range objects {
 			key := fmt.Sprintf("key-%d", i)
@@ -745,8 +745,8 @@ func TestStoreVary(t *testing.T) {
 	}
 }
 
-// TestStoreVaryNamesAreKept checks that a response listing fewer names than
-// the ones stored before it joins them instead of replacing them all.
+// TestStoreVaryNamesAreKept checks that a response whose Vary lists a subset
+// of the names already stored joins them instead of replacing them.
 func TestStoreVaryNamesAreKept(t *testing.T) {
 	s := openTestStore(t, t.TempDir(), Limits{})
 
@@ -766,8 +766,8 @@ func TestStoreVaryNamesAreKept(t *testing.T) {
 		t.Errorf("got %q for the second response", got)
 	}
 
-	// A name that is not listed yet is another matter: what was stored
-	// without it cannot be told apart by it.
+	// A name not listed before replaces them all: what was stored without it
+	// cannot be told apart by it.
 	if err := storePut(t, s, "key", []string{"accept-language", "origin"}, plain, []byte("new")); err != nil {
 		t.Fatal(err)
 	}
@@ -820,9 +820,9 @@ func TestStorePurge(t *testing.T) {
 	}
 }
 
-// TestStorePurgeWhileLoading checks that a response purged while the store
-// indexes its files stays purged: the file may be read for the index at
-// that very moment, by the loader or by a lookup that does not wait for it.
+// TestStorePurgeWhileLoading checks that a purge sticks while the loader, or
+// a lookup that does not wait for it, may be indexing the file at that very
+// moment.
 func TestStorePurgeWhileLoading(t *testing.T) {
 	s := openTestStore(t, t.TempDir(), Limits{})
 	waitLoaded(t, s)
@@ -882,7 +882,7 @@ func TestStoreInactive(t *testing.T) {
 		}
 	}
 
-	// The last use of an entry is known to the second.
+	// The time of last use is kept to the second.
 	time.Sleep(1500 * time.Millisecond)
 	if _, hit := storeGet(t, s, "busy", nil); hit == nil {
 		t.Fatal("busy is gone")
@@ -988,8 +988,7 @@ func TestStoreTail(t *testing.T) {
 		t.Error("the committed response differs")
 	}
 
-	// A response that is given up fails its readers instead of leaving them
-	// with a truncated body.
+	// An aborted response fails its readers instead of truncating the body.
 	w = create("aborted", -1)
 	if _, err := w.Write(body[:1000]); err != nil {
 		t.Fatal(err)
@@ -1018,8 +1017,8 @@ func TestStoreTail(t *testing.T) {
 		t.Fatal("the reader of an aborted response was left waiting")
 	}
 
-	// A reader told where to stop gets what was written up to there even
-	// though the response is given up.
+	// A reader told where to stop gets everything up to there even though the
+	// response is aborted.
 	w = create("drained", -1)
 	if _, err := w.Write(body[:5000]); err != nil {
 		t.Fatal(err)
@@ -1059,8 +1058,7 @@ func TestStoreTail(t *testing.T) {
 	}
 }
 
-// transientUsage returns the memory the transient responses are accounted
-// for.
+// transientUsage returns the memory accounted to transient responses.
 func transientUsage(s *Store) int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1068,8 +1066,8 @@ func transientUsage(s *Store) int64 {
 	return s.transMeta + int64(s.transBlocks)*int64(s.arena.blockSize)
 }
 
-// TestStoreMinUses checks that a response is only written to disk once it
-// was requested as many times as asked, and is served from memory meanwhile.
+// TestStoreMinUses checks that a response is written to disk only once it
+// has been requested min_uses times, and is served from memory until then.
 func TestStoreMinUses(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir, Limits{MaxMemory: 4 << 20})
@@ -1088,8 +1086,7 @@ func TestStoreMinUses(t *testing.T) {
 		t.Errorf("%d temporary files for responses held in memory", len(left))
 	}
 
-	// The second request is served from memory, and has the response
-	// written.
+	// The second request is served from memory and triggers the write.
 	for _, key := range []string{"twice", "empty"} {
 		got, hit := storeGet(t, s, key, nil)
 		if hit == nil || !hit.InMemory() || !bytes.Equal(got, bodyFor(key, sizes[key])) {
@@ -1136,7 +1133,7 @@ func TestStoreMinUses(t *testing.T) {
 	if got, hit := storeGet(t, s, "large", nil); hit == nil || hit.InMemory() || !bytes.Equal(got, large) {
 		t.Error("a response too large for memory was not stored on disk")
 	}
-	// As all are without memory.
+	// So is every response when memory is off.
 	s.SetLimits(Limits{MaxSize: 64 << 20})
 	if err := storePutUses(t, s, "no-memory", nil, nil, []byte("body"), 2); err != nil {
 		t.Fatal(err)
@@ -1149,8 +1146,8 @@ func TestStoreMinUses(t *testing.T) {
 	}
 }
 
-// TestStoreMinUsesCounts follows the count of the requests a response is
-// still to get, through what can happen to the response meanwhile.
+// TestStoreMinUsesCounts follows the countdown of requests a response still
+// needs through what can happen to it meanwhile.
 func TestStoreMinUsesCounts(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir, Limits{MaxMemory: 4 << 20})
@@ -1188,8 +1185,7 @@ func TestStoreMinUsesCounts(t *testing.T) {
 	waitFor(t, "the response to be written at its third request", func() bool { return cacheFiles(dir) == 1 })
 	waitPersisted(t, s)
 
-	// A response dropped from memory is not made to start over when it
-	// comes back…
+	// A response dropped from memory does not start over when it comes back…
 	if err := storePutUses(t, s, "dropped", nil, nil, body, 3); err != nil {
 		t.Fatal(err)
 	}
@@ -1203,7 +1199,7 @@ func TestStoreMinUsesCounts(t *testing.T) {
 	if n := left("dropped"); n != 1 {
 		t.Fatalf("%d requests left for a response stored a second time, want 1", n)
 	}
-	// …and is written at once the time it has been requested enough.
+	// …and is written at once when it has been requested enough.
 	drop("dropped")
 	if err := storePutUses(t, s, "dropped", nil, nil, body, 3); err != nil {
 		t.Fatal(err)
@@ -1238,8 +1234,8 @@ func TestStoreMinUsesCounts(t *testing.T) {
 	waitFor(t, "a response two requests were served from to be written", func() bool { return cacheFiles(dir) == 3 })
 	waitPersisted(t, s)
 
-	// A response found stale at its second request is replaced, not
-	// written: its new version is, and only that.
+	// A response found stale at its second request is not written: only its
+	// new version is, and straight to disk.
 	persisted := s.Stats().Persisted
 	if err := storePutUses(t, s, "stale", nil, nil, []byte("old"), 2); err != nil {
 		t.Fatal(err)
@@ -1283,8 +1279,8 @@ func TestStoreMinUsesCounts(t *testing.T) {
 		t.Errorf("%d responses written from memory and %d files, want the confirmed response stored directly", n-persisted, cacheFiles(dir))
 	}
 
-	// A response in memory only that replaces one on disk takes its file
-	// away: it would come back at the next start.
+	// A response in memory only that replaces one on disk removes its file,
+	// which would otherwise come back at the next start.
 	now = time.Now()
 	rec = &record{stored: now.UnixMilli(), fresh: now.Add(time.Hour).UnixMilli(), status: http.StatusOK}
 	if w, err = s.Create("replaced", nil, nil, rec, 0, -1, 2); err != nil {
@@ -1308,11 +1304,10 @@ func TestStoreMinUsesCounts(t *testing.T) {
 	}
 }
 
-// TestStoreMinUsesCountsLateReaders checks that a request that comes while a
-// response received in memory is being committed counts once among those the
-// response waits for, whether it still gets to read it from the writer or
-// has to find it in the cache: a request that was not counted would leave the
-// response in memory for one more than min_uses asks.
+// TestStoreMinUsesCountsLateReaders checks that a request arriving while a
+// response received in memory is committed counts exactly once, whether it
+// reads from the writer or finds the entry in the cache. Missing one would
+// keep the response in memory for one request more than min_uses asks.
 func TestStoreMinUsesCountsLateReaders(t *testing.T) {
 	s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 4 << 20})
 	body := bodyFor("key", 1000)
@@ -1335,7 +1330,7 @@ func TestStoreMinUsesCountsLateReaders(t *testing.T) {
 
 		committed := make(chan error, 1)
 		go func() { committed <- w.Commit() }()
-		// The request comes at about any point of the commit.
+		// The request lands at an arbitrary point of the commit.
 		for range i % 50 {
 			runtime.Gosched()
 		}
@@ -1359,8 +1354,8 @@ func TestStoreMinUsesCountsLateReaders(t *testing.T) {
 	}
 }
 
-// TestStoreMinUsesLimits checks that the responses held in memory only stay
-// within their share of it, the oldest making way.
+// TestStoreMinUsesLimits checks that transient responses stay within their
+// share of memory, the oldest evicted first.
 func TestStoreMinUsesLimits(t *testing.T) {
 	const maxMemory = 1 << 20
 
@@ -1400,8 +1395,8 @@ func TestStoreMinUsesLimits(t *testing.T) {
 	}
 	waitFor(t, "the response requested twice to be written", func() bool { return cacheFiles(dir) == 1 })
 
-	// A response that was dropped is remembered: its second request, though
-	// it finds nothing, has it written.
+	// A dropped response is remembered: its second request finds nothing, yet
+	// has it written.
 	if err := storePutUses(t, s, "key-0", nil, nil, bodyFor("key-0", size), 2); err != nil {
 		t.Fatal(err)
 	}
@@ -1430,7 +1425,7 @@ func TestStoreMinUsesLimits(t *testing.T) {
 		t.Errorf("after the inactive period: %+v", st)
 	}
 
-	// Lowering the memory drops what no longer fits, turning it off all.
+	// Lowering the limit drops what no longer fits; turning it off drops all.
 	s.SetLimits(Limits{MaxSize: 64 << 20, MaxMemory: 4 * maxMemory})
 	for i := range 20 {
 		key := fmt.Sprintf("key-%d", i)
@@ -1452,8 +1447,8 @@ func TestStoreMinUsesLimits(t *testing.T) {
 	waitFor(t, "all the memory to be given back", func() bool { return s.arena.residentBytes() == 0 })
 }
 
-// TestStoreMinUsesVary checks that what tells the variants of a response
-// apart is written to disk with the first of them that is.
+// TestStoreMinUsesVary checks that the marker of a varying response is
+// written to disk with the first of its variants that is.
 func TestStoreMinUsesVary(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir, Limits{MaxMemory: 4 << 20})
@@ -1510,7 +1505,7 @@ func TestStoreMinUsesVary(t *testing.T) {
 		t.Error("en: a variant requested once survived the restart")
 	}
 
-	// A variant nothing leads to anymore is not worth a file.
+	// A variant its marker no longer leads to is not written.
 	if err := storePutUses(t, s, "other", vary, french, []byte("bonjour"), 2); err != nil {
 		t.Fatal(err)
 	}
@@ -1532,8 +1527,8 @@ func TestStoreMinUsesVary(t *testing.T) {
 	}
 }
 
-// TestStoreMinUsesTail reads responses received in memory while they are,
-// one of which outgrows memory on its way.
+// TestStoreMinUsesTail reads responses received in memory as they arrive,
+// one of which outgrows memory midway.
 func TestStoreMinUsesTail(t *testing.T) {
 	const maxMemory = 1 << 20
 
@@ -1544,8 +1539,8 @@ func TestStoreMinUsesTail(t *testing.T) {
 	create := func(key string, declared int64) *Writer {
 		now := time.Now()
 		rec := &record{stored: now.UnixMilli(), fresh: now.Add(time.Hour).UnixMilli(), status: http.StatusOK}
-		// More requests than the test makes, so that nothing is written
-		// to disk that does not have to be.
+		// More uses than the test makes, so nothing is written to disk unless
+		// it has to be.
 		w, err := s.Create(key, nil, nil, rec, 0, declared, 10)
 		if err != nil {
 			t.Fatal(err)
@@ -1620,8 +1615,8 @@ func TestStoreMinUsesTail(t *testing.T) {
 		t.Error("the committed response differs, or is not in memory only")
 	}
 
-	// One of unknown length that outgrows what memory may hold of it moves
-	// to a file, which its readers do not notice.
+	// A response of unknown length that outgrows its memory share moves to a
+	// file without its readers noticing.
 	w = create("grown", -1)
 	if w.mem == nil {
 		t.Fatal("a response of unknown length is not received in memory")
@@ -1663,8 +1658,8 @@ func TestStoreMinUsesTail(t *testing.T) {
 		t.Errorf("%d bytes accounted in memory only", u)
 	}
 
-	// A response that is given up fails its readers, except the one told
-	// where to stop.
+	// An aborted response fails its readers, except the one told where to
+	// stop.
 	w = create("aborted", -1)
 	if _, err := w.Write(body[:5000]); err != nil {
 		t.Fatal(err)
@@ -1733,8 +1728,8 @@ func TestStoreFlights(t *testing.T) {
 		t.Error("the next request should lead again")
 	}
 
-	// A response that is stored under another ID than the one it was
-	// fetched under, because it varies, is waited for under both.
+	// A varying response is stored under another ID than it was fetched
+	// under; waiters find the flight under both.
 	fl, _ := s.BeginFlight(id)
 	w, err := s.Create("key", []string{"accept-language"}, http.Header{"Accept-Language": {"fr"}}, &record{status: http.StatusOK}, 0, 7, 1)
 	if err != nil {
@@ -1769,13 +1764,12 @@ func TestStoreFlights(t *testing.T) {
 	}
 }
 
-// TestStoreStress hammers a store that is too small for its load from many
-// goroutines. Every body read must be the one of its key, whole: a response
-// served from memory that was freed, or from a file that was replaced, would
-// show here. Run with -race.
+// TestStoreStress hammers a store too small for its load from many
+// goroutines. Every body read must be whole and belong to its key: a response
+// served from freed memory or from a replaced file shows here. Run with
+// -race.
 func TestStoreStress(t *testing.T) {
-	// With min_uses the responses start in memory only, and reach the disk
-	// from there.
+	// With min_uses, responses start in memory and reach the disk from there.
 	for _, minUses := range []int{1, 2} {
 		t.Run(fmt.Sprintf("min_uses=%d", minUses), func(t *testing.T) {
 			stressStore(t, minUses)
@@ -1808,8 +1802,8 @@ func stressStore(t *testing.T, minUses int) {
 			rng := rand.New(rand.NewPCG(uint64(w), 42))
 
 			for time.Now().Before(stop) {
-				// A skewed choice, so that some keys are popular enough to
-				// be kept in memory.
+				// Skewed, so that some keys are popular enough to stay in
+				// memory.
 				k := int(float64(keys) * rng.Float64() * rng.Float64())
 				key := fmt.Sprintf("key-%d", k)
 
@@ -1893,7 +1887,7 @@ func stressStore(t *testing.T, minUses int) {
 	if left, _ := os.ReadDir(filepath.Join(dir, tmpDirName)); len(left) != 0 {
 		t.Errorf("%d temporary files left", len(left))
 	}
-	// And so must that of the memory the transient responses take.
+	// So must the memory accounted to transient responses.
 	s.mu.Lock()
 	blocks, meta, transients := 0, int64(0), 0
 	for _, e := range s.index {
@@ -1940,7 +1934,7 @@ func TestStoreClosed(t *testing.T) {
 	}
 	hit.Close()
 
-	// New ones are told there is nothing, without failing.
+	// New ones find nothing, without failing.
 	if _, hit := s.Lookup("key", nil); hit != nil {
 		t.Error("a closed store served a response")
 	}
@@ -2073,7 +2067,7 @@ func TestBlobReader(t *testing.T) {
 	}
 }
 
-// errInjected is the failure the tests make up.
+// errInjected is the failure the tests inject.
 var errInjected = errors.New("injected failure")
 
 // failingWriter refuses whatever it is given.
@@ -2095,8 +2089,8 @@ func tempFiles(s *Store) int {
 	return len(files)
 }
 
-// freshKey returns a key whose file goes to a directory that does not exist
-// yet, and that directory.
+// freshKey returns a key whose shard directory does not exist yet, and that
+// directory.
 func freshKey(t *testing.T, s *Store, prefix string) (key, shard string) {
 	t.Helper()
 
@@ -2151,8 +2145,8 @@ func TestOpenStoreFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Chdir(gone)
-	// Some systems know the path of a directory for as long as it is open,
-	// which a directory that cannot be read is not.
+	// Some systems keep the path of a directory while it is held open, which
+	// an unreadable directory cannot be.
 	if err := os.Chmod(gone, 0o300); err != nil {
 		t.Fatal(err)
 	}
@@ -2172,8 +2166,8 @@ func TestOpenStoreFailures(t *testing.T) {
 	}
 }
 
-// TestStoreLookupMismatches covers what is found under an ID without being
-// what was looked for.
+// TestStoreLookupMismatches covers entries found under an ID that are not
+// what was looked up.
 func TestStoreLookupMismatches(t *testing.T) {
 	s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 1 << 20})
 	fr, de := http.Header{"Accept-Language": {"fr"}}, http.Header{"Accept-Language": {"de"}}
@@ -2222,8 +2216,8 @@ func TestStoreLookupMismatches(t *testing.T) {
 		t.Errorf("the response the file belongs to reads %q", got)
 	}
 
-	// Two keys with the same ID. An ID is 128 bits of a hash, so the index
-	// is made to believe that it happened, to a response held in memory.
+	// Two keys with one ID. IDs are 128 bits of a hash, so the collision is
+	// faked in the index, on a response held in memory.
 	if err := storePutUses(t, s, "held", nil, nil, []byte("in memory"), 2); err != nil {
 		t.Fatal(err)
 	}
@@ -2241,7 +2235,7 @@ func TestStoreLookupMismatches(t *testing.T) {
 		t.Errorf("the response the ID belongs to reads %q", got)
 	}
 
-	// A file that can no longer be told about.
+	// A closed file cannot be described.
 	f, err := os.Open(s.path(makeID("other")))
 	if err != nil {
 		t.Fatal(err)
@@ -2252,8 +2246,8 @@ func TestStoreLookupMismatches(t *testing.T) {
 	}
 }
 
-// TestStoreClosedWhileStoring covers the responses on their way in when the
-// store is closed: none of them makes it, and none is left behind.
+// TestStoreClosedWhileStoring covers responses in progress when the store is
+// closed: none is stored, and none leaves anything behind.
 func TestStoreClosedWhileStoring(t *testing.T) {
 	bs := arenaBlock()
 	s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
@@ -2295,7 +2289,7 @@ func TestStoreClosedWhileStoring(t *testing.T) {
 	if err := inMemory.Commit(); !errors.Is(err, errStoreClosed) {
 		t.Errorf("committing a response held in memory: %v", err)
 	}
-	// More memory is not to be had, nor a file to go on in.
+	// Neither more memory nor a file to spill to is available.
 	if _, err := growing.Write(make([]byte, bs)); !errors.Is(err, errStoreClosed) {
 		t.Errorf("writing more than a block: %v", err)
 	}
@@ -2356,9 +2350,9 @@ func TestStoreWriterIsDoneOnce(t *testing.T) {
 	}
 }
 
-// TestStoreFileFailures covers the files and directories that cannot be
-// created, written or moved. Nothing is to be left of a response that could
-// not be stored, and the next one is to find the store as it should be.
+// TestStoreFileFailures covers files and directories that cannot be created,
+// written or moved. A response that could not be stored leaves nothing
+// behind, and the next one finds the store sound.
 func TestStoreFileFailures(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir, Limits{})
@@ -2382,7 +2376,7 @@ func TestStoreFileFailures(t *testing.T) {
 		}
 	}
 
-	// A file where the temporary files go.
+	// A file in place of the tmp directory.
 	tmp := filepath.Join(dir, tmpDirName)
 	if err := os.RemoveAll(tmp); err != nil {
 		t.Fatal(err)
@@ -2398,7 +2392,7 @@ func TestStoreFileFailures(t *testing.T) {
 	}
 	clean("no directory")
 
-	// A temporary file that cannot be told about.
+	// A temporary file that cannot be described.
 	statFile = func(*os.File) (os.FileInfo, error) { return nil, errInjected }
 	err := put("no-stat")
 	statFile = (*os.File).Stat
@@ -2419,7 +2413,7 @@ func TestStoreFileFailures(t *testing.T) {
 	clean("closed file")
 	expect("closed", false)
 
-	// A file where the directory of the response goes.
+	// A file in place of the shard directory.
 	blocked, shard := freshKey(t, s, "blocked")
 	if err := os.WriteFile(shard, nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -2437,7 +2431,7 @@ func TestStoreFileFailures(t *testing.T) {
 	}
 	expect(blocked, true)
 
-	// A directory removed after it was made: it is found missing once, and
+	// A shard directory removed after it was made is found missing once, then
 	// made again.
 	gone, shard := freshKey(t, s, "gone")
 	if err := put(gone); err != nil {
@@ -2457,7 +2451,7 @@ func TestStoreFileFailures(t *testing.T) {
 }
 
 func TestStoreWithoutSpace(t *testing.T) {
-	// Not even room for what describes a response.
+	// Not even room for a record.
 	s := openTestStore(t, t.TempDir(), Limits{MaxSize: 16})
 	if err := storePut(t, s, "key", nil, nil, []byte("body")); !errors.Is(err, errNoSpace) {
 		t.Errorf("storing in a cache of 16 bytes: %v", err)
@@ -2467,8 +2461,8 @@ func TestStoreWithoutSpace(t *testing.T) {
 	}
 }
 
-// TestStoreTailFailures covers the readers of a response in progress whose
-// file is not, or no longer, what they expect.
+// TestStoreTailFailures covers readers of a download whose file is not, or
+// no longer, what they expect.
 func TestStoreTailFailures(t *testing.T) {
 	s := openTestStore(t, t.TempDir(), Limits{})
 	ctx := context.Background()
@@ -2496,7 +2490,7 @@ func TestStoreTailFailures(t *testing.T) {
 	}
 	w.Abort()
 
-	// The file was cut short behind the back of the store.
+	// The file was truncated behind the store's back.
 	w = create("cut", -1)
 	if _, err := w.Write(bodyFor("cut", 1000)); err != nil {
 		t.Fatal(err)
@@ -2514,7 +2508,7 @@ func TestStoreTailFailures(t *testing.T) {
 	tail.Close()
 	w.Abort()
 
-	// Seeking takes a body of known length.
+	// Seeking requires a known length.
 	w = create("sized", 10)
 	if tail, err = w.Tail(ctx); err != nil {
 		t.Fatal(err)
@@ -2544,7 +2538,7 @@ func TestStoreTailFailures(t *testing.T) {
 	tail.Close()
 	w.Abort()
 
-	// The request is over before the rest of the body came.
+	// The request ends before the rest of the body arrives.
 	w = create("awaited", 10)
 	canceled, cancel := context.WithCancel(ctx)
 	if tail, err = w.Tail(canceled); err != nil {
@@ -2557,8 +2551,8 @@ func TestStoreTailFailures(t *testing.T) {
 	tail.Close()
 	w.Abort()
 
-	// A reader that waits for more is first given the chance to pass on
-	// what it has, and is not left waiting when it is told where to stop.
+	// A reader waiting for more first flushes what it has, and is woken when
+	// told where to stop.
 	w = create("stopped", -1)
 	if _, err := w.Write([]byte("0123456789")); err != nil {
 		t.Fatal(err)
@@ -2590,8 +2584,7 @@ func TestStoreTailFailures(t *testing.T) {
 	tail.Close()
 	w.Abort()
 
-	// A response that is committed is read from the cache, not as a
-	// download.
+	// A committed response is read from the cache, not tailed.
 	w = create("committed", -1)
 	if err := w.Commit(); err != nil {
 		t.Fatal(err)
@@ -2611,8 +2604,8 @@ func TestStoreTailFailures(t *testing.T) {
 	w.Abort()
 }
 
-// TestStoreHotEntry covers the copy in memory of a response on disk, made
-// here without waiting for the response to be requested enough.
+// TestStoreHotEntry covers the in-memory copy of a response on disk, promoted
+// here by hand rather than after enough requests.
 func TestStoreHotEntry(t *testing.T) {
 	s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * arenaBlock()})
 	body := bodyFor("key", 3*diskBlock)
@@ -2642,7 +2635,7 @@ func TestStoreHotEntry(t *testing.T) {
 		t.Error("the end of the body differs")
 	}
 
-	// Closing the store takes the copy away, but not from who reads it.
+	// Closing the store drops the copy, but not from under a reader.
 	_ = s.Close()
 	var buf bytes.Buffer
 	if err := hit.WriteBody(&buf); err != nil || !bytes.Equal(buf.Bytes(), body) {
@@ -2657,7 +2650,7 @@ func TestStoreHotEntry(t *testing.T) {
 	}
 }
 
-// TestStoreLoadsWhatBelongs covers the files the loader finds and is not to
+// TestStoreLoadsWhatBelongs covers files the loader finds but must not
 // index.
 func TestStoreLoadsWhatBelongs(t *testing.T) {
 	dir := t.TempDir()
@@ -2702,8 +2695,8 @@ func TestStoreLoadsWhatBelongs(t *testing.T) {
 	}
 }
 
-// TestStoreSpillFailure covers the response received in memory that cannot
-// go on in a file: the requests reading it are left with what they have.
+// TestStoreSpillFailure covers a response received in memory that cannot
+// spill to a file: its readers are left with what they have.
 func TestStoreSpillFailure(t *testing.T) {
 	bs := arenaBlock()
 	s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
@@ -2733,7 +2726,7 @@ func TestStoreSpillFailure(t *testing.T) {
 
 		return os.Open(name)
 	}
-	// More than memory holds of one response.
+	// More than the memory share of one response.
 	_, err = w.Write(make([]byte, 8*bs))
 	openFile = os.Open
 	if !errors.Is(err, errInjected) {
@@ -2777,8 +2770,8 @@ func TestStoreMemoryPressure(t *testing.T) {
 	t.Run("responses being received take it all", func(t *testing.T) {
 		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
 
-		// Each announces the most that memory holds of one response, and
-		// four of them make the share of those that are in memory only.
+		// Each announces the largest size memory holds of one response; four
+		// fill the transient share.
 		var writers []*Writer
 		for i := range 5 {
 			w, err := s.Create(fmt.Sprintf("key-%d", i), nil, nil, testRecord(), 0, 8*bs, 2)
@@ -2840,7 +2833,7 @@ func TestStoreMemoryPressure(t *testing.T) {
 	t.Run("the index takes it all", func(t *testing.T) {
 		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 << 10})
 
-		// A response with no body takes no block, which leaves it in memory
+		// A response without a body takes no block, so it stays in memory
 		// until the index itself has to shrink.
 		if err := storePutUses(t, s, "empty", nil, nil, nil, 2); err != nil {
 			t.Fatal(err)
@@ -2881,7 +2874,7 @@ func TestStoreMemoryPressure(t *testing.T) {
 			t.Fatalf("the index outgrew memory: %+v", st)
 		}
 
-		// However requested, a response is not copied to memory.
+		// However often requested, a response is not copied to memory.
 		for range 2 * promoteAfter {
 			if _, hit := storeGet(t, s, keys[0], nil); hit == nil || hit.InMemory() {
 				t.Fatal("not served from disk")
@@ -2935,8 +2928,8 @@ func TestStoreMemoryPressure(t *testing.T) {
 	t.Run("copies of what is on disk take it", func(t *testing.T) {
 		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
 
-		// copyToMemory stores a response of eight blocks and has it copied
-		// to memory, whatever it is requested.
+		// copyToMemory stores a response of eight blocks and promotes it by
+		// hand.
 		copyToMemory := func(key string) {
 			t.Helper()
 
@@ -2955,8 +2948,8 @@ func TestStoreMemoryPressure(t *testing.T) {
 			t.Fatalf("%d responses in memory, want 7", st.HotEntries)
 		}
 
-		// One more does not fit, and is not requested more than those that
-		// are there.
+		// One more does not fit, and is no more requested than those in
+		// memory.
 		copyToMemory("late")
 		if st := s.Stats(); st.HotEntries != 7 || st.Promoted != 7 {
 			t.Errorf("unexpected state: %+v", st)
@@ -2965,8 +2958,8 @@ func TestStoreMemoryPressure(t *testing.T) {
 			t.Error("the response that did not fit is not served from disk")
 		}
 
-		// A response that is in memory only has nowhere else to be: a copy
-		// makes way for it.
+		// A transient response has nowhere else to go: a copy makes way for
+		// it.
 		w, err := s.Create("held", nil, nil, testRecord(), 0, 8*bs, 2)
 		if err != nil {
 			t.Fatal(err)
@@ -2979,7 +2972,7 @@ func TestStoreMemoryPressure(t *testing.T) {
 
 	t.Run("the response is purged while it is copied", func(t *testing.T) {
 		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
-		// The loader ends by applying the limits, those of the memory too.
+		// The loader ends by applying the limits, memory included.
 		waitLoaded(t, s)
 		if err := storePut(t, s, "key", nil, nil, bodyFor("key", 3*diskBlock)); err != nil {
 			t.Fatal(err)
@@ -2989,9 +2982,9 @@ func TestStoreMemoryPressure(t *testing.T) {
 		e.epoch = 0
 		s.mu.Unlock()
 
-		// The copy is held up where it obtains its memory, which is after
-		// it was found worth making. That shows: the count of the requests
-		// the entry got is brought up to date for it.
+		// The copy is held at its memory allocation, which comes after it was
+		// found worth making; the entry's hit count being brought up to date
+		// shows that point was reached.
 		s.arena.mu.Lock()
 		held := true
 		defer func() {
@@ -3078,8 +3071,8 @@ func TestStoreMemoryPressure(t *testing.T) {
 	})
 }
 
-// TestStoreHitsDecay checks that the count of the requests an entry got is
-// halved with each period that goes by, and forgotten after many.
+// TestStoreHitsDecay checks that an entry's hit count halves with each
+// period that passes, and is forgotten after many.
 func TestStoreHitsDecay(t *testing.T) {
 	s := new(Store)
 	e := &entry{hits: 40, epoch: 10}
@@ -3098,14 +3091,13 @@ func TestStoreHitsDecay(t *testing.T) {
 	}
 }
 
-// TestStorePersistFailures covers the responses held in memory that cannot
-// be written to disk when their time has come: they stay where they are,
-// and are written when asked again.
+// TestStorePersistFailures covers transient responses that cannot be written
+// to disk when due: they stay in memory and are written on the next request.
 func TestStorePersistFailures(t *testing.T) {
 	bs := arenaBlock()
 
-	// request asks for the response, which is due on disk from the first
-	// request on, and returns how many responses were written so far.
+	// request fetches the response, due on disk from its first request on,
+	// and returns how many responses have been written so far.
 	request := func(t *testing.T, s *Store, key string) int64 {
 		t.Helper()
 
@@ -3171,7 +3163,7 @@ func TestStorePersistFailures(t *testing.T) {
 		s := openTestStore(t, t.TempDir(), Limits{MaxSize: 100_000, MaxMemory: 64 * bs})
 		hold(t, s, "held")
 
-		// Two downloads in progress take the disk.
+		// Two downloads in progress fill the disk.
 		var downloads []*Writer
 		for _, key := range []string{"first", "second"} {
 			w, err := s.Create(key, nil, nil, testRecord(), 0, -1, 1)
@@ -3224,8 +3216,7 @@ func TestStorePersistFailures(t *testing.T) {
 		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
 		hold(t, s, "held")
 
-		// Two requests are served the response at the same time, and each
-		// finds it due on disk.
+		// Two concurrent requests each find the response due on disk.
 		var hits [2]*Hit
 		for i := range hits {
 			if _, hits[i] = s.Lookup("held", nil); hits[i] == nil || !hits[i].persist {
@@ -3249,8 +3240,7 @@ func TestStorePersistFailures(t *testing.T) {
 		e := s.index[makeID("held")]
 		s.mu.Unlock()
 
-		// As its file is created, which leaves a file nothing is to be
-		// made of.
+		// Purged as its file is created, which leaves a useless file.
 		statFile = func(f *os.File) (os.FileInfo, error) {
 			if !s.Purge("held") {
 				t.Error("nothing to purge")
@@ -3273,8 +3263,8 @@ func TestStorePersistFailures(t *testing.T) {
 		waitLoaded(t, s)
 		hold(t, s, "held")
 
-		// Memory is turned off as the file is put in place, which drops
-		// what was only there.
+		// Memory is turned off as the file is renamed into place, dropping
+		// the entry that only existed there.
 		renameFile = func(from, to string) error {
 			err := os.Rename(from, to)
 			s.SetLimits(Limits{MaxSize: 64 << 20})
@@ -3295,8 +3285,8 @@ func TestStorePersistFailures(t *testing.T) {
 	t.Run("marker", func(t *testing.T) {
 		s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 64 * bs})
 
-		// The directory of the marker is made, then removed, before the
-		// marker has a file to put there.
+		// The marker's shard directory is made, then removed, before the
+		// marker is written there.
 		key, shard := freshKey(t, s, "page")
 		if err := storePut(t, s, key, nil, nil, []byte("body")); err != nil {
 			t.Fatal(err)
@@ -3339,8 +3329,8 @@ func TestStoreTruncatedFile(t *testing.T) {
 	}
 	defer hit.Close()
 
-	// The file lost its end since it was opened: the body is sent up to the
-	// end of the file, which is not that of the body anymore.
+	// The file was truncated after it was opened: the body is sent up to the
+	// end of the file, short of its own.
 	fi, err := hit.f.Stat()
 	if err != nil {
 		t.Fatal(err)
@@ -3404,7 +3394,7 @@ func TestStorePurgeAllInMemory(t *testing.T) {
 func TestStoreUncacheableMemo(t *testing.T) {
 	s := openTestStore(t, t.TempDir(), Limits{})
 
-	// What is remembered is forgotten after a while.
+	// A memo expires after a while.
 	id := makeID("key")
 	s.SetUncacheable(id, true)
 	s.fmu.Lock()
@@ -3420,7 +3410,7 @@ func TestStoreUncacheableMemo(t *testing.T) {
 		t.Errorf("%d responses remembered, want none", remembered)
 	}
 
-	// And all at once when there is too much to remember.
+	// And all memos go at once when there are too many.
 	for i := range maxPassMemo + 1 {
 		binary.LittleEndian.PutUint32(id[:], uint32(i))
 		s.SetUncacheable(id, true)
@@ -3433,8 +3423,8 @@ func TestStoreUncacheableMemo(t *testing.T) {
 	}
 }
 
-// TestStoreJanitor checks that the responses nobody requests leave by
-// themselves.
+// TestStoreJanitor checks that unrequested responses are removed on their
+// own, by the janitor.
 func TestStoreJanitor(t *testing.T) {
 	period := janitorPeriod
 	janitorPeriod = 5 * time.Millisecond
@@ -3476,7 +3466,7 @@ func TestArenaFailures(t *testing.T) {
 		t.Errorf("writing to what refuses it: %v", err)
 	}
 
-	// A limit lowered by a lot is caught up with in steps.
+	// A limit lowered by a lot is reached in steps.
 	b.release()
 	a.setLimit(0)
 	if !a.excess() || a.residentBytes() == 0 {
@@ -3497,8 +3487,8 @@ func TestArenaFailures(t *testing.T) {
 	}
 }
 
-// TestStoreMinUsesAcrossVersions checks that a response held in memory that
-// is replaced by a new version does not start over: the requests the
+// TestStoreMinUsesAcrossVersions checks that a transient response replaced
+// by a new version does not start its countdown over: the requests the
 // previous version got count.
 func TestStoreMinUsesAcrossVersions(t *testing.T) {
 	s := openTestStore(t, t.TempDir(), Limits{MaxMemory: 1 << 20})
@@ -3517,7 +3507,7 @@ func TestStoreMinUsesAcrossVersions(t *testing.T) {
 	if n := left(); n != 3 {
 		t.Fatalf("%d more requests needed, want 3", n)
 	}
-	// The second finds it, say stale, and fetches the next version.
+	// The second finds it stale, say, and fetches the next version.
 	if _, hit := storeGet(t, s, "key", nil); hit == nil {
 		t.Fatal("not found")
 	}
@@ -3535,8 +3525,8 @@ func TestStoreMinUsesAcrossVersions(t *testing.T) {
 	}
 }
 
-// TestStorePurgeMatchKeepsWhatIsNew checks that a response stored while the
-// keys are being matched is not purged for the one it replaces.
+// TestStorePurgeMatchKeepsWhatIsNew checks that a response stored while keys
+// are matched is not purged in place of the one it replaced.
 func TestStorePurgeMatchKeepsWhatIsNew(t *testing.T) {
 	s := openTestStore(t, t.TempDir(), Limits{})
 	for _, key := range []string{"replaced", "other"} {

@@ -26,9 +26,8 @@ func init() {
 //	POST /cache/purge?regex=<regex>    removes the responses whose key matches
 //	POST /cache/purge?all=true         empties the caches
 //
-// Keys are the ones shown in the Cache-Status header. A purge applies to the
-// cache stored in the directory given by the path parameter, or to all of
-// them without it.
+// Keys are as shown in the Cache-Status header. The path parameter limits a
+// purge to the cache in that directory; without it every cache is purged.
 type adminAPI struct{}
 
 // CaddyModule returns the Caddy module information.

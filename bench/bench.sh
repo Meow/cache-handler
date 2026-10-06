@@ -9,21 +9,17 @@
 #
 # Caddy is built from the working tree with the versions of go.mod, started
 # with the Caddyfile next to this script on 127.0.0.1, and stopped at the end.
-# Every scenario is a route of that Caddyfile: read it for what each one is.
-# The first scenario of each group is the baseline the others are compared
-# to. The cached ones are requested before they are measured, so what is
-# measured is hits; the last column is the Cache-Status of such a request,
-# which tells where from. Every scenario is measured RUNS times and the run
-# with the median number of requests per second is the one reported: single
-# runs of the same scenario differ by 10% or more.
+# Every scenario is a route of that Caddyfile; the first of each group is the
+# baseline. Cached scenarios are requested once before being measured, so
+# hits are what is measured; the last column is the Cache-Status of such a
+# request. Each scenario runs RUNS times and the median run is reported:
+# single runs differ by 10% or more.
 #
-# ab is a single thread, and a Caddy with many cores to itself answers small
-# responses faster than ab can ask for them: the scenarios that reach the
-# same ceiling show the speed of ab, not theirs. GOMAXPROCS, which Caddy
-# inherits, makes Caddy the slower of the two, so that the differences
-# between the scenarios show. Both run on the same machine and compete for
-# it: compare the numbers of one run with each other, not with those of
-# another machine.
+# ab is single-threaded, and a Caddy with many cores answers small responses
+# faster than ab can ask: scenarios that hit the same ceiling show ab's
+# speed, not theirs. GOMAXPROCS, inherited by Caddy, makes Caddy the slower
+# side so that differences between scenarios show. Both compete for the same
+# machine: compare numbers within one run, not across machines.
 #
 # Environment:
 #   REQUESTS       requests per run (100000)
@@ -127,9 +123,9 @@ bench() {
 	local name=$1 url=$base$2
 	shift 2
 
-	# Warm up: the response is stored, written to disk if it waits for that
-	# (min_uses), and requested enough to be copied to memory, which happens
-	# in the background, hence the pause.
+	# Warm up: store the response, get it written to disk (min_uses) and
+	# requested enough to be copied to memory. That copy happens in the
+	# background, hence the pause.
 	if ! ab "${ab_flags[@]}" -n $((CONCURRENCY * 20)) "$@" "$url" >"$work/ab.txt" 2>&1; then
 		echo "bench: ab failed on $url:" >&2
 		cat "$work/ab.txt" >&2

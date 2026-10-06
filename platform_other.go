@@ -4,9 +4,9 @@ package httpcache
 
 import "os"
 
-// Without mmap the memory tier falls back to the Go heap. The limit on the
-// bytes in use still holds, but freed memory is only returned by the garbage
-// collector.
+// mapSegment allocates from the Go heap where there is no mmap. The limit on
+// the bytes in use still holds, but freed memory is only returned by the
+// garbage collector.
 func mapSegment(size int) ([]byte, error) {
 	return make([]byte, size), nil
 }

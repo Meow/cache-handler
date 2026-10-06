@@ -255,8 +255,8 @@ func varyNames(h http.Header) (names []string, star bool) {
 	return names, false
 }
 
-// varyValue returns the value of a request header as it takes part in the
-// selection of a response.
+// varyValue returns the value of a request header as used to select a
+// response.
 func varyValue(h http.Header, name string) string {
 	values := h.Values(name)
 	if len(values) == 0 {
@@ -428,10 +428,10 @@ func headerDiff(base, final http.Header) http.Header {
 	return diff
 }
 
-// ownHeaders returns the headers a handler gave a response itself, leaving
-// out the values that were set before it ran. Those come from the handlers
-// in front of the cache, which set them on every response, served from the
-// cache or not: they say nothing about the response of the upstream.
+// ownHeaders returns the headers a handler set itself, without the values
+// present before it ran: those come from the handlers in front of the cache,
+// which set them on every response, served from the cache or not, and say
+// nothing about the upstream's response.
 func ownHeaders(base, final http.Header) http.Header {
 	own := make(http.Header, len(final))
 	for name, values := range final {

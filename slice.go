@@ -19,35 +19,33 @@ import (
 	"go.uber.org/zap"
 )
 
-// With the slice option, a response is asked of the upstream in ranges of a
-// fixed size, the slices, and each slice is stored as a response of its own.
-// A request for the middle of a large response then fetches the slices it
-// reads and nothing else, instead of waiting for a download that starts at
-// the first byte.
+// With the slice option, a response is requested from the upstream in
+// ranges of a fixed size, the slices, and each slice is stored as a response
+// of its own. A request for the middle of a large response then fetches only
+// the slices it reads, instead of waiting for a download that starts at the
+// first byte.
 //
-// The slices of a response are stored like the variants of a response that
-// varies: the entry of the key is a marker, and the range of a slice takes
-// part in the selection of what the marker leads to, beside the request
-// headers the response varies on. What holds for variants therefore holds
-// for slices without a line of the store knowing about them: one request to
-// the upstream per slice however many requests want it, a slice served
-// while it downloads, min_uses, and a purge of the key that leaves no slice
-// reachable.
+// Slices are stored like the variants of a response that varies: the entry
+// of the key is a marker, and the range of a slice selects what the marker
+// leads to, beside the request headers the response varies on. Everything
+// that holds for variants therefore holds for slices without the store
+// knowing about them: one upstream request per slice however many requests
+// want it, a slice served while it downloads, min_uses, and a purge of the
+// key that leaves no slice reachable.
 //
 // A slice is stored as the upstream sent it: a 206 response whose
-// Content-Range tells which part of what it is. No other response is ever
-// stored with that status, which is how a slice is told from a response
-// stored whole. A response is stored whole, under the slice option too, when
-// it is not a slice of something larger: it fits in the first slice, it has
-// another status than 206, or it cannot be had in slices at all.
+// Content-Range says which part of what it is. No other response is stored
+// with that status, which is how a slice is told from a response stored
+// whole. Under the slice option a response is still stored whole when it is
+// not a slice of something larger: it fits in the first slice, its status is
+// not 206, or it cannot be fetched in slices at all.
 //
 // A request is answered by http.ServeContent reading a sliceReader, which
 // makes one body of the slices: ranges and preconditions are evaluated by
-// the standard library, as they are for a response stored whole.
+// the standard library, as for a response stored whole.
 
-// sliceSelector is the name under which the range of a slice takes part in
-// the selection of what is stored for a key. It cannot be the name of a
-// header.
+// sliceSelector is the name under which the range of a slice selects what
+// is stored for a key. It cannot be the name of a header.
 const sliceSelector = ":slice"
 
 var (
@@ -124,7 +122,7 @@ func firstSlice(r *http.Request, size int64) int64 {
 
 // sliceFetch is the fetch of one slice. It runs beside the request it is
 // for, which reads the slice from the cache as it arrives, like any other
-// request for it does.
+// request for it.
 type sliceFetch struct {
 	// first and last bound the slice in the response.
 	first, last int64
@@ -134,31 +132,30 @@ type sliceFetch struct {
 	// whole is the ID the response has when it is stored whole. Unlike the
 	// ID of the slice, it is the same for every slice of the response.
 	whole ID
-	// lead tells that the client was not sent anything yet. The fetch may
-	// then answer the request itself, which it does when the upstream sends
-	// something else than a slice. Otherwise nothing but a slice is of use.
+	// lead is set while the client has not been sent anything yet. The fetch
+	// may then answer the request itself, which it does when the upstream
+	// sends something other than a slice. Otherwise only a slice is of use.
 	lead bool
 	// request is held while the request is changed into the one for the
 	// slice and back, see sliceWriter.
 	request *sync.Mutex
 	done    chan struct{}
 
-	// What follows is the outcome, for the request to read once done is
-	// closed.
+	// The rest is the outcome, read by the request once done is closed.
 	//
-	// sliced tells that the upstream sent the slice, and stored that it is
-	// in the cache now.
+	// sliced is set when the upstream sent the slice, stored once it is in
+	// the cache.
 	sliced, stored bool
-	// beyond tells that the response ends before the slice.
+	// beyond is set when the response ends before the slice.
 	beyond bool
-	// unsliced tells that the upstream sent something that cannot be stored
-	// as a slice, where the response may well be storable whole.
+	// unsliced is set when the upstream sent something that cannot be stored
+	// as a slice; the response may still be storable whole.
 	unsliced bool
-	// changed tells that the upstream answered with another response than
-	// the one the client is being sent.
+	// changed is set when the upstream answered with a different response
+	// than the one the client is being sent.
 	changed bool
-	// hit is the stored slice to serve, when the upstream confirmed it or
-	// failed, with the parameters of Cache-Status that say so.
+	// hit is the stored slice to serve when the upstream confirmed it or
+	// failed, and params the Cache-Status parameters saying so.
 	hit    *Hit
 	params string
 	// err is the result of the handler when the fetch answered the request,
@@ -173,9 +170,8 @@ func (sf *sliceFetch) passable() bool {
 	return sf.lead && !sf.beyond && !sf.unsliced
 }
 
-// sliceSink stands for the client in the fetch of a slice that follows
-// others the client was already sent: nothing of that fetch is for the
-// client to see.
+// sliceSink stands in for the client in the fetch of a slice after others
+// were already sent: nothing of that fetch is for the client to see.
 type sliceSink struct {
 	header http.Header
 }
@@ -184,15 +180,15 @@ func (s *sliceSink) Header() http.Header       { return s.header }
 func (*sliceSink) WriteHeader(int)             {}
 func (*sliceSink) Write(p []byte) (int, error) { return len(p), nil }
 
-// sliceWriter is the client as the response made of slices is written to
-// it. It records the status of the response, and keeps the request still
-// while the header is written: that is when the handlers in front of the
-// cache set the response headers they were asked to set late, for which
-// they may look at the request, and the fetch of the slice being sent may
-// be done at that very moment, and putting the request back as it was.
+// sliceWriter wraps the client while the response made of slices is written
+// to it. It records the status and holds the request lock while the header
+// is written: that is when handlers in front of the cache set the response
+// headers they were asked to set late, which may read the request, while
+// the fetch of the slice being sent may be restoring the request at that
+// very moment.
 //
-// The body is written without the lock: a client that reads slowly is not
-// to hold up a fetch.
+// The body is written without the lock: a slow client must not hold up a
+// fetch.
 type sliceWriter struct {
 	*caddyhttp.ResponseWriterWrapper
 	status  int
@@ -210,9 +206,9 @@ func (w *sliceWriter) WriteHeader(code int) {
 }
 
 // sliceHeaderLocked decides what becomes of the response to a request for
-// one slice. It reports whether it did. A response that is not a slice of a
-// larger one is left to be handled like the answer to any request, provided
-// the client can still be sent it.
+// one slice, and reports whether it did. A response that is not a slice of
+// a larger one is left to be handled like any other, provided the client
+// can still be sent it.
 func (fw *fetchWriter) sliceHeaderLocked(sf *sliceFetch, now time.Time) bool {
 	switch fw.status {
 	case http.StatusRequestedRangeNotSatisfiable:
@@ -234,16 +230,16 @@ func (fw *fetchWriter) sliceHeaderLocked(sf *sliceFetch, now time.Time) bool {
 
 		if first == 0 && last == total-1 {
 			// The response fits in its first slice. It is what a request
-			// without a range would have been answered, and is stored as
-			// such: one file, and nothing to put together.
+			// without a range would have gotten, and is stored as such: one
+			// file, nothing to put together.
 			fw.hdr.Del("Content-Range")
 			fw.status = http.StatusOK
 			break
 		}
 
-		// A body that a handler on the way transformed, by compressing it
-		// for instance, is no longer the range it claims to be. Such a
-		// handler removes the length, which it cannot know.
+		// A body transformed by a handler on the way, compressed for
+		// instance, is no longer the range it claims to be. Such a handler
+		// removes the length, which it cannot know.
 		if length, err := strconv.ParseInt(fw.hdr.Get("Content-Length"), 10, 64); err != nil || length != last-first+1 {
 			sf.unsliced = true
 			fw.giveUpLocked()
@@ -261,7 +257,7 @@ func (fw *fetchWriter) sliceHeaderLocked(sf *sliceFetch, now time.Time) bool {
 	}
 
 	// The client is being sent a response the upstream has no more slices
-	// of. An error that may pass says nothing of the response.
+	// of. A passing error says nothing about the response.
 	sf.changed = fw.status < http.StatusBadRequest || fw.status == http.StatusNotFound || fw.status == http.StatusGone
 	fw.giveUpLocked()
 
@@ -297,8 +293,9 @@ func (fw *fetchWriter) storeSliceLocked(sf *sliceFetch, length, total int64, now
 			fw.mode = modeSlice
 			sf.sliced = true
 			// The response was stored whole and no longer fits in a slice.
-			// Where it varies, what was stored is not replaced by what leads
-			// to the slices, and would be found before them forever.
+			// Where it varies, the stored response is not replaced by the
+			// marker leading to the slices, and would be found before them
+			// forever.
 			if fw.stale != nil && fw.stale.rec.status != http.StatusPartialContent {
 				fw.stale.Discard()
 			}
@@ -344,8 +341,8 @@ type slicePart struct {
 	pos  int64
 	hit  *Hit
 	tail *Tail
-	// params are the parameters of Cache-Status telling how the slice was
-	// come by.
+	// params are the Cache-Status parameters telling how the slice was
+	// obtained.
 	params string
 }
 
@@ -357,14 +354,14 @@ func (p *slicePart) close() {
 }
 
 // sliceReader is the body of a response stored in slices, read and seeked
-// like a file. The slices are taken from the cache, or fetched, as the
-// reading gets to them.
+// like a file. Slices are taken from the cache, or fetched, as the reading
+// reaches them.
 //
-// http.ServeContent reads the body of a response to a request for several
-// ranges from a goroutine of its own, which it does not wait for when the
-// client leaves. Reading is therefore done under a lock, and comes to an end
-// with shut: from then on that goroutine finds nothing to read, and the
-// request can release what the reader holds.
+// For a request for several ranges, http.ServeContent reads the body from a
+// goroutine of its own, which it does not wait for when the client leaves.
+// Reading is therefore done under a lock and ended by shut: from then on
+// that goroutine finds nothing to read, and the request can release what
+// the reader holds.
 type sliceReader struct {
 	x    *exchange
 	size int64
@@ -372,8 +369,8 @@ type sliceReader struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	// base holds the response headers as the cache found them, and plain
-	// the request headers. The request and the response themselves are not
-	// to be read while a fetch is running, which works on both.
+	// the request headers. The request and response themselves must not be
+	// read while a fetch is running, since it works on both.
 	base  http.Header
 	plain http.Header
 	// header is plain with the range of the slice wanted, which selects the
@@ -387,15 +384,14 @@ type sliceReader struct {
 	request sync.Mutex
 	sw      *sliceWriter
 
-	// lead tells that the client was not sent anything yet: until then the
-	// request can still be answered another way than from slices. answer is
-	// the result of the handler when it was.
+	// lead is set while the client has not been sent anything yet: until
+	// then the request can still be answered otherwise than from slices.
+	// answer is the result of the handler when it was.
 	lead   bool
 	answer error
 
-	// total is the size of the response, and etag and modified what
-	// identifies it: every slice has to be part of the same response as the
-	// first one sent.
+	// total is the size of the response, and etag and modified identify it:
+	// every slice must belong to the same response as the first one sent.
 	total          int64
 	etag, modified string
 	off            int64
@@ -406,14 +402,13 @@ type sliceReader struct {
 	// panicked is what a fetch panicked with, for the request to raise
 	// again when it ends, see wait.
 	panicked any
-	// flushing tells that the client is sent what there is while more is
-	// awaited. Not when it asked for several ranges: the one waiting is then
-	// not the one writing to it.
+	// flushing is set when the client is sent what there is while more is
+	// awaited. Not for several ranges: the goroutine waiting is then not
+	// the one writing to the client.
 	flushing bool
 
-	// mu guards the reading, from when the response is being sent: closed
-	// tells that it came to an end, and err is the reason the body could
-	// not be read to its end.
+	// mu guards the reading once the response is being sent: closed is set
+	// when it ended, and err is why the body could not be read to its end.
 	mu     sync.Mutex
 	closed bool
 	err    error
@@ -439,8 +434,8 @@ func (x *exchange) serveSliced() error {
 	n := firstSlice(x.r, sr.size)
 	part, err := sr.acquire(n)
 	if err == errSliceBeyond && n > 0 {
-		// The response ends before the range asked for. Its first slice
-		// tells where, which the answer has to say.
+		// The response ends before the requested range. Its first slice
+		// tells where, which the answer must say.
 		part, err = sr.acquire(0)
 	}
 
@@ -500,8 +495,8 @@ func (sr *sliceReader) serve(part *slicePart) error {
 	return nil
 }
 
-// shut ends the reading, and returns the reason the body was not read to
-// its end if it was not. It returns once nobody is reading.
+// shut ends the reading and returns why the body was not read to its end,
+// if it was not. It returns once nobody is reading.
 func (sr *sliceReader) shut() error {
 	// Whoever is still reading is waiting for a slice nobody will be sent.
 	sr.cancel()
@@ -521,8 +516,8 @@ func (sr *sliceReader) answered(err error) error {
 }
 
 // close releases the slice being read and waits for the fetch in progress,
-// which is not to outlive the request it works on. It is called by the
-// request itself, which is where the panic of a fetch belongs.
+// which must not outlive the request it works on. The request itself calls
+// it: that is where the panic of a fetch belongs.
 func (sr *sliceReader) close() {
 	_ = sr.shut()
 	sr.closePart()
@@ -541,10 +536,10 @@ func (sr *sliceReader) closePart() {
 	}
 }
 
-// wait returns once no fetch is running for the request. A fetch that
-// panicked is not made to do so again from here: the body may be read from
-// a goroutine of http.ServeContent, where a panic is not that of a request
-// anymore but the end of the server. It is kept for close to raise.
+// wait returns once no fetch is running for the request. A panic of the
+// fetch is not raised again here: the body may be read from a goroutine of
+// http.ServeContent, where a panic is no longer that of a request but the
+// end of the server. It is kept for close to raise.
 func (sr *sliceReader) wait() {
 	sf := sr.pending
 	if sf == nil {
@@ -585,7 +580,7 @@ func (sr *sliceReader) Seek(offset int64, whence int) (int64, error) {
 }
 
 // Read implements io.Reader. It reads from the slice the current offset is
-// in, which it gets hold of first if it is not the one read last.
+// in, acquiring it first if it is not the one read last.
 func (sr *sliceReader) Read(p []byte) (int, error) {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
@@ -691,10 +686,10 @@ func (sr *sliceReader) tailPart(n int64, w *Writer) *slicePart {
 	return part
 }
 
-// lookup finds what is stored for slice n. For a request that was not
-// answered yet that may be the whole response, which is looked for first:
-// where both are found, a response that was stored whole since is the one
-// that says what the upstream sends now.
+// lookup finds what is stored for slice n. For a request not answered yet
+// that may be the whole response, which is looked for first: where both
+// exist, a response stored whole after the slices is the one that says
+// what the upstream sends now.
 func (sr *sliceReader) lookup(n int64) (ID, *Hit) {
 	x := sr.x
 	s := x.store
@@ -733,9 +728,9 @@ func (sr *sliceReader) fetch(id ID, fl *flight, stale *Hit, n int64) *sliceFetch
 
 	sub := &exchange{h: x.h, c: x.c, store: x.store, w: x.w, r: x.r, next: x.next, key: x.key, start: x.start, reqCC: x.reqCC, slice: sf}
 	if !sr.lead {
-		// The headers of the client response are those of the first slice
-		// by now, which is not what a response is to be compared with to
-		// tell what the upstream gave it.
+		// By now the client response headers are those of the first slice,
+		// not the base a response must be diffed against to tell which
+		// headers the upstream set.
 		sub.w = &sliceSink{header: sr.base.Clone()}
 	}
 
@@ -755,18 +750,18 @@ func (sr *sliceReader) fetch(id ID, fl *flight, stale *Hit, n int64) *sliceFetch
 	return sf
 }
 
-// acquire gets hold of slice n, from the cache or from the upstream. It is
-// to slices what exchange.serve is to whole responses, and answers the
-// request like it does when there turn out to be no slices to read: the
-// error is then errSliceAnswered. That only happens while the client was
-// not sent anything.
+// acquire obtains slice n, from the cache or from the upstream. It is to
+// slices what exchange.serve is to whole responses, and like it answers the
+// request when there turn out to be no slices to read: the error is then
+// errSliceAnswered. That only happens while the client was not sent
+// anything.
 func (sr *sliceReader) acquire(n int64) (*slicePart, error) {
 	x := sr.x
 	s := x.store
 
-	// The fetches of a request run one at a time: the upstream handlers work
-	// on the request itself, and on what its context carries. The one for
-	// the slice read before this one is over, or about to be.
+	// A request's fetches run one at a time: the upstream handlers work on
+	// the request itself and on what its context carries. The fetch of the
+	// slice read before this one is over, or about to be.
 	sr.wait()
 	if sr.panicked != nil {
 		return nil, errSliceLost
@@ -780,7 +775,7 @@ func (sr *sliceReader) acquire(n int64) (*slicePart, error) {
 	var (
 		joined, seen *flight
 		deadline     time.Time
-		// fetched tells how the request came by the slice it fetched itself.
+		// fetched tells how the request obtained the slice it fetched itself.
 		fetched string
 	)
 	for {
@@ -856,7 +851,7 @@ func (sr *sliceReader) acquire(n int64) (*slicePart, error) {
 			}
 
 			// Finding out again that the response cannot be stored would
-			// take a request for a slice nobody has a use for.
+			// cost a request for a slice nobody can use.
 			if s.Uncacheable(sr.whole) {
 				hit.Close()
 				return nil, sr.answered(x.pass("UNCACHEABLE"))
@@ -953,9 +948,9 @@ func (sr *sliceReader) acquire(n int64) (*slicePart, error) {
 					return part, nil
 				}
 				if fl.w.rec.status == http.StatusPartialContent {
-					// Another slice of the response, the first one to be
-					// stored: the marker it came with tells under which ID
-					// the one wanted here is to be fetched.
+					// Another slice of the response, the first to be stored:
+					// its marker tells under which ID the one wanted here
+					// must be fetched.
 					break wait
 				}
 				if !sr.lead {

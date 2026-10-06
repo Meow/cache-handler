@@ -27,8 +27,8 @@ const (
 	// minMaxMemory is the smallest memory budget accepted: below it the
 	// index could not even describe a useful number of files.
 	minMaxMemory = 1 << 20
-	// maxMinUses is the largest number of requests a response can be made
-	// to wait for before it is written to disk.
+	// maxMinUses is the largest min_uses accepted: requests a response may
+	// wait for before it is written to disk.
 	maxMinUses = 1000
 	// minSlice is the smallest slice accepted: each slice is a file and a
 	// request to the upstream.
@@ -86,14 +86,14 @@ type Options struct {
 	// Default: keep them until the space is needed.
 	Inactive caddy.Duration `json:"inactive,omitempty"`
 	// Number of requests after which a response is written to disk. Until
-	// then it is kept in memory, within half of max_memory, and dropped from
-	// there by the responses that follow if it is not requested again.
+	// then it is kept in memory, within half of max_memory, where newer
+	// responses push it out if it is not requested again.
 	// Default: 1, every response is written to disk as it is received.
 	MinUses int `json:"min_uses,omitempty"`
-	// Size of the ranges the responses are asked of the upstream in, each
-	// range being stored by itself: a request for the middle of a large
-	// response fetches what it reads and nothing else. The upstream has to
-	// support range requests. Default: off, responses are fetched whole.
+	// Size of the ranges responses are fetched from the upstream in, each
+	// stored by itself: a request for the middle of a large response fetches
+	// only what it reads. The upstream must support range requests.
+	// Default: off, responses are fetched whole.
 	Slice Size `json:"slice,omitempty"`
 	// How long a response is fresh when the upstream does not say.
 	// Default: 120s.
@@ -104,10 +104,10 @@ type Options struct {
 	// How long a request waits for another one that is already fetching the
 	// same response before going to the upstream itself. Default: 5s.
 	LockTimeout caddy.Duration `json:"lock_timeout,omitempty"`
-	// Which Cache-Control directives are honoured: by default those of the
-	// responses only, with "strict" also those of the requests, with
-	// "bypass_response" or "bypass" none of the responses. "strict" is the
-	// mode that conforms to RFC 9111, see README.md.
+	// Which Cache-Control directives are honored. Default: those of the
+	// responses only. "strict" also honors those of the requests, and is the
+	// mode that conforms to RFC 9111, see README.md. "bypass_response" or
+	// "bypass" ignores those of the responses.
 	Mode string `json:"mode,omitempty"`
 	// Name of the cache in the Cache-Status header. Default: Caddy.
 	CacheName string `json:"cache_name,omitempty"`
@@ -261,8 +261,8 @@ func (o Options) resolve() (*config, error) {
 	case slice < minSlice:
 		return nil, fmt.Errorf("slice must be at least %s, or off", Size(minSlice))
 	case slice > c.limits.MaxSize/2:
-		// A slice is stored like a response, and is no more allowed to take
-		// most of the cache.
+		// A slice is stored like a response and may not take most of the
+		// cache either.
 		return nil, fmt.Errorf("slice cannot be larger than half of max_size")
 	default:
 		c.slice = slice
@@ -315,8 +315,8 @@ func (o Options) resolve() (*config, error) {
 
 const storageRemoved = "storage backends were removed, the cache now stores on disk and in memory by itself: use path, max_size, max_memory and max_file_count"
 
-// removedOptions are the options of the Souin based versions of this module
-// that no longer exist, with what to do instead.
+// removedOptions are the options of the Souin based versions that no longer
+// exist, with what to use instead.
 var removedOptions = map[string]string{
 	"badger":                    storageRemoved,
 	"etcd":                      storageRemoved,
@@ -503,10 +503,10 @@ func parseOptions(d *caddyfile.Dispenser, o *Options) error {
 	}
 
 	// Report mistakes where they are written rather than when the
-	// configuration is loaded. Only those that can be told from here: a
-	// slice is checked against the size of the cache, which may be set where
-	// this block inherits from, or where it is inherited. That is left to
-	// when the handler is provisioned, and knows both.
+	// configuration is loaded, as far as they can be told from here: a slice
+	// is checked against max_size, which the other block, global option or
+	// directive, may set. That check waits for the handler's Provision,
+	// which knows both.
 	check := *o
 	if check.MaxSize == 0 {
 		check.MaxSize = math.MaxInt64

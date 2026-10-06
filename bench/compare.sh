@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# Requests per second of this module next to those of other caches: nginx's
+# Requests per second of this module next to other caches: nginx's
 # proxy_cache, Varnish, and caddyserver/cache-handler (Souin) with three of
-# its storages. Everything runs in Docker, which is all the host needs, and
-# on the loopback interface of one container.
+# its storages. Everything runs in Docker, on the loopback interface of one
+# container; the host needs nothing else.
 #
 #   bench/compare.sh
 #   bench/compare.sh | tee results.txt
@@ -11,26 +11,24 @@
 #
 # What it does:
 #
-#   1. Builds an image with a Caddy built from the working tree, a Caddy
-#      with caddyserver/cache-handler, and Alpine's nginx, Varnish, hitch
-#      and ab.
+#   1. Builds an image with a Caddy from the working tree, a Caddy with
+#      caddyserver/cache-handler, and Alpine's nginx, Varnish, hitch and ab.
 #   2. For each number of cores in CORES, puts every cache in front of the
-#      same upstream, a Caddy without a cache answering a text of 13 bytes
-#      and fixtures/test.png, and measures hits with ab. The no cache rows
-#      are what the same server does without its cache: by itself, then as
-#      a mere proxy of the upstream. Everything is measured twice: in plain
-#      HTTP, and over TLS with sendfile off, as a server that terminates TLS
-#      does without help from the kernel. Varnish has no TLS of its own and
-#      gets it from hitch, the TLS proxy of the Varnish project, on the same
-#      cores.
+#      same upstream, a Caddy without a cache answering a 13-byte text and
+#      fixtures/test.png, and measures hits with ab. The "no cache" rows are
+#      the same server without its cache: by itself, then as a plain proxy
+#      of the upstream. Everything is measured twice: in plain HTTP, and
+#      over TLS with sendfile off, as a server terminating TLS without kernel
+#      help does. Varnish has no TLS of its own and gets it from hitch, the
+#      Varnish project's TLS proxy, on the same cores.
 #   3. Runs bench.sh, the benchmark of this module alone, in the same image:
-#      once as it is, once with GOMAXPROCS=1.
+#      once as is, once with GOMAXPROCS=1.
 #
-# The processes are pinned, each to physical cores of its own: ab to one,
-# the server under test to the next CORES ones, the upstream to up to four
-# of the last ones. ab is a single thread: with enough cores, the fastest
-# servers answer faster than it asks, and their rows show the speed of ab.
-# One core is where the servers are compared; more cores tell how they scale.
+# Processes are pinned to physical cores of their own: ab to one, the server
+# under test to the next CORES, the upstream to up to four of the last. ab is
+# single-threaded: with enough cores the fastest servers answer faster than
+# it asks, and their rows show ab's speed. One core compares the servers;
+# more cores show how they scale.
 #
 # Environment:
 #   CORES        numbers of cores to give the server under test, each a run
@@ -105,9 +103,9 @@ RUN apk add --no-cache nginx varnish hitch openssl apache2-utils curl bash util-
 COPY --from=ours /caddy-ours /usr/local/bin/caddy-ours
 COPY --from=souin /caddy-souin /usr/local/bin/caddy-souin
 COPY --from=souin /souin-versions.txt /souin-versions.txt
-# On the filesystem of the container rather than mounted from the host: with
-# Docker in a virtual machine, a mount is slow enough to open files on to be
-# what the servers that serve them are measured by.
+# On the container's filesystem, not a host mount: with Docker in a virtual
+# machine, opening files on a mount is slow enough to dominate what the
+# servers are measured by.
 COPY fixtures /fixtures
 COPY bench /bench
 EOF
@@ -407,9 +405,8 @@ ready() {
 	done
 }
 
-# stop ends the server under test. nginx, Varnish and hitch answer from
-# processes of their own, which take a moment to follow: the next server
-# needs the ports.
+# stop ends the server under test. nginx, Varnish and hitch answer from child
+# processes, which take a moment to exit: the next server needs the ports.
 stop() {
 	local scheme
 	kill "${servers[@]}" 2>/dev/null || true
@@ -437,8 +434,8 @@ bench() {
 	for scheme in $schemes; do for file in plain test.png; do
 		url=$(base "$scheme")$path/$file
 
-		# Warm up, and ask the cache what it says of the response: every
-		# server has its header for that.
+		# Warm up, then read the cache status header, which every server
+		# names differently.
 		ab -q -k -c "$CONCURRENCY" -n $((CONCURRENCY * 20)) "$url" >/dev/null 2>&1
 		sleep 0.5
 		status=$(curl -sk -o /dev/null -D - "$url" | tr -d '\r' | awk '
@@ -462,8 +459,8 @@ bench() {
 		done
 		read -r rps run failed reopened rate length < <(sort -n "$work/runs.txt" | sed -n "$(((RUNS + 1) / 2))p")
 
-		# What would make a row say something else than it seems to: a server
-		# that closes the connections, or one that answers something else.
+		# What would make a row misleading: a server that closes connections,
+		# or one that answers something else.
 		[ "$reopened" -gt 0 ] && status="$status (connections reopened: $reopened)"
 		case $file:$length in plain:13 | test.png:43366) ;; *) status="$status (WRONG LENGTH: $length)" ;; esac
 

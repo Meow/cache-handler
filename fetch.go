@@ -22,10 +22,9 @@ import (
 // receiving anything from the upstream before it is given up.
 var clientGoneGrace = 30 * time.Second
 
-// routeGroupCtxKey is where Caddy's router keeps, in the context of a
-// request, the groups of routes of which one was taken already: those of the
-// rewrite and handle directives, of which only the first that matches
-// applies. Caddy does not export it.
+// routeGroupCtxKey is the request context key under which Caddy's router
+// records the route groups already taken (rewrite and handle directives,
+// where only the first match applies). Caddy does not export it.
 var routeGroupCtxKey = caddy.CtxKey("route_group")
 
 var (
@@ -45,8 +44,8 @@ const (
 	// range of it that it asked for, from what is stored so far.
 	modeRelay
 	// modeSilent: stored only. The client sent a precondition or asked for
-	// something else than one plain range, which is answered from the stored
-	// response afterwards.
+	// something other than one plain range, and is answered from the stored
+	// response afterward.
 	modeSilent
 	// modeRevalidated: the upstream confirmed the stale response.
 	modeRevalidated
@@ -62,14 +61,14 @@ const (
 	modeSlice
 )
 
-// fetchWriter is the ResponseWriter given to the upstream handlers when the
-// cache fetches a response. It decides what to do with the response when its
-// headers arrive, then streams the body accordingly without ever holding it.
+// fetchWriter is the ResponseWriter the upstream handlers get during a
+// fetch. It decides the fate of the response when its headers arrive, then
+// streams the body accordingly, never holding it.
 //
-// A response that is stored goes from the upstream to the file only. The
-// client is served from the file by a separate goroutine, the pump, like the
-// other requests reading the response while it downloads: a client that
-// reads slowly holds up neither the download nor the others.
+// A stored response goes from the upstream to the file only. The client is
+// served from the file by a separate goroutine, the pump, like every other
+// request reading the response as it downloads: a slow client holds up
+// neither the download nor the others.
 type fetchWriter struct {
 	x  *exchange
 	id ID
@@ -87,9 +86,9 @@ type fetchWriter struct {
 	rangeHeader string
 	// revalidating tells that the request carries the validators of stale.
 	revalidating bool
-	// reqHeader holds the request headers as the client sent them. They are
-	// what selects the variant a response is stored as, like they are when
-	// it is looked up: the upstream handlers may change the request since.
+	// reqHeader is the request headers as the client sent them. They select
+	// the variant a response is stored as, like they do at lookup: the
+	// upstream handlers may change the request meanwhile.
 	reqHeader http.Header
 	// forward is the Cache-Status reason the request was forwarded.
 	forward string
@@ -140,8 +139,8 @@ func newFetchWriter(x *exchange, id ID, stale *Hit) *fetchWriter {
 		fw.forward = "fwd=stale"
 	}
 	if x.slice != nil {
-		// Whether the response can be stored is the same for all its
-		// slices, and is remembered for all of them at once.
+		// Cacheability is the same for all slices of a response and is
+		// remembered once for all of them.
 		fw.id = x.slice.whole
 	}
 	if x.r.Method == http.MethodGet && !conditional(x.r) && x.r.Header.Get("If-Range") == "" {
@@ -158,20 +157,18 @@ func plainRequest(r *http.Request) bool {
 }
 
 // prepareRequest turns the client request into one for the whole response:
-// a stored response must not depend on the range or the preconditions of the
-// client that happened to trigger the fetch. The validators of the stale
-// response are sent instead, so the upstream can answer that it is still
-// current. When responses are stored in slices, the request is for the one
-// slice the fetch is for.
+// what is stored must not depend on the range or preconditions of the client
+// that happened to trigger the fetch. The stale response's validators are
+// sent instead, so the upstream can confirm it. With slicing, the request is
+// for the one slice this fetch is for.
 //
-// The returned function puts the request back as it was received, undoing
-// as well what the upstream handlers changed in it, a rewrite for instance:
-// the request may have to be handled a second time. That includes what the
-// router noted of the routes it took: left there, a rewrite that was undone
-// would not be done again.
+// The returned function restores the request as received, undoing what the
+// upstream handlers changed too (a rewrite, for instance), since the request
+// may be handled a second time. That includes the router's record of the
+// routes taken: left in place, an undone rewrite would not be redone.
 func (fw *fetchWriter) prepareRequest(r *http.Request) (restore func()) {
-	// The request reading slices may be answering the client meanwhile,
-	// which is not to happen while the request changes, see sliceWriter.
+	// The request reading slices may be answering the client meanwhile; it
+	// must not while the request changes, see sliceWriter.
 	sf := fw.x.slice
 	if sf != nil {
 		sf.request.Lock()
@@ -270,8 +267,8 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 		code = fw.status
 	}
 
-	// The decision is taken on what the upstream handlers answered, not on
-	// what the handlers in front of the cache add to every response.
+	// Judge what the upstream handlers answered, not what the handlers in
+	// front of the cache add to every response.
 	own := ownHeaders(fw.base, fw.hdr)
 	if c.defaultCC != "" && own.Get("Cache-Control") == "" {
 		own.Set("Cache-Control", c.defaultCC)
@@ -284,12 +281,12 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 		// stored whole are found beside the slices of those that are not.
 		v.vary = withSliceSelector(v.vary)
 	}
-	// uncacheable tells that the response itself cannot be stored, as
-	// opposed to this one attempt at storing it.
+	// uncacheable: the response itself cannot be stored, not just this
+	// attempt at storing it.
 	uncacheable := !v.store
 
-	// The size the response announces is known not to fit before any of it
-	// is written.
+	// An announced size that does not fit is rejected before any of the
+	// body is written.
 	limit := s.maxObject()
 	if c.maxBody > 0 && c.maxBody < limit {
 		limit = c.maxBody
@@ -301,8 +298,7 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 		}
 	}
 
-	// Nobody is waiting for the response anymore. It is only worth storing
-	// for later if it is known to end.
+	// Nobody is waiting anymore: only store it if it is known to end.
 	if v.store && fw.gone && fw.declared < 0 {
 		v = reject("CLIENT-GONE")
 	}
@@ -314,10 +310,9 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 			v = reject("STORAGE-ERROR")
 		} else {
 			fw.w = w
-			// From now on the requests waiting for this one are served from
-			// the response as it arrives. That is only offered for a
-			// response of known length: one that may turn out too large to
-			// store would be cut short for them when it does.
+			// Waiting requests are now served from the response as it
+			// arrives, but only when its length is known: one that turns
+			// out too large to store would be cut short for them.
 			if x.flight != nil && fw.declared >= 0 {
 				s.ShareFlight(x.flightID, x.flight, w)
 			}
@@ -328,8 +323,8 @@ func (fw *fetchWriter) writeHeaderLocked(code int) {
 		fw.reason = v.reason
 		if uncacheable {
 			s.SetUncacheable(fw.id, true)
-			// The upstream no longer gives a response to keep, so the one
-			// it gave before is not to be served anymore either.
+			// The upstream no longer gives a response to keep, so the
+			// earlier one must not be served anymore either.
 			if fw.stale != nil && code < 500 {
 				fw.stale.Discard()
 			}
@@ -390,9 +385,9 @@ func (fw *fetchWriter) recordLocked(v verdict, now time.Time) *record {
 	return rec
 }
 
-// relayRangeLocked starts a partial response if the client asked for one
-// range of a response whose length is known. The client then gets its bytes
-// as they arrive from the upstream instead of once everything is stored.
+// relayRangeLocked starts a 206 when the client asked for one range of a
+// response of known length, so that its bytes reach it as they arrive from
+// the upstream instead of once everything is stored.
 func (fw *fetchWriter) relayRangeLocked() bool {
 	if fw.status != http.StatusOK {
 		return false
@@ -484,8 +479,7 @@ func (fw *fetchWriter) startPumpLocked(count int64) {
 		return
 	}
 
-	// When the client has caught up with the download it is given what it
-	// has so far.
+	// Flush once the client has caught up with the download.
 	tail.flush = func() { _ = http.NewResponseController(fw.rw).Flush() }
 
 	done := make(chan struct{})
@@ -595,8 +589,8 @@ func (fw *fetchWriter) Write(p []byte) (int, error) {
 			return 0, errFetchAborted
 		}
 		if _, err := fw.w.Write(p); err != nil {
-			// Those reading the slice are cut short: it is from the cache
-			// that they get it, the request this fetch is for included.
+			// Readers of the slice, the request this fetch is for included,
+			// get it from the cache and are cut short.
 			fw.dropStoreLocked(err)
 			fw.cancel()
 
@@ -628,9 +622,9 @@ func (fw *fetchWriter) Flush() {
 	}
 }
 
-// dropStoreLocked gives up storing the response. If the client was being
-// served from the file, it returns once the client has received all that
-// the file holds, after which the client can be written to directly.
+// dropStoreLocked gives up storing the response. If the client was served
+// from the file, it returns once the client has all the file holds; the
+// client can then be written to directly.
 func (fw *fetchWriter) dropStoreLocked(err error) {
 	s := fw.x.store
 

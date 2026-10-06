@@ -63,9 +63,9 @@ func TestParseSize(t *testing.T) {
 	}
 }
 
-// TestSliceIsCheckedAgainstTheInheritedSize covers a slice and the size of
-// the cache it has to fit in being set at different levels: where it is
-// written, a block cannot tell what it inherits.
+// TestSliceIsCheckedAgainstTheInheritedSize covers a slice and the max_size
+// it must fit in being set at different levels: while a block is parsed, it
+// cannot tell what it inherits.
 func TestSliceIsCheckedAgainstTheInheritedSize(t *testing.T) {
 	var local, global Options
 	if err := parseOptions(caddyfile.NewTestDispenser("cache {\n slice 6Gi\n}"), &local); err != nil {
@@ -82,15 +82,14 @@ func TestSliceIsCheckedAgainstTheInheritedSize(t *testing.T) {
 	if _, err := local.inherit(Options{}).resolve(); err == nil || !strings.Contains(err.Error(), "half of max_size") {
 		t.Errorf("a slice larger than half of the default max_size was accepted: %v", err)
 	}
-	// What a block can tell by itself, it still does.
+	// What a block can check on its own, it still refuses as it is parsed.
 	if err := parseOptions(caddyfile.NewTestDispenser("cache {\n slice 1k\n}"), new(Options)); err == nil {
 		t.Error("a slice below the minimum was accepted")
 	}
 }
 
-// TestParseOptions covers the block of the directive and of the global
-// option as a whole. What Caddy makes of it is left to the tests that start
-// one.
+// TestParseOptions covers parsing a whole block, as a directive or as a
+// global option. What Caddy makes of it is left to the tests that start one.
 func TestParseOptions(t *testing.T) {
 	var got Options
 	err := parseOptions(caddyfile.NewTestDispenser(`cache {
@@ -215,8 +214,8 @@ func TestParseOptions(t *testing.T) {
 		t.Errorf("an unknown global option was accepted: %+v", app)
 	}
 
-	// A block that sets nothing inherits everything, and one that sets
-	// everything nothing but the status codes, which add up.
+	// A block that sets nothing inherits everything; one that sets everything
+	// inherits nothing but the status codes, which add up.
 	if inherited := (Options{}).inherit(want); !reflect.DeepEqual(inherited, want) {
 		t.Errorf("inherited %+v\nwant      %+v", inherited, want)
 	}
@@ -238,7 +237,7 @@ func TestModeOption(t *testing.T) {
 	} {
 		c, err := Options{Mode: mode}.resolve()
 		if err != nil || c.strict != want[0] || c.ignoreResponse != want[1] {
-			t.Errorf("mode %q: requests honoured %v, responses ignored %v, %v", mode, c.strict, c.ignoreResponse, err)
+			t.Errorf("mode %q: requests honored %v, responses ignored %v, %v", mode, c.strict, c.ignoreResponse, err)
 		}
 	}
 }
@@ -400,7 +399,7 @@ func TestEvaluate(t *testing.T) {
 		{name: "authorization public", r: authenticated, status: 200, header: http.Header{"Cache-Control": {"public"}}, lifetime: time.Hour},
 		{name: "authorization in key", c: resolve(keyed), r: authenticated, status: 200, lifetime: time.Hour},
 		{name: "authorization in vary", r: authenticated, status: 200, header: http.Header{"Vary": {"Authorization"}}, lifetime: time.Hour},
-		// RFC 9111, section 3.5, knows no exception but the directives.
+		// RFC 9111, section 3.5 allows no exception but response directives.
 		{name: "strict authorization in key", c: resolve(strictKeyed), r: authenticated, status: 200, reason: "AUTHORIZATION"},
 		{name: "strict authorization in vary", c: resolve(strict), r: authenticated, status: 200, header: http.Header{"Vary": {"Authorization"}}, reason: "AUTHORIZATION"},
 		{name: "strict authorization s-maxage", c: resolve(strict), r: authenticated, status: 200, header: http.Header{"Cache-Control": {"s-maxage=60"}}, lifetime: time.Minute},
@@ -477,7 +476,7 @@ func TestStaleUsable(t *testing.T) {
 		t.Error("a must-revalidate response was accepted stale")
 	}
 
-	// In strict mode a request that sets its own terms gets nothing less.
+	// In strict mode a request with terms of its own is never served stale.
 	for _, directive := range []string{"no-cache", "max-age=0", "min-fresh=600"} {
 		strict := &exchange{reqCC: parseDirectives([]string{directive})}
 		for name, rec := range map[string]*record{"stale": stale, "fresh": fresh} {
@@ -521,8 +520,8 @@ func TestUsable(t *testing.T) {
 		}
 	}
 
-	// What another request fetched while this one waited for it is as
-	// current as it gets, however long it is fresh.
+	// A response another request fetched while this one waited for it is as
+	// current as it gets, whatever its freshness.
 	x := &exchange{c: new(config), start: now.Add(-2 * time.Minute)}
 	if !x.usable(stale, now, &flight{stored: true}) {
 		t.Error("the response a request waited for was refused")
@@ -800,9 +799,9 @@ func TestRecordRoundTrip(t *testing.T) {
 	}
 }
 
-// TestReadRecordRejects covers the files whose checksum is right and whose
-// content is not, which no damage done at random gets to, and the ones that
-// cannot be read at all.
+// TestReadRecordRejects covers files whose checksum is right but whose
+// content is not, which random damage never produces, and files that cannot
+// be read at all.
 func TestReadRecordRejects(t *testing.T) {
 	// file returns the head of a cache file with the given meta block.
 	file := func(meta []byte) []byte {

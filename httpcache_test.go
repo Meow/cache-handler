@@ -369,9 +369,9 @@ func TestRevalidationCountsTheAge(t *testing.T) {
 	expectHit(t, resp, key, 20)
 }
 
-// TestRevalidationKeepsTheEntityTag checks that the clients keep being
-// answered on the entity tag they were given once the response is confirmed
-// by the upstream, which knows it under another one when encode changed it.
+// TestRevalidationKeepsTheEntityTag checks that a revalidated response
+// keeps the entity tag its clients were given: with encode, that tag is not
+// the one the upstream knows.
 func TestRevalidationKeepsTheEntityTag(t *testing.T) {
 	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Etag", `"v1"`)
@@ -489,8 +489,8 @@ func TestUncacheableRangeRequestKeepsItsRange(t *testing.T) {
 		expectBody(t, body, "abcdef")
 		expectStatus(t, resp, "Caddy; fwd=uri-miss; detail="+detail+"; key=GET-http-localhost:9080-/file")
 
-		// Finding out takes one more request to the upstream, once: from
-		// then on the client's request is all it gets.
+		// Finding out costs one extra request to the upstream, the first time
+		// only: from then on the client's request is the only one.
 		if want := int64(i + 2); up.hits.Load() != want {
 			t.Errorf("the upstream got %d requests after %d from the client, want %d", up.hits.Load(), i+1, want)
 		}
@@ -522,9 +522,9 @@ func TestVary(t *testing.T) {
 	}
 }
 
-// TestVaryIsSelectedByTheRequestAsReceived checks that a response is stored
-// as the variant the next request for it will look up: the one the headers
-// the client sent select, whatever the handlers after the cache made of them.
+// TestVaryIsSelectedByTheRequestAsReceived checks that a variant is stored
+// under the headers the client sent, not those the handlers after the cache
+// made of them: that is what the next request looks up.
 func TestVaryIsSelectedByTheRequestAsReceived(t *testing.T) {
 	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Vary", "X-Lang")
@@ -889,8 +889,8 @@ func TestFailedDownloadFailsThoseWhoJoinedIt(t *testing.T) {
 	}
 }
 
-// TestStatusOfAStoredResponse checks that a response stored with another
-// status than 200 reaches the client that triggered its download with it.
+// TestStatusOfAStoredResponse checks that a response stored with a status
+// other than 200 is delivered with that status, on the miss as on the hit.
 func TestStatusOfAStoredResponse(t *testing.T) {
 	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "max-age=60")
@@ -1065,8 +1065,8 @@ func TestResponseTooLargeToStoreIsStillDelivered(t *testing.T) {
 }
 
 // TestRangeIsDeliveredWhenTheResponseCannotBeStored checks that the request
-// which triggered a download gets the range it asked for when the response
-// can no longer be stored midway, like it would get a whole response.
+// that triggered a download still gets the range it asked for when storing
+// fails midway, as it would get a whole response.
 func TestRangeIsDeliveredWhenTheResponseCannotBeStored(t *testing.T) {
 	const size = 32 << 10
 	content := string(bodyFor("range", size))
@@ -1720,7 +1720,7 @@ func TestMinUses(t *testing.T) {
 			w.Header().Set("Vary", "Accept-Language")
 			_, _ = io.WriteString(w, r.Header.Get("Accept-Language")+" "+r.URL.Path)
 		case strings.HasPrefix(r.URL.Path, "/stream/"):
-			// No announced length, and more than memory is to hold of one
+			// No announced length, and larger than what memory may hold of one
 			// response.
 			body := bodyFor(r.URL.Path, 300_000)
 			for off := 0; off < len(body); off += 30_000 {
@@ -1763,8 +1763,7 @@ func TestMinUses(t *testing.T) {
 	expectBody(t, body, string(bodyFor("/twice", size)))
 	waitFor(t, "the response requested twice to be written", func() bool { return cacheFiles(dir) == 1 })
 
-	// So does it for a response that varies, along with what tells its
-	// variants apart.
+	// The same goes for a response that varies: its marker is written with it.
 	resp, body = get(t, tester, "/varied/page", "Accept-Language: fr")
 	expectHit(t, resp, prefix+"/varied/page", 3600)
 	expectBody(t, body, "fr /varied/page")
@@ -2229,10 +2228,10 @@ func TestRequestIsHandledTwiceAsReceived(t *testing.T) {
 	})
 }
 
-// TestRewriteIsAppliedToARequestHandledTwice covers the directives of which
-// Caddy applies only the first that matches, rewrite and handle: the router
-// remembers in the request that one was applied, which must not keep it from
-// applying it again to a request the cache starts over.
+// TestRewriteIsAppliedToARequestHandledTwice covers rewrite and handle, of
+// which Caddy applies only the first that matches: the router notes in the
+// request that one was applied, and that note must not stop it from being
+// applied again when the cache starts the request over.
 func TestRewriteIsAppliedToARequestHandledTwice(t *testing.T) {
 	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/real/x" {
@@ -2270,8 +2269,8 @@ func TestFailedReloadLeavesTheCacheAlone(t *testing.T) {
 	}
 	before := cacheStats(t)
 
-	// This configuration shrinks the cache to less than it holds, but is
-	// refused once its first site is set up, for the limits of its second.
+	// This configuration shrinks the cache below what it holds, but is
+	// refused for the limits of its second site, once the first is set up.
 	loadError(t, fmt.Sprintf(`
 	{
 		admin localhost:2999
@@ -2311,7 +2310,7 @@ func loadError(t *testing.T, config string) string {
 
 	body, _ := io.ReadAll(resp.Body)
 	// The admin API starts answering with the warnings of the adapter, so a
-	// configuration refused afterwards still has a 200 status.
+	// configuration refused afterward still has a 200 status.
 	if resp.StatusCode == http.StatusOK && !bytes.Contains(body, []byte(`"error"`)) {
 		t.Errorf("configuration accepted:\n%s", config)
 	}

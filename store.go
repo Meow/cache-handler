@@ -38,9 +38,9 @@ const (
 	// which its requests are not made to wait for each other.
 	passMemoTTL = time.Minute
 	maxPassMemo = 16384
-	// transientShare is the share of the memory the responses that are held
-	// in memory only, waiting to be requested again, may take together, and
-	// transientBodyShare the share the body of one of them may take.
+	// transientShare divides max_memory into what the transient responses
+	// (held in memory only, until requested again) may take together;
+	// transientBodyShare, into what the body of one of them may take.
 	transientShare     = 2
 	transientBodyShare = 8
 	// ghostShare is the share of the memory spent on remembering the
@@ -54,10 +54,10 @@ const (
 
 // What follows is variable for the tests.
 var (
-	// openFile and statFile are os.Open and (*os.File).Stat where nothing
-	// but replacing them makes them fail: a file that was just created or
-	// written is there, and can be told about. renameFile is os.Rename where
-	// what counts is what happens meanwhile.
+	// openFile and statFile stand for os.Open and (*os.File).Stat at the
+	// calls only a test can make fail: a file just created or written is
+	// there. renameFile stands for os.Rename where what happens meanwhile
+	// matters.
 	openFile   = os.Open
 	statFile   = (*os.File).Stat
 	renameFile = os.Rename
@@ -110,10 +110,10 @@ type entry struct {
 	epoch     uint32
 	marker    bool
 	promoting bool
-	// transient tells that the entry has no file: it only exists in memory,
-	// until it is requested enough to be worth writing to disk. A transient
-	// response always has its body in hot, and is listed apart from the
-	// others; a transient marker has nothing but its entry.
+	// transient tells that the entry has no file: it lives in memory until
+	// requested enough to be worth writing to disk. A transient response has
+	// its body in hot and is in its own LRU list; a transient marker is
+	// nothing but its entry.
 	transient bool
 	// persisting tells that the persister was asked to write the entry.
 	persisting bool
@@ -165,11 +165,11 @@ type StoreStats struct {
 // file is always complete and never changes. The index is rebuilt from the
 // files when the store opens.
 //
-// A response may be asked to stay out of the disk until it was requested a
-// number of times (min_uses). It is then transient: held in memory only, and
-// written to a file by the persister once it has been requested enough. Most
-// responses are requested once and never again; these are dropped from memory
-// by the ones that follow and never cost a write.
+// With min_uses, a response stays out of the disk until requested that many
+// times. It is transient meanwhile: held in memory only, and written to a
+// file by the persister once requested enough. Most responses are requested
+// once and never again; those are pushed out of memory by the ones that
+// follow and never cost a write.
 type Store struct {
 	dir  string
 	log  *zap.Logger
@@ -182,14 +182,13 @@ type Store struct {
 	hotHead  *entry
 	hotTail  *entry
 	hotCount int
-	// transHead and transTail are the list of the transient responses, by
-	// last use. They are not part of the list above, which is the one of the
-	// files.
+	// transHead and transTail list the transient responses by last use,
+	// apart from the list of the files above.
 	transHead *entry
 	transTail *entry
 	// transients counts the entries that have no file. transBlocks and
-	// transMeta are the memory blocks and the index space taken by the
-	// transient responses, those being received included for the former.
+	// transMeta are the memory blocks (downloads in progress included) and
+	// the index space taken by the transient responses.
 	transients  int
 	transBlocks int
 	transMeta   int64
@@ -566,10 +565,10 @@ type Hit struct {
 	rec  *record
 	f    *os.File
 	blob *blob
-	// persist tells that the response is in memory only and was now
-	// requested enough to be written to disk. That is asked for when the
-	// request is done with the response: if it turned out to be stale and
-	// was replaced meanwhile, there is nothing left to write.
+	// persist tells that the response is in memory only and has now been
+	// requested enough to be written to disk. The write is asked for at
+	// Close, not before: a response found stale and replaced by then has
+	// nothing left to write.
 	persist bool
 	closed  bool
 }
@@ -614,10 +613,10 @@ func (h *Hit) WriteBody(w io.Writer) error {
 		return err
 	}
 
-	// Copying from the file itself lets the server use sendfile, and from
-	// the file bare: sendfile is only used for a file, or for a file in one
-	// io.LimitedReader, and Caddy already puts what it is given in one. The
-	// body needs no limit of its own, since it is the end of the file.
+	// Copying from the bare file lets the server use sendfile, which only
+	// applies to a file or to a file in one io.LimitedReader, and Caddy
+	// already wraps what it is given in one. The body needs no limit of its
+	// own: it is the end of the file.
 	if _, err := h.f.Seek(h.rec.bodyOff, io.SeekStart); err != nil {
 		return err
 	}
@@ -683,11 +682,10 @@ type Writer struct {
 	// wake is closed when avail or state changes. It only exists while a
 	// reader waits.
 	wake chan struct{}
-	// readers lists the Tails reading from mem, which are to be given the
-	// file if the response moves to one. uses counts the requests served
-	// from the response while it was received in memory. sealed tells that
-	// the count was taken, for the entry the response is becoming: no
-	// request is to start reading it from here anymore.
+	// readers lists the Tails reading from mem, to be handed the file if
+	// the response moves to one. uses counts the requests served from the
+	// response while received in memory. sealed tells that uses was taken
+	// for the entry the response becomes: no Tail may open from here on.
 	readers []*Tail
 	uses    int
 	sealed  bool
@@ -750,16 +748,16 @@ func (s *Store) Create(key string, vary []string, reqHeader http.Header, rec *re
 }
 
 // ensureMarker makes the entry of key a marker listing the given header
-// names and returns its vary specification. A marker created for responses
-// that are not written to disk at once (minUses) is not either: it is when
-// the first of them is, see saveMarker.
+// names and returns its vary specification. With minUses above 1 the marker
+// is transient like its variants, and written to disk with the first of
+// them, see saveMarker.
 //
-// A marker that lists these names and others is kept as it is. A response
-// stored under more names than it varies on is only found by fewer requests
-// than it could answer, whereas replacing the marker loses every response
-// stored under it: an upstream that only names a header when the response
-// depends on its value, as one that compresses for those who accept it
-// does, would otherwise have each kind of response evict the other.
+// A marker listing these names and others is kept. A response stored under
+// more names than it varies on is merely found by fewer requests than it
+// could answer, whereas replacing the marker loses every response stored
+// under it: an upstream that names a header only when the response depends
+// on it (one that compresses for those who accept it, say) would otherwise
+// have each kind of response evict the other.
 func (s *Store) ensureMarker(key, names string, minUses int) (string, error) {
 	s.markerMu.Lock()
 	defer s.markerMu.Unlock()
@@ -1046,8 +1044,8 @@ func (w *Writer) writeMem(p []byte) bool {
 }
 
 // spill moves a response received in memory to a temporary file, where the
-// rest of it goes: it will be written to disk rather than held in memory.
-// The requests reading it are switched to the file.
+// rest of it goes: it ends on disk rather than in memory. The requests
+// reading it are switched to the file.
 func (w *Writer) spill() error {
 	f, info, err := w.createFile()
 	if err != nil {
@@ -1317,9 +1315,9 @@ type Tail struct {
 }
 
 // Tail opens the response for reading. It fails once the response is
-// committed, from when it is found in the cache like any other. For a
-// response received in memory that is as soon as Commit is at work: the
-// request would not count among those the response waits for otherwise.
+// committed and found in the cache like any other; for a response received
+// in memory, as soon as Commit is at work, or the request would not count
+// among those the response waits for.
 func (w *Writer) Tail(ctx context.Context) (*Tail, error) {
 	t := &Tail{w: w, ctx: ctx, limit: -1}
 
@@ -1357,9 +1355,9 @@ func (w *Writer) Tail(ctx context.Context) (*Tail, error) {
 }
 
 // finishAt makes the reader stop at offset n, which must have been written,
-// instead of following the response to its end. The reader then gets these
-// bytes even if the response is given up: it is how the client of a
-// response that cannot be stored after all is still sent what was written.
+// instead of following the response to its end. It gets these bytes even if
+// the response is given up: that is how the client of a response that cannot
+// be stored after all still gets what was written.
 func (t *Tail) finishAt(n int64) {
 	w := t.w
 
@@ -1548,10 +1546,9 @@ func (s *Store) installMem(w *Writer) ([]ID, error) {
 		e.hot = &hotData{rec: &rec, body: w.mem, cost: rec.memCost() + int64(len(w.mem.ids))*28}
 	}
 
-	// The requests that come from here on find the response in the cache,
-	// which counts them. One that started reading it from the writer after
-	// its count was taken would be missed, and the response left waiting for
-	// a request more than it needs to be written to disk.
+	// From here on requests find the response in the cache, which counts
+	// them. One that opened a Tail after uses was taken would be missed, and
+	// the response left waiting for one request more than it needs.
 	w.pmu.Lock()
 	uses := w.uses
 	w.sealed = true
@@ -1582,7 +1579,7 @@ func (s *Store) installMem(w *Writer) ([]ID, error) {
 	}
 	if !e.marker {
 		// The requests served from the response as it arrived, the one it
-		// was fetched for among them, are as many it no longer waits for.
+		// was fetched for included, no longer need waiting for.
 		e.left = uint16(max(left-uses, 0))
 		// The blocks were counted when the writer obtained them. The index
 		// gets a hold of its own on them: the writer keeps its until it is
@@ -1722,8 +1719,7 @@ func (s *Store) demoteLocked(e *entry) {
 }
 
 // dropLocked removes a transient response that was not requested enough to
-// be written to disk, which leaves nothing of it but the memory of how far
-// it got.
+// be written to disk, keeping only a ghost of how far it got.
 func (s *Store) dropLocked(e *entry) {
 	if s.limits.MaxMemory > 0 {
 		s.rememberLocked(e)
@@ -1765,13 +1761,13 @@ func (s *Store) transientRoomLocked(n int) bool {
 	return true
 }
 
-// The transient responses that are dropped are remembered for a while, by
-// their ID and the number of requests they still needed, in a table that
-// forgets by itself: each ID has one slot, which the next to fall on it
-// takes. A response that comes back is thereby not made to start over, and
-// one that has been requested enough by then is written to disk at once:
-// were it not, a response requested at intervals longer than memory holds
-// it for would be fetched again every time.
+// Dropped transient responses are remembered for a while, by ID and the
+// number of requests they still needed, in a table that forgets by itself:
+// each ID has one slot, taken by the next ID that falls on it. A response
+// that comes back does not start over, and one requested enough by then is
+// written to disk at once. Without this, a response requested at intervals
+// longer than memory holds it would be fetched again every time and never
+// stored.
 
 // ghostSlotLocked returns the slot of id in the table and the value that
 // names it there, less the count.
@@ -1847,8 +1843,8 @@ func (s *Store) enforceLocked() []ID {
 		if dropped {
 			continue
 		}
-		// Giving a lot of memory back takes time, which is not spent here
-		// with the requests waiting.
+		// Giving a lot of memory back takes time, not to be spent under mu
+		// with requests waiting.
 		if s.arena.excess() {
 			select {
 			case s.trimCh <- struct{}{}:
@@ -1922,11 +1918,10 @@ func (s *Store) promotableLocked(e *entry, now int64) bool {
 	return s.hotTail != nil && s.challengeLocked(s.hotTail, e, now)
 }
 
-// challengeLocked tells whether cand deserves the memory of v, the least
-// recently used response in memory. It does when it is requested more.
-// Otherwise v is given another round, but at the cost of half its count:
-// a response that was popular once and is no longer requested ends up
-// giving way.
+// challengeLocked tells whether cand, being requested more, deserves the
+// memory of v, the least recently used response in memory. Otherwise v gets
+// another round at the cost of half its count, so a response that was
+// popular once and no longer requested ends up giving way.
 func (s *Store) challengeLocked(v, cand *entry, now int64) bool {
 	s.decayLocked(v, now)
 	if v.hits < cand.hits {
@@ -2217,10 +2212,10 @@ func (s *Store) loadFile(id ID, gen uint64, front bool) {
 		atime:  time.Now().Unix(),
 	}
 
-	// The file was read with nothing held: it may have been deleted since,
-	// purged or evicted, and would be indexed without being there. Deleting
-	// it takes the stripe of its ID, under which the name is checked to
-	// still be that of the file that was read.
+	// The file was read with nothing held and may have been purged or
+	// evicted since; indexed anyway, it would be an entry without a file.
+	// Deletion takes the stripe of the ID, under which the name is checked
+	// to still be the file that was read.
 	stripe := &s.stripes[id[0]]
 	stripe.Lock()
 	defer stripe.Unlock()
@@ -2376,9 +2371,8 @@ func (s *Store) PurgeAll() int {
 	return n
 }
 
-// ends returns the ends of the list e belongs in by last use: the one of the
-// transient responses or the one of the files, which the transient markers
-// are in too.
+// ends returns the ends of the LRU list e belongs in: that of the transient
+// responses, or that of the files, which holds the transient markers too.
 func (s *Store) ends(e *entry) (head, tail **entry) {
 	if e.transient && !e.marker {
 		return &s.transHead, &s.transTail
@@ -2498,10 +2492,10 @@ func (s *Store) SharedFlight(id ID) *Writer {
 // ShareFlight lets the requests waiting on the flight read the response from
 // w as it is written.
 //
-// A response that turns out to vary is stored under another ID than the one
-// it was looked for, and fetched, under: there was no marker to tell. The
-// requests for it that come from now on find the marker, and are to find
-// the flight where it leads them rather than begin one of their own.
+// A response that turns out to vary is stored under another ID than it was
+// looked up and fetched under, since there was no marker yet. Requests from
+// now on find the marker and must find the flight where it leads them too,
+// rather than begin one of their own.
 func (s *Store) ShareFlight(id ID, f *flight, w *Writer) {
 	s.fmu.Lock()
 	defer s.fmu.Unlock()

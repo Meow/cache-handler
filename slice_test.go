@@ -32,8 +32,8 @@ func init() {
 	})
 }
 
-// panicHandler is a handler with a bug: it panics when it is asked for a
-// given range. It exists for the tests only, as the test_panic directive.
+// panicHandler panics when asked for a given range. It is the test_panic
+// directive, for tests only.
 type panicHandler struct {
 	Range string `json:"range,omitempty"`
 }
@@ -62,9 +62,9 @@ func (h *panicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	return next.ServeHTTP(w, r)
 }
 
-// sliceContent returns a body in which no two places look alike, unlike the
-// one of bodyFor, which repeats every 32 bytes: a slice put at the place of
-// another one must not go unnoticed.
+// sliceContent returns a body with no two places alike, unlike bodyFor's,
+// which repeats every 32 bytes: a slice served in place of another must not
+// go unnoticed.
 func sliceContent(seed string, size int) []byte {
 	body := make([]byte, 0, size+sha256.Size)
 	for i := 0; len(body) < size; i++ {
@@ -132,10 +132,9 @@ func (o *origin) asked() []string {
 	return ranges
 }
 
-// rangeHandler answers requests for one range of content, like an upstream
-// that supports them does. When stall returns a channel for the first byte
-// of a range, the second half of that range is only sent once the channel
-// is closed.
+// rangeHandler answers requests for one range of content, like a range-aware
+// upstream. When stall returns a channel for the first byte of a range, the
+// second half of that range is sent only once the channel is closed.
 func rangeHandler(t *testing.T, content []byte, stall func(first int) <-chan struct{}) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var first, last int
@@ -170,8 +169,7 @@ func TestSlices(t *testing.T) {
 		reverse_proxy `+up.addr())
 	const key = "GET-http-localhost:9080-/video"
 
-	// A range far into a response that is not in the cache: the slice it is
-	// in is all the upstream is asked for.
+	// A range far into an uncached response: only its slice is fetched.
 	resp, body := get(t, tester, "/video", "Range: bytes=30000-30099")
 	if resp.StatusCode != http.StatusPartialContent || resp.Header.Get("Content-Range") != "bytes 30000-30099/40000" {
 		t.Errorf("status %d, Content-Range %q", resp.StatusCode, resp.Header.Get("Content-Range"))
@@ -185,8 +183,8 @@ func TestSlices(t *testing.T) {
 		t.Errorf("the upstream was asked for %v", asked)
 	}
 
-	// The whole response is put together from its slices, of which the
-	// missing ones are fetched, once each.
+	// The whole response is assembled from its slices; the missing ones are
+	// fetched once each.
 	resp, body = get(t, tester, "/video")
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Length") != "40000" || resp.Header.Get("Content-Range") != "" {
 		t.Errorf("status %d, headers %v", resp.StatusCode, resp.Header)
@@ -255,8 +253,8 @@ func TestSlices(t *testing.T) {
 		t.Errorf("the upstream got %d requests, want 11", n)
 	}
 
-	// A purge by prefix finds the slices themselves: the new one and what
-	// leads to it, and the ten the first purge left for eviction to remove.
+	// A purge by prefix matches the slices themselves: the new one, its
+	// entry, and the ten the first purge left for eviction.
 	if n := purge(t, "prefix=GET-http-localhost:9080-/vid"); n != 12 {
 		t.Errorf("purged %d entries by prefix, want 12", n)
 	}
@@ -351,8 +349,8 @@ func TestSliceIsServedWhileItDownloads(t *testing.T) {
 		return resp
 	}
 
-	// The request that triggers the download of a slice gets what there is
-	// of it, and so does one that comes meanwhile.
+	// The request that triggers a slice's download gets what has arrived, and
+	// so does one that joins meanwhile.
 	leader := open()
 	expectStatus(t, leader, "Caddy; fwd=uri-miss; stored; key="+key)
 	follower := open()
@@ -377,7 +375,7 @@ func TestSliceIsServedWhileItDownloads(t *testing.T) {
 }
 
 // TestSmallResponseIsNotSliced checks that a response that fits in one slice
-// is stored like it is without slices.
+// is stored as it would be without slicing.
 func TestSmallResponseIsNotSliced(t *testing.T) {
 	up := newOrigin(t, 1000)
 	content := string(up.content("v1"))
@@ -410,7 +408,7 @@ func TestSmallResponseIsNotSliced(t *testing.T) {
 		t.Errorf("%d entries, want the response alone", st.Entries)
 	}
 
-	// A range on a response not in the cache yet is answered all the same.
+	// A range on a response not yet cached is answered all the same.
 	resp, body = get(t, tester, "/other", "Range: bytes=100-199")
 	if resp.StatusCode != http.StatusPartialContent || resp.Header.Get("Content-Range") != "bytes 100-199/1000" {
 		t.Errorf("status %d, Content-Range %q", resp.StatusCode, resp.Header.Get("Content-Range"))
@@ -471,8 +469,8 @@ func TestSliceBeyondTheEnd(t *testing.T) {
 		cache
 		reverse_proxy `+up.addr())
 
-	// The upstream has no such slice. The first one tells the size of the
-	// response, which the answer has to say.
+	// The upstream has no such slice. The first slice is fetched for the size
+	// of the response, which the answer must state.
 	resp, _ := get(t, tester, "/video", "Range: bytes=50000-")
 	if resp.StatusCode != http.StatusRequestedRangeNotSatisfiable || resp.Header.Get("Content-Range") != "bytes */40000" {
 		t.Errorf("status %d, Content-Range %q", resp.StatusCode, resp.Header.Get("Content-Range"))
@@ -530,8 +528,8 @@ func TestSlicedResponseThatChanges(t *testing.T) {
 		return resp, string(body), err
 	}
 
-	// The beginning of the first version is in the cache when the upstream
-	// gets another one.
+	// The beginning of the first version is cached when the upstream moves to
+	// a new one.
 	get(t, tester, "/video", "Range: bytes=0-99")
 	up.version.Store("v2")
 
@@ -539,7 +537,7 @@ func TestSlicedResponseThatChanges(t *testing.T) {
 		t.Errorf("a response made of two versions was delivered as complete: %s", abbreviate(body))
 	}
 
-	// What was left of the first version went with it.
+	// What remained of the first version is gone with it.
 	resp, body, err := download("/video")
 	if err != nil {
 		t.Fatal(err)
@@ -672,16 +670,14 @@ func compressibleText(size int) string {
 	return text.String()
 }
 
-// TestSlicesAndCompression covers the response that is transformed between
-// the upstream and the cache: its ranges are not those of what the client
-// gets, so it is stored whole, beside the slices of the variant that is
-// left as it is.
+// TestSlicesAndCompression covers a response transformed between the
+// upstream and the cache: its ranges are not those of what the client gets,
+// so it is stored whole, beside the slices of the untransformed variant.
 func TestSlicesAndCompression(t *testing.T) {
 	content := compressibleText(40_000)
 
-	// What a handler that compresses on the way does to the response to a
-	// request for a range, when it does not know better: the body is no
-	// longer the range the headers say, and its length is not told.
+	// What a naive compressing handler does to a range response: the body is
+	// no longer the range the headers say, and its length is unknown.
 	up := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.Header().Set("Etag", `"text"`)
@@ -730,18 +726,18 @@ func TestSlicesAndCompression(t *testing.T) {
 		}
 	}
 
-	// One request to find out the response is compressed, one for all of
-	// it, and one for the slice.
+	// One request finds the response is compressed, one fetches all of it,
+	// and one the slice.
 	if n := up.hits.Load(); n != 3 {
 		t.Errorf("the upstream got %d requests, want 3", n)
 	}
 }
 
 // TestSlicesAndEncode covers the encode directive on either side of the
-// cache. It leaves the response to a request for a range alone, which is
-// all it sees of an upstream that is asked for slices: placed after the
-// cache it compresses nothing, and the response is stored in slices as the
-// upstream sent it. Placed in front, it compresses what the cache serves.
+// cache. encode leaves range responses alone, which is all it sees of an
+// upstream asked for slices: after the cache it compresses nothing, and the
+// slices are stored as the upstream sent them. In front, it compresses what
+// the cache serves.
 func TestSlicesAndEncode(t *testing.T) {
 	content := compressibleText(40_000)
 
@@ -778,8 +774,8 @@ func TestSlicesAndEncode(t *testing.T) {
 					t.Errorf("request %d: Cache-Status: %s", i, resp.Header.Get("Cache-Status"))
 				}
 
-				// A range is one of the response as the upstream has it,
-				// whoever asks.
+				// A range is of the response as the upstream has it, whoever
+				// asks.
 				resp, body = get(t, tester, "/text", "Accept-Encoding: gzip", "Range: bytes=30000-30099")
 				if resp.StatusCode != http.StatusPartialContent || resp.Header.Get("Content-Encoding") != "" {
 					t.Errorf("status %d, headers %v", resp.StatusCode, resp.Header)
@@ -813,7 +809,7 @@ func TestUncacheableResponseIsNotSliced(t *testing.T) {
 		expectBody(t, body, content[30000:30100])
 		expectStatus(t, resp, "Caddy; fwd=uri-miss; detail="+detail+"; key="+key)
 
-		// Finding out takes one more request to the upstream, once.
+		// Finding out costs one extra upstream request, once.
 		if want := int64(i + 2); up.hits.Load() != want {
 			t.Errorf("the upstream got %d requests after %d from the client, want %d", up.hits.Load(), i+1, want)
 		}
@@ -871,8 +867,8 @@ func TestSlicesWithMinUses(t *testing.T) {
 		cache
 		reverse_proxy `+up.addr())
 
-	// Requested once, the slices are in memory only. The client has the last
-	// one before the cache is done storing it.
+	// Requested once, the slices are transient. The client gets the last one
+	// before the cache is done storing it.
 	_, body := get(t, tester, "/video")
 	expectBody(t, body, content)
 	waitFor(t, "the last slice to be stored", func() bool { return cacheStats(t).Stored == 10 })
@@ -880,7 +876,7 @@ func TestSlicesWithMinUses(t *testing.T) {
 		t.Errorf("unexpected stats after one request: %+v", st)
 	}
 
-	// Requested again, they are served from there, then written to disk.
+	// Requested again, they are served from memory, then written to disk.
 	resp, body := get(t, tester, "/video")
 	expectBody(t, body, content)
 	if !strings.Contains(resp.Header.Get("Cache-Status"), "detail=MEMORY") {
@@ -892,9 +888,9 @@ func TestSlicesWithMinUses(t *testing.T) {
 	}
 }
 
-// TestSlicesOfARewrittenRequest checks that each slice is asked of the
-// upstream as the first one was: the request is rewritten once per fetch,
-// starting over from what the client sent.
+// TestSlicesOfARewrittenRequest checks that every slice is requested from
+// the upstream as the first was: each fetch rewrites the request anew from
+// what the client sent.
 func TestSlicesOfARewrittenRequest(t *testing.T) {
 	up := newOrigin(t, 40_000)
 	content := string(up.content("v1"))
@@ -920,10 +916,9 @@ func TestSlicesOfARewrittenRequest(t *testing.T) {
 	}
 }
 
-// TestSeveralRangesAndAClientThatLeaves covers what the standard library
-// does for a request for several ranges: it has them read by a goroutine of
-// its own, which is still at it when the client is gone and the request
-// over.
+// TestSeveralRangesAndAClientThatLeaves covers multi-range requests, whose
+// ranges the standard library reads from its own goroutine, one still
+// running after the client left and the request ended.
 func TestSeveralRangesAndAClientThatLeaves(t *testing.T) {
 	const size = 2_000_000
 	up := newOrigin(t, size)
@@ -952,7 +947,7 @@ func TestSeveralRangesAndAClientThatLeaves(t *testing.T) {
 		_ = resp.Body.Close()
 	}
 
-	// Nothing of it is in the way of the requests that follow.
+	// None of that gets in the way of later requests.
 	for i := range 2 {
 		resp, body := get(t, tester, fmt.Sprintf("/video-%d", i), "Range: bytes=10-19,1900000-1900009")
 		if resp.StatusCode != http.StatusPartialContent {
@@ -964,14 +959,11 @@ func TestSeveralRangesAndAClientThatLeaves(t *testing.T) {
 	}
 }
 
-// TestResponseThatOutgrowsItsSlice covers the response that was stored
-// whole and is now too large for that, where it varies: the slices are then
-// stored beside what was there, which is not to be found before them.
 // TestPanicWhileFetchingASlice covers a handler after the cache that panics
-// while a slice is fetched for a request for several ranges, whose body
-// http.ServeContent reads from a goroutine of its own. The panic is that of
-// the request, as it is without a cache: the client is cut short and the
-// server carries on, where a panic in that goroutine would end the process.
+// while a slice is fetched for a multi-range request, whose body
+// http.ServeContent reads from its own goroutine. The panic must belong to
+// the request, as without a cache: the client is cut short and the server
+// carries on. A panic in that goroutine would end the process.
 func TestPanicWhileFetchingASlice(t *testing.T) {
 	up := newOrigin(t, 40_000)
 	content := up.content("v1")
@@ -1004,6 +996,9 @@ func TestPanicWhileFetchingASlice(t *testing.T) {
 	expectBody(t, body, string(content[20000:20010]))
 }
 
+// TestResponseThatOutgrowsItsSlice covers a varying response stored whole
+// that grows too large for that: its slices are stored beside the whole
+// entry, which must not be found before them.
 func TestResponseThatOutgrowsItsSlice(t *testing.T) {
 	up := newOrigin(t, 1000)
 	up.header.Set("Vary", "X-Kind")
@@ -1025,7 +1020,7 @@ func TestResponseThatOutgrowsItsSlice(t *testing.T) {
 	expectBody(t, body, content[100:200])
 	time.Sleep(1100 * time.Millisecond)
 
-	// The slice is what there is to confirm now.
+	// Now it is the slice that is revalidated.
 	resp, body = get(t, tester, "/growing", "X-Kind: a", "Range: bytes=100-199")
 	expectStatus(t, resp, "Caddy; fwd=stale; fwd-status=304; detail=REVALIDATED; key="+key)
 	expectBody(t, body, content[100:200])
@@ -1034,10 +1029,10 @@ func TestResponseThatOutgrowsItsSlice(t *testing.T) {
 	}
 }
 
-// TestHeadersSetLateFromTheRequest covers the handler in front of the cache
-// that looks at the request when the response headers are written, which is
-// while the slice being sent may still be fetched, and the request with it
-// changed into the one for that slice.
+// TestHeadersSetLateFromTheRequest covers a handler in front of the cache
+// that reads the request when the response headers are written. That may
+// happen while a slice is still being fetched, with the request rewritten
+// into the one for that slice.
 func TestHeadersSetLateFromTheRequest(t *testing.T) {
 	up := newOrigin(t, 40_000)
 	content := string(up.content("v1"))
@@ -1051,8 +1046,8 @@ func TestHeadersSetLateFromTheRequest(t *testing.T) {
 		path := fmt.Sprintf("/video-%d", i)
 		resp, body := get(t, tester, path, "X-Tag: tagged", "Range: bytes=5000-5099")
 		expectBody(t, body, content[5000:5100])
-		// What the handler sees of the request is not the cache's to say:
-		// the rewrite may be done or undone. It is to see one or the other.
+		// The cache does not decide what the handler sees: the rewrite may be
+		// done or undone, but it must see one or the other.
 		if seen := resp.Header.Get("X-Seen"); seen != "tagged "+path && seen != "tagged /real"+path {
 			t.Errorf("X-Seen: %q", seen)
 		}

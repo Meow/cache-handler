@@ -522,13 +522,13 @@ func (x *exchange) endFlight(stored bool) {
 	}
 }
 
-// fetch asks the upstream for the response and, when it may be stored, puts
-// it in the cache. stale is the expired response the cache holds, if any; it
-// is closed here. fl is nil when the request does not hold the flight, which
-// is the case for responses recently found uncacheable.
+// fetch asks the upstream for the response and stores it when allowed.
+// stale is the expired response the cache holds, if any; it is closed here.
+// fl is nil when the request holds no flight, as for responses recently
+// found uncacheable.
 func (x *exchange) fetch(id ID, fl *flight, stale *Hit) error {
 	// In the fetch of a slice, the stale response may be handed to the
-	// request reading the slices, whose business closing it then is.
+	// request reading the slices, which then closes it.
 	if x.slice == nil {
 		defer stale.Close()
 	}
@@ -554,9 +554,9 @@ func (x *exchange) fetch(id ID, fl *flight, stale *Hit) error {
 	restore()
 	stop()
 
-	// A fetch the cache canceled did not run to its end, even when the
-	// handlers return as if it had: a reverse proxy whose request is
-	// canceled before the upstream answers returns without a response.
+	// A fetch the cache canceled did not run to its end, even if the
+	// handlers return as if it had: a reverse proxy canceled before the
+	// upstream answers returns nil without writing anything.
 	canceled := ctx.Err() != nil
 	failed := err != nil || aborted || canceled
 	fw.finish(!failed)
@@ -598,9 +598,9 @@ func (x *exchange) fetch(id ID, fl *flight, stale *Hit) error {
 		// short if the response is not whole.
 		perr := fw.close()
 		if fw.satisfied {
-			// The cache stopped the fetch itself once the client had the
-			// range it asked for: the response is complete, however the
-			// handlers took being stopped.
+			// The cache stopped the fetch once the client had its range:
+			// the response is complete, however the handlers took being
+			// stopped.
 			return nil
 		}
 		if perr != nil || aborted {
@@ -684,8 +684,8 @@ func (x *exchange) deliver(hit *Hit, now time.Time, params string) error {
 }
 
 // callNext runs the next handlers. A reverse proxy that loses its upstream
-// while relaying the body aborts by panicking, which is reported here rather
-// than left to unwind, so that the fetch can be cleaned up or retried.
+// mid-body panics with http.ErrAbortHandler; that is turned into a return
+// value here so that the fetch can be cleaned up or retried.
 func callNext(next caddyhttp.Handler, w http.ResponseWriter, r *http.Request) (err error, aborted bool) {
 	defer func() {
 		if v := recover(); v != nil {
@@ -712,10 +712,10 @@ func (x *exchange) refresh(stale *Hit, fw *fetchWriter, now time.Time) *Hit {
 		// These describe the body, which the 304 does not carry.
 		case "Content-Encoding", "Content-Range", "Content-Type":
 		case "Etag":
-			// The upstream confirmed the tag it was sent, which is the
-			// stored one. The clients were given that one, and a handler
-			// in between may spell it differently: encode takes off the
-			// suffix it added to it, and does not put it back on a 304.
+			// The upstream confirmed the tag it was sent, the stored one,
+			// which clients were given. A handler in between may spell it
+			// differently: encode strips the suffix it added and does not
+			// put it back on a 304.
 			if header.Get("Etag") == "" {
 				header[name] = values
 			}
@@ -724,14 +724,13 @@ func (x *exchange) refresh(stale *Hit, fw *fetchWriter, now time.Time) *Hit {
 		}
 	}
 
-	// As when it was first stored, the response is judged on what the
-	// upstream said, which is what the stored headers add to those every
-	// response gets.
+	// As at first storage, the response is judged on what the upstream
+	// said: what the stored headers add to those every response gets.
 	final := fw.base.Clone()
 	applyHeaders(final, header)
 	own := ownHeaders(fw.base, final)
-	// The age is not among the stored headers. The one that counts from now
-	// on is that of the confirmation.
+	// Age is not stored; the one that counts from now on is the
+	// confirmation's.
 	if age := ownHeaders(fw.base, fw.hdr)["Age"]; len(age) > 0 {
 		own["Age"] = age
 	}
