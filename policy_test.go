@@ -314,6 +314,11 @@ func TestEvaluate(t *testing.T) {
 	noVary.Key = &KeyOptions{DisableVary: true}
 	keyed := base
 	keyed.Key = &KeyOptions{Headers: []string{"authorization"}}
+	strict := base
+	strict.Mode = "strict"
+	strictKeyed := keyed
+	strictKeyed.Mode = "strict"
+	httpDate := func(t time.Time) string { return t.UTC().Format(http.TimeFormat) }
 
 	tests := []struct {
 		name     string
@@ -334,6 +339,22 @@ func TestEvaluate(t *testing.T) {
 		}, lifetime: 5 * time.Minute},
 		{name: "age shortens", status: 200, header: http.Header{"Cache-Control": {"max-age=60"}, "Age": {"20"}}, lifetime: 40 * time.Second},
 		{name: "absurd age", status: 200, header: http.Header{"Cache-Control": {"max-age=60"}, "Age": {"13835058055"}}, reason: "EXPIRED"},
+		// RFC 9111, section 4.2.3: the age is at least the time since the Date.
+		{name: "date shortens", status: 200, header: http.Header{"Cache-Control": {"max-age=60"}, "Date": {httpDate(now.Add(-20 * time.Second))}}, lifetime: 40 * time.Second, check: func(t *testing.T, v verdict) {
+			if v.age != 20*time.Second {
+				t.Errorf("age %v, want 20s", v.age)
+			}
+		}},
+		{name: "date shortens the default ttl", status: 200, header: http.Header{"Date": {httpDate(now.Add(-time.Minute))}}, lifetime: 59 * time.Minute},
+		{name: "age beats an earlier date", status: 200, header: http.Header{"Cache-Control": {"max-age=60"}, "Age": {"30"}, "Date": {httpDate(now.Add(-20 * time.Second))}}, lifetime: 30 * time.Second},
+		{name: "date beats a smaller age", status: 200, header: http.Header{"Cache-Control": {"max-age=60"}, "Age": {"10"}, "Date": {httpDate(now.Add(-20 * time.Second))}}, lifetime: 40 * time.Second},
+		{name: "date in the future", status: 200, header: http.Header{"Cache-Control": {"max-age=60"}, "Date": {httpDate(now.Add(time.Hour))}}, lifetime: time.Minute},
+		{name: "expires counts from now", status: 200, header: http.Header{
+			"Date":    {httpDate(now.Add(-time.Minute))},
+			"Expires": {httpDate(now.Add(5 * time.Minute))},
+		}, lifetime: 5 * time.Minute},
+		{name: "bypass ignores the date", c: resolve(bypass), status: 200, header: http.Header{"Date": {httpDate(now.Add(-time.Minute))}}, lifetime: time.Hour},
+		{name: "must-understand", status: 200, header: http.Header{"Cache-Control": {"must-understand, no-store, max-age=60"}}, lifetime: time.Minute},
 		{name: "trailers", status: 200, header: http.Header{"Trailer": {"X-Checksum"}}, reason: "TRAILER"},
 		{name: "event stream", status: 200, header: http.Header{"Content-Type": {"text/event-stream; charset=utf-8"}}, reason: "EVENT-STREAM"},
 		{name: "no-store", status: 200, header: http.Header{"Cache-Control": {"no-store"}}, reason: "NO-STORE"},
@@ -378,6 +399,11 @@ func TestEvaluate(t *testing.T) {
 		{name: "authorization", r: authenticated, status: 200, reason: "AUTHORIZATION"},
 		{name: "authorization public", r: authenticated, status: 200, header: http.Header{"Cache-Control": {"public"}}, lifetime: time.Hour},
 		{name: "authorization in key", c: resolve(keyed), r: authenticated, status: 200, lifetime: time.Hour},
+		{name: "authorization in vary", r: authenticated, status: 200, header: http.Header{"Vary": {"Authorization"}}, lifetime: time.Hour},
+		// RFC 9111, section 3.5, knows no exception but the directives.
+		{name: "strict authorization in key", c: resolve(strictKeyed), r: authenticated, status: 200, reason: "AUTHORIZATION"},
+		{name: "strict authorization in vary", c: resolve(strict), r: authenticated, status: 200, header: http.Header{"Vary": {"Authorization"}}, reason: "AUTHORIZATION"},
+		{name: "strict authorization s-maxage", c: resolve(strict), r: authenticated, status: 200, header: http.Header{"Cache-Control": {"s-maxage=60"}}, lifetime: time.Minute},
 		{name: "bypass ignores no-store", c: resolve(bypass), status: 200, header: http.Header{"Cache-Control": {"no-store, max-age=5"}}, lifetime: time.Hour},
 		{name: "bypass keeps cookies out", c: resolve(bypass), status: 200, header: http.Header{"Set-Cookie": {"a=b"}}, reason: "SET-COOKIE"},
 	}

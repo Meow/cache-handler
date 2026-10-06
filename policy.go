@@ -152,43 +152,57 @@ func (c *config) evaluate(r *http.Request, status int, h http.Header, now time.T
 		cc = parseDirectives(h.Values("Cache-Control"))
 	}
 	switch {
-	case cc.has("no-store"):
+	// With must-understand, no-store is only for the caches that do not
+	// know the status code, and only known ones get this far.
+	case cc.has("no-store") && !cc.has("must-understand"):
 		return reject("NO-STORE")
 	case cc.has("private"):
 		return reject("PRIVATE")
 	}
 
 	// A response to an authenticated request is only shared when it says so
-	// or when the credentials are part of what selects it.
+	// (RFC 9111, section 3.5) or, unless the cache is strict, when the
+	// credentials are part of what selects it.
 	if r.Header.Get("Authorization") != "" &&
 		!cc.has("public") && !cc.has("s-maxage") && !cc.has("must-revalidate") &&
-		!slices.Contains(v.vary, "authorization") && !slices.Contains(c.keyHeaders, "Authorization") {
+		(c.strict || !slices.Contains(v.vary, "authorization") && !slices.Contains(c.keyHeaders, "Authorization")) {
 		return reject("AUTHORIZATION")
 	}
+
+	// The age of the response when it arrives is the greater of what its
+	// Age header says and of the time since its Date (RFC 9111, section
+	// 4.2.3). A Date that cannot be read, or lies in the future, counts for
+	// nothing.
+	var date time.Time
+	if t, err := http.ParseTime(h.Get("Date")); err == nil && !c.ignoreResponse {
+		date = t
+		v.age = max(now.Sub(t), 0)
+	}
+	if age, err := strconv.ParseInt(h.Get("Age"), 10, 64); err == nil && age > 0 {
+		v.age = max(v.age, time.Duration(min(age, int64(maxLifetime/time.Second)))*time.Second)
+	}
+	v.age = min(v.age.Truncate(time.Second), maxLifetime)
 
 	if d, ok := cc.seconds("s-maxage"); ok {
 		v.lifetime = d
 	} else if d, ok := cc.seconds("max-age"); ok {
 		v.lifetime = d
 	} else if expires := h.Get("Expires"); expires != "" && !c.ignoreResponse {
-		// An unreadable date means already expired.
+		// The lifetime runs from the Date, like the age does. An unreadable
+		// date means already expired.
 		if t, err := http.ParseTime(expires); err == nil {
-			date := now
-			if d, err := http.ParseTime(h.Get("Date")); err == nil {
-				date = d
+			since := now
+			if !date.IsZero() {
+				since = date
 			}
-			v.lifetime = min(max(t.Sub(date), 0), maxLifetime)
+			v.lifetime = min(max(t.Sub(since), 0), maxLifetime)
 		}
 	} else if defaultTTL {
 		v.lifetime = c.ttl
 	} else {
 		return reject("UNCACHEABLE-STATUS")
 	}
-
-	if age, err := strconv.ParseInt(h.Get("Age"), 10, 64); err == nil && age > 0 {
-		v.age = time.Duration(min(age, int64(maxLifetime/time.Second))) * time.Second
-		v.lifetime -= v.age
-	}
+	v.lifetime -= v.age
 
 	if cc.has("no-cache") {
 		v.lifetime = 0

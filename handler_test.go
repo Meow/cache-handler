@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -623,6 +624,46 @@ func TestUnsafeMethods(t *testing.T) {
 		t.Errorf("returned %v", rep.err)
 	}
 	c.expectHit(c.get("/a", up), "/a", 120)
+
+	// So does one of a method the cache does not know to be safe, while
+	// the safe ones leave the cache alone (RFC 9111, section 4.4).
+	unsafe("LOCK", respond(http.StatusOK, "locked"))
+	c.expect(c.get("/a", up), "/a", "fwd=uri-miss; stored")
+	unsafe(http.MethodOptions, respond(http.StatusNoContent, ""))
+	c.expectHit(c.get("/a", up), "/a", 120)
+
+	// What the response points to on the same host goes too, be it
+	// relative or absolute; what is on another host stays.
+	store := func(paths ...string) {
+		for _, path := range paths {
+			c.expect(c.get(path, up), path, "fwd=uri-miss; stored")
+			c.expectHit(c.get(path, up), path, 120)
+		}
+	}
+	store("/b", "/dir/c", "/d", "/e")
+	unsafe(http.MethodPost, respond(http.StatusCreated, "", "Location: /b", "Content-Location: http://EXAMPLE.com/dir/c"))
+	c.expect(c.get("/a", up), "/a", "fwd=uri-miss; stored")
+	c.expect(c.get("/b", up), "/b", "fwd=uri-miss; stored")
+	c.expect(c.get("/dir/c", up), "/dir/c", "fwd=uri-miss; stored")
+	unsafe(http.MethodPost, respond(http.StatusCreated, "", "Location: http://other.example.com/d", "Content-Location: e"))
+	c.expectHit(c.get("/d", up), "/d", 120)
+	c.expect(c.get("/e", up), "/e", "fwd=uri-miss; stored")
+	// A Location that cannot be read is not an error.
+	unsafe(http.MethodPost, respond(http.StatusCreated, "", "Location: ::not a url"))
+}
+
+// TestAgeFromDate checks that a response's age counts from its Date, not
+// from its arrival (RFC 9111, section 4.2.3).
+func TestAgeFromDate(t *testing.T) {
+	c := newCacheTest(t, Options{})
+	up := respond(http.StatusOK, "body", "Cache-Control: max-age=60", "Date: "+time.Now().Add(-30*time.Second).UTC().Format(http.TimeFormat))
+
+	c.expect(c.get("/a", up), "/a", "fwd=uri-miss; stored")
+	hit := c.get("/a", up)
+	c.expectHit(hit, "/a", 30)
+	if age, _ := strconv.Atoi(hit.Header().Get("Age")); age < 30 || age > 31 {
+		t.Errorf("Age: %q, want 30", hit.Header().Get("Age"))
+	}
 }
 
 // TestRequestsNothingIsFetchedFor covers the requests that are answered

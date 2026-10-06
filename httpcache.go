@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -167,27 +168,60 @@ func (x *exchange) pass(detail string) error {
 }
 
 // serveUncached handles the methods that are never cached. A successful
-// unsafe request invalidates what is stored for its URI.
+// request of a method that is not known to be safe invalidates what is
+// stored for its URI, and for those its response points to on the same host
+// (RFC 9111, section 4.4).
 func (x *exchange) serveUncached() error {
 	r := x.r
 	x.w.Header().Add("Cache-Status", x.status("fwd=bypass; detail=UNSUPPORTED-METHOD"))
 
 	switch r.Method {
-	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
-	default:
+	case http.MethodOptions, http.MethodTrace:
 		return x.next.ServeHTTP(x.w, r)
 	}
 
 	// The handlers below may rewrite the request.
 	key := x.c.buildKey(r, http.MethodGet)
+	target := *r.URL
 
 	sw := &statusWriter{ResponseWriterWrapper: &caddyhttp.ResponseWriterWrapper{ResponseWriter: x.w}}
 	err := x.next.ServeHTTP(sw, r)
 	if err == nil && sw.status < http.StatusBadRequest {
 		x.store.Purge(key)
+		for _, k := range x.locationKeys(&target, x.w.Header()) {
+			if k != key {
+				x.store.Purge(k)
+			}
+		}
 	}
 
 	return err
+}
+
+// locationKeys returns the keys of the URIs named by the Location and
+// Content-Location headers of a response to a request for target, when they
+// are on the host of target. A key template is computed from the request,
+// not from a URI, so there is no telling what it would be for another one.
+func (x *exchange) locationKeys(target *url.URL, h http.Header) []string {
+	if x.c.key.Template != "" {
+		return nil
+	}
+
+	var keys []string
+	for _, name := range []string{"Location", "Content-Location"} {
+		for _, value := range h.Values(name) {
+			u, err := target.Parse(value)
+			if err != nil || u.Host != "" && !strings.EqualFold(u.Host, x.r.Host) {
+				continue
+			}
+
+			r := *x.r
+			r.URL = u
+			keys = append(keys, x.c.buildKey(&r, http.MethodGet))
+		}
+	}
+
+	return keys
 }
 
 // statusWriter records the status code of a response.

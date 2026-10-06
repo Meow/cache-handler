@@ -106,7 +106,8 @@ type Options struct {
 	LockTimeout caddy.Duration `json:"lock_timeout,omitempty"`
 	// Which Cache-Control directives are honoured: by default those of the
 	// responses only, with "strict" also those of the requests, with
-	// "bypass_response" or "bypass" none of the responses.
+	// "bypass_response" or "bypass" none of the responses. "strict" is the
+	// mode that conforms to RFC 9111, see README.md.
 	Mode string `json:"mode,omitempty"`
 	// Name of the cache in the Cache-Status header. Default: Caddy.
 	CacheName string `json:"cache_name,omitempty"`

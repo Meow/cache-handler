@@ -64,6 +64,7 @@ Known limits of this module, besides what the notice above lists:
 * `Range`, `If-None-Match`, `If-Modified-Since` and `HEAD` requests are answered from the cache.
 * `Vary` support, with `Accept-Encoding` normalized so that compressed variants are not multiplied.
 * Sets the [`Cache-Status`](https://www.rfc-editor.org/rfc/rfc9211) and `Age` response headers.
+* Follows [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111) (HTTP Caching), to the letter with `mode strict`, see [Standards compliance](#standards-compliance).
 * Statistics and purge on Caddy's admin endpoint.
 
 ## Building
@@ -147,7 +148,7 @@ cache [<matcher>] {
 | `ttl` | `120s` | How long a response is fresh when the upstream does not say (no `Cache-Control: max-age` / `s-maxage`, no `Expires`). |
 | `stale` | `0` | How long past its freshness a response may still be served while it is being updated, or when the upstream fails. `Cache-Control: stale-while-revalidate` and `stale-if-error` in a response override it. |
 | `lock_timeout` | `5s` | How long a request waits for the upstream to start answering another request for the same response, before going to the upstream itself. |
-| `mode` | | Which `Cache-Control` directives are honoured. By default those of the responses, but not those of the requests: a client cannot force its way past the cache. `strict` also honours the requests' (`no-cache`, `no-store`, `max-age`, `min-fresh`, `max-stale`, `only-if-cached`). `bypass_response` ignores the responses' and caches everything for `ttl`. `bypass` and `bypass_request` are accepted as aliases of `bypass_response` and of the default. |
+| `mode` | | Which `Cache-Control` directives are honoured. By default those of the responses, but not those of the requests: a client cannot force its way past the cache. `strict` also honours the requests' (`no-cache`, `no-store`, `max-age`, `min-fresh`, `max-stale`, `only-if-cached`, and `Pragma: no-cache`), and stores a response to a request with `Authorization` only when it carries `public`, `s-maxage` or `must-revalidate`: it is the mode that conforms to RFC 9111, see [Standards compliance](#standards-compliance). `bypass_response` ignores the responses' and caches everything for `ttl`. `bypass` and `bypass_request` are accepted as aliases of `bypass_response` and of the default. |
 | `cache_name` | `Caddy` | Name of the cache in the `Cache-Status` header. |
 | `default_cache_control` | | `Cache-Control` given to the responses that have none. |
 | `max_cacheable_body_bytes` | half of `max_size` | Responses with a larger body are relayed without being stored. For a response stored in slices, this is its whole size, and there is no default. |
@@ -243,6 +244,8 @@ The size of a response is not kept anywhere but in its slices. A request for a r
 
 ### Expiry
 
+A response is fresh for what `Cache-Control: s-maxage` or `max-age` says, failing that until its `Expires`, failing that for `ttl`. Its age when it arrives is the greater of its `Age` header and of the time elapsed since its `Date`, and is taken off its freshness: a response that was already a minute old at an upstream cache, or that left an upstream whose clock is a minute behind, has a minute less to live here. `Age` on a response served from the cache carries that age plus the time spent in the cache.
+
 A response past its freshness is not discarded. The next request for it revalidates it: the upstream is sent the `ETag` and `Last-Modified` of the stored response and, if it answers `304 Not Modified`, the stored response is fresh again without having been transferred. Otherwise the new response replaces it.
 
 With `stale` set, the other requests arriving during this update are served the stale response immediately, and a failure of the upstream (an error before the response, or a 5xx) is answered with the stale response too. Responses marked `must-revalidate`, `proxy-revalidate` or `no-cache` are never served stale.
@@ -253,16 +256,41 @@ Only `GET` requests fill the cache; `HEAD` requests are answered from it. A resp
 
 * its status is not one of 200, 203, 204, 300, 301, 302, 307, 308, 404, 405, 410, 414, 501 or of `allowed_additional_status_codes`;
 * it does not say how long it is fresh and its status is not one `ttl` applies to;
-* it has `Cache-Control: no-store` or `private`;
+* it has `Cache-Control: no-store` (unless `must-understand` is there too, as the status is one the cache understands) or `private`;
 * it has a `Set-Cookie` header, or `Vary: *`;
-* the request had an `Authorization` header, and the response has none of `public`, `s-maxage`, `must-revalidate`, and `Authorization` is neither in `Vary` nor in the `key` `headers`;
+* the request had an `Authorization` header, and the response has none of `public`, `s-maxage`, `must-revalidate`. Unless `mode strict` is set, the response is stored anyway when `Authorization` is in its `Vary` or in the `key` `headers`, as the credentials then select it;
 * it is already expired and has no `ETag` or `Last-Modified` to revalidate it with;
 * its body is larger than what may be stored;
 * it announces trailers, or is a stream of events (`text/event-stream`).
 
-A successful `POST`, `PUT`, `PATCH` or `DELETE` request removes the response stored for its URI.
+A successful request of any method but `GET`, `HEAD`, `OPTIONS` and `TRACE` removes the response stored for its URI, and those stored for the URIs its response names in `Location` and `Content-Location` when they are on the same host.
 
 The cache stores what the handlers after it produce. Headers set by a directive placed before it, such as `header Cache-Control "public, max-age=31536000"` for the browsers, are given to every response, served from the cache or not: they are not stored and do not decide how long a response is kept.
+
+## Standards compliance
+
+The caching rules are those of [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111) (HTTP Caching, which obsoletes RFC 7234), the `Cache-Status` header follows [RFC 9211](https://www.rfc-editor.org/rfc/rfc9211), and `stale-while-revalidate` and `stale-if-error` follow [RFC 5861](https://www.rfc-editor.org/rfc/rfc5861). The module behaves as a *shared cache* in the sense of the RFC.
+
+By default, the module takes the side of the hit rate where the RFC leaves a choice, and in two places where it does not. `mode strict` removes those two differences, and [examples/Caddyfile-rfc9111](examples/Caddyfile-rfc9111) is a configuration that conforms:
+
+| | Default | `mode strict` | RFC 9111 |
+|---|---|---|---|
+| Request `Cache-Control` (`no-cache`, `no-store`, `max-age`, `min-fresh`, `max-stale`, `only-if-cached`) and `Pragma: no-cache` | Ignored: a client cannot force its way past the cache, as with nginx and Varnish. | Honoured. | Section 4 requires that a request with `no-cache` is not answered from the cache without validation. Section 5.2.1 makes the other request directives advisory. |
+| Response to a request with `Authorization` | Stored with `public`, `s-maxage` or `must-revalidate`, or when `Authorization` is in `Vary` or among the `key` `headers`: the credentials are then part of the key, so the response is not shared between users. | Stored with `public`, `s-maxage` or `must-revalidate` only. | Section 3.5 allows the directives only. |
+
+Choices the RFC leaves to the cache, and how they are taken, whatever the mode:
+
+* **Heuristic freshness** (section 4.2.2) is the `ttl` option: a fixed duration rather than a fraction of the age given by `Last-Modified`, applied to 200, 203, 204, 300, 301 and 308 responses, which the RFC lists as heuristically cacheable, and to the status codes `allowed_additional_status_codes` names. It cannot be turned off, only shortened.
+* **Serving stale** (section 4.2.4) is allowed by the response's `stale-while-revalidate` and `stale-if-error`, by the request's `max-stale` in `mode strict`, and by the `stale` option, which the RFC admits as "configuration in accordance with an out-of-band contract" with the origin. A response that is stale is served to the requests arriving while one request updates it; the request that finds it stale first waits for the origin rather than being served stale while a background update runs.
+* **Invalidation** (section 4.4) applies to every method not known to be safe and to the `Location` and `Content-Location` URIs on the same host, which the RFC permits but does not require.
+* **Stricter than required**: responses with `Set-Cookie`, with trailers, `text/event-stream` responses and partial (206) responses from the upstream are not stored; `Cache-Control: no-cache` and `private` with field names are treated as if they had none; of several `Cache-Control` directives of one name, the first counts. Refusing to store never breaks conformance.
+* **Normalization** of `Accept-Encoding` for `Vary` (section 4.1) keeps `gzip`, `br`, `zstd`, `deflate` and `*`, sorted.
+* `Warning` headers, which RFC 7234 recommended on stale and heuristically fresh responses, are not generated: RFC 9111 deprecates them.
+* `must-understand` (section 5.2.2.3) lifts `no-store` for the status codes the cache understands, which are the only ones it stores.
+
+Things that stay outside the RFC by design: `mode bypass_response` ignores the responses' directives altogether; `default_cache_control` makes the cache speak for an origin that says nothing; `key { disable_vary }` and `key { template }` change what a stored response answers.
+
+The [http-tests/cache-tests](https://github.com/http-tests/cache-tests) conformance suite can be run against the module: see [fixtures/cache-tests](fixtures/cache-tests/README.md).
 
 ## Cache key
 
@@ -473,7 +501,7 @@ The storage backends are gone, and with them the need to build Caddy with a stor
 
 Other differences:
 
-* Request `Cache-Control` directives are ignored unless `mode strict` is set.
+* Request `Cache-Control` directives are ignored unless `mode strict` is set, see [Standards compliance](#standards-compliance).
 * Responses with a 404, 405, 410, 414 or 501 status are only cached when they say for how long, or when listed in `allowed_additional_status_codes`.
 * The `Cache-Status` header names the cache `Caddy` and has different details, see above.
 * The admin API moved from `/souin-api` to `/cache`.

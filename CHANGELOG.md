@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.2.0
+
+### Added
+
+* A [Standards compliance](README.md#standards-compliance) section in the README, and `examples/Caddyfile-rfc9111`, a configuration that conforms to RFC 9111.
+* `Cache-Control: must-understand` lifts `no-store`, as the cache only stores the status codes it understands.
+
+### Changed
+
+* The age of a response when it arrives is the time since its `Date` when that is more than its `Age` header says (RFC 9111, section 4.2.3). A response from an upstream whose clock is behind, or that went through a cache that sets no `Age`, is fresh for less time than before, and the `Age` of a hit reflects it. With `Expires`, the lifetime now runs from the `Date`.
+* With `mode strict`, a response to a request with `Authorization` is stored only when it carries `public`, `s-maxage` or `must-revalidate` (RFC 9111, section 3.5). `Authorization` in `Vary` or among the `key` `headers` no longer makes an exception in that mode.
+* A successful request of any method but `GET`, `HEAD`, `OPTIONS` and `TRACE` invalidates the response stored for its URI, where only `POST`, `PUT`, `PATCH` and `DELETE` did. It also invalidates the URIs its response names in `Location` and `Content-Location` when they are on the same host (RFC 9111, section 4.4).
+
 ## 1.1.0
 
 ### Added
